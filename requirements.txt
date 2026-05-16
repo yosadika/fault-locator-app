@@ -1,0 +1,6 @@
+streamlit
+comtrade
+pandas
+numpy
+plotly
+scipy
