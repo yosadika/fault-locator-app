@@ -36,6 +36,7 @@ from two_ended import (
     evaluate_two_ended_quality,
     build_two_ended_result_dataframe,
     choose_best_remote_current_direction,
+    choose_best_two_ended_adaptation,
 )
 from auto_assignment import (
     detect_voltage_current_channels,
@@ -2882,23 +2883,42 @@ with tab10:
     st.markdown("### Two-Ended Calculation")
 
     remote_direction_mode = st.selectbox(
-        "Remote Current Direction",
+        "Remote Record Adaptation",
         [
-            "auto_choose_best",
+            "auto_adapt_record",
+            "auto_current_direction_only",
             "into_line",
             "opposite_to_line",
         ],
         index=0,
         help=(
-            "Pilih into_line jika arus remote direkam masuk ke saluran dari sisi remote. "
-            "Pilih opposite_to_line jika arah arus remote berlawanan. "
-            "Auto akan mencoba keduanya dan memilih yang paling masuk akal."
+            "Auto Adapt mencoba arah arus, polaritas CT/VT, dan offset sudut antar rekaman. "
+            "Direction only hanya mencoba arah arus remote. Pilih manual jika polaritas dan sinkronisasi sudah pasti."
         ),
     )
 
     if st.button("Calculate Two-Ended Fault Location"):
         try:
-            if remote_direction_mode == "auto_choose_best":
+            adapted_remote_phasors = remote_phasors
+
+            if remote_direction_mode == "auto_adapt_record":
+                best_candidate, all_candidates = choose_best_two_ended_adaptation(
+                    local_phasors=local_phasors,
+                    remote_phasors=remote_phasors,
+                    line_param=line_param,
+                )
+
+                if best_candidate["result"] is None:
+                    raise ValueError("Auto adapt gagal menentukan pembacaan remote yang konsisten.")
+
+                two_result = best_candidate["result"]
+                two_quality = best_candidate["quality"]
+                adapted_remote_phasors = best_candidate["adapted_remote_phasors"]
+
+                st.session_state["two_ended_candidates"] = all_candidates
+                st.session_state["two_ended_adapted_remote_phasors"] = adapted_remote_phasors
+
+            elif remote_direction_mode == "auto_current_direction_only":
                 best_candidate, all_candidates = choose_best_remote_current_direction(
                     local_phasors=local_phasors,
                     remote_phasors=remote_phasors,
@@ -2910,8 +2930,10 @@ with tab10:
 
                 two_result = best_candidate["result"]
                 two_quality = best_candidate["quality"]
+                adapted_remote_phasors = best_candidate["adapted_remote_phasors"]
 
                 st.session_state["two_ended_candidates"] = all_candidates
+                st.session_state["two_ended_adapted_remote_phasors"] = adapted_remote_phasors
 
             else:
                 two_result = calculate_positive_sequence_two_ended(
@@ -2922,6 +2944,8 @@ with tab10:
                 )
 
                 two_quality = evaluate_two_ended_quality(two_result, line_param)
+                st.session_state.pop("two_ended_candidates", None)
+                st.session_state["two_ended_adapted_remote_phasors"] = remote_phasors
 
             single_ended_compare_error = None
 
@@ -2931,11 +2955,11 @@ with tab10:
                 if local_fault_type_result is None:
                     local_fault_type_result = detect_fault_type(local_phasors)
 
-                remote_fault_type_result = detect_fault_type(remote_phasors)
-                remote_single_phasors = remote_phasors
+                remote_fault_type_result = detect_fault_type(adapted_remote_phasors)
+                remote_single_phasors = adapted_remote_phasors
 
                 if two_result["remote_current_direction"] == "opposite_to_line":
-                    remote_single_phasors = invert_current_phasors(remote_phasors)
+                    remote_single_phasors = invert_current_phasors(adapted_remote_phasors)
 
                 local_single_result = calculate_single_ended_fault_location(
                     phasors=local_phasors,
@@ -3214,17 +3238,21 @@ with tab10:
         st.plotly_chart(fig_two, use_container_width=True)
 
         if "two_ended_candidates" in st.session_state:
-            st.markdown("### Auto Direction Candidates")
+            st.markdown("### Auto Adaptation Candidates")
 
             candidate_rows = []
 
-            for c in st.session_state["two_ended_candidates"]:
+            for c in st.session_state["two_ended_candidates"][:50]:
                 if c["result"] is None:
                     candidate_rows.append(
                         {
                             "Direction": c["direction"],
+                            "VT Polarity": c.get("voltage_polarity"),
+                            "CT Polarity": c.get("current_polarity"),
+                            "Angle Shift deg": c.get("angle_shift_deg"),
                             "Distance km": None,
                             "Distance imag": None,
+                            "Mismatch Ratio": None,
                             "Quality": None,
                             "Ranking Score": c["ranking_score"],
                             "Error": c.get("error"),
@@ -3234,8 +3262,12 @@ with tab10:
                     candidate_rows.append(
                         {
                             "Direction": c["direction"],
+                            "VT Polarity": c.get("voltage_polarity", 1),
+                            "CT Polarity": c.get("current_polarity", 1),
+                            "Angle Shift deg": c.get("angle_shift_deg", 0.0),
                             "Distance km": c["result"]["distance_km"],
                             "Distance imag": c["result"]["distance_complex"].imag,
+                            "Mismatch Ratio": c["quality"]["mismatch_ratio"],
                             "Quality": c["quality"]["quality_score"],
                             "Ranking Score": c["ranking_score"],
                             "Error": "",
