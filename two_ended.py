@@ -350,16 +350,21 @@ def choose_best_two_ended_adaptation(
 
 def build_two_ended_result_dataframe(result: dict, quality: dict):
     rows = [
+        {"Parameter": "Calculation Local Side", "Value": result.get("calculation_local_label", "Local End")},
+        {"Parameter": "Calculation Remote Side", "Value": result.get("calculation_remote_label", "Remote End")},
         {"Parameter": "Distance from Local End (km)", "Value": result["distance_km"]},
         {"Parameter": "Distance from Local End (%)", "Value": result["distance_percent"]},
         {"Parameter": "Distance from Remote End (km)", "Value": result["distance_from_remote_km"]},
         {"Parameter": "Distance from Remote End (%)", "Value": result["distance_from_remote_percent"]},
+        {"Parameter": "Distance from Original Local GI (km)", "Value": result.get("distance_from_original_local_km", result["distance_km"])},
+        {"Parameter": "Distance from Original Local GI (%)", "Value": result.get("distance_from_original_local_percent", result["distance_percent"])},
         {"Parameter": "Distance Complex Real", "Value": result["distance_complex"].real},
         {"Parameter": "Distance Complex Imag", "Value": result["distance_complex"].imag},
         {"Parameter": "Voltage Mismatch Magnitude", "Value": result["voltage_mismatch_magnitude"]},
         {"Parameter": "Mismatch Ratio", "Value": quality["mismatch_ratio"]},
         {"Parameter": "Quality Score 0-10", "Value": quality["quality_score"]},
         {"Parameter": "Remote Current Direction", "Value": result["remote_current_direction"]},
+        {"Parameter": "Uploaded Remote Current Direction", "Value": result.get("uploaded_remote_current_direction", result["remote_current_direction"])},
         {"Parameter": "Remote Voltage Polarity", "Value": result.get("remote_voltage_polarity", 1)},
         {"Parameter": "Remote Current Polarity", "Value": result.get("remote_current_polarity", 1)},
         {"Parameter": "Remote Angle Shift Deg", "Value": result.get("remote_angle_shift_deg", 0.0)},

@@ -2,6 +2,7 @@ import streamlit as st
 import tempfile
 import math
 import cmath
+import re
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -157,6 +158,210 @@ def install_print_friendly_tables():
 
     st.dataframe = printable_dataframe
     st._print_tables_installed = True
+
+
+def explain_fault_type_result(result: dict, context: str = "Aplikasi"):
+    fault_type = result.get("fault_type", "UNKNOWN")
+    phases = result.get("faulted_phases", [])
+    ground_text = (
+        "melibatkan tanah/ground"
+        if result.get("ground_involved")
+        else "tidak menunjukkan arus tanah yang dominan"
+    )
+
+    if fault_type == "UNKNOWN":
+        return (
+            f"{context} belum bisa menentukan tipe gangguan dengan jelas. "
+            "Cek mapping channel, threshold deteksi, dan cursor DFT."
+        )
+
+    phase_text = ", ".join(phases) if phases else "-"
+    return (
+        f"{context} membaca gangguan sebagai {fault_type}. "
+        f"Fasa yang dianggap terganggu: {phase_text}; {ground_text}. "
+        "Nilai confidence menunjukkan seberapa konsisten pola arus, tegangan, dan ground terhadap aturan klasifikasi aplikasi."
+    )
+
+
+def explain_single_ended_status(status: str):
+    explanations = {
+        "VALID": (
+            "VALID berarti hasil numerik masih berada dalam batas kewajaran aplikasi: "
+            "jarak tidak negatif, tidak melewati panjang saluran, dan indikator resistif tidak melewati batas warning. "
+            "Ini bukan jaminan lokasi pasti benar, tetapi hasil layak dipakai sebagai estimasi awal."
+        ),
+        "CHECK": (
+            "CHECK berarti hasil masih bisa dipakai sebagai indikasi, tetapi ada gejala yang perlu divalidasi "
+            "dengan waveform, SOE relay, fault type, polaritas CT/CVT, dan data lapangan."
+        ),
+        "UNCERTAIN": (
+            "UNCERTAIN berarti hasil keluar dari batas dasar, misalnya jarak negatif atau melebihi panjang saluran. "
+            "Cek ulang mapping sinyal, polaritas, parameter saluran, dan pemilihan loop gangguan."
+        ),
+    }
+
+    return explanations.get(status, "Status belum dikenali. Cek detail warning dan parameter input.")
+
+
+def explain_two_ended_quality(quality: dict):
+    score = quality.get("quality_score", 0)
+
+    if score >= 9:
+        level = "sangat baik"
+    elif score >= 7:
+        level = "baik, tetapi masih perlu validasi"
+    elif score >= 5:
+        level = "sedang dan perlu dicek ulang"
+    else:
+        level = "rendah, sehingga hasil perlu dianggap tidak pasti"
+
+    return (
+        f"Quality {score}/10 berarti kualitas perhitungan two-ended {level}. "
+        "Skor ini terutama dipengaruhi oleh apakah jarak berada di dalam saluran, "
+        "besar komponen imajiner jarak, dan mismatch tegangan fault dari dua ujung."
+    )
+
+
+def explain_high_resistance_result(result: dict):
+    if result.get("high_resistance_suspected"):
+        return (
+            "Aplikasi melihat bukti gangguan resistif yang cukup kuat. "
+            "Pada kondisi ini, estimasi single-ended berbasis magnitude bisa bergeser, "
+            "sehingga jarak berbasis reactance/projection lebih layak dijadikan pembanding."
+        )
+
+    return (
+        "Aplikasi belum melihat bukti kuat gangguan high resistance. "
+        "Untuk gangguan petir atau flashover cepat, ini sering wajar karena impedansi busur dapat rendah dan durasinya singkat. "
+        "Tetap validasi dengan waveform dan laporan relay."
+    )
+
+
+def explain_sync_warning():
+    return (
+        "Selisih waktu local dan remote lebih dari 1 siklus tidak selalu berarti rekaman salah. "
+        "Jika jam relay tidak sinkron SNTP/GPS dan diset manual, timestamp absolut bisa berbeda. "
+        "Dalam kondisi itu, fokuskan validasi pada kualitas fasor masing-masing record, fault type, dan konsistensi hasil two-ended."
+    )
+
+
+def clean_gi_name(raw_name: str, fallback: str):
+    name = str(raw_name or "").strip()
+    if not name:
+        return fallback
+
+    name = re.sub(r"(?i)\bGI\b", "", name)
+    name = re.sub(r"[^A-Za-z0-9]+", " ", name).strip()
+
+    if not name:
+        return fallback
+
+    return f"GI {name.upper()}"
+
+
+def infer_gi_names_from_line_name(line_name: str):
+    cleaned = str(line_name or "").strip()
+    cleaned = cleaned.split("#", 1)[0]
+
+    if "-" in cleaned:
+        left, right = cleaned.split("-", 1)
+        return (
+            clean_gi_name(left, "GI Local"),
+            clean_gi_name(right, "GI Remote"),
+        )
+
+    parts = re.split(r"\s+(?:to|ke|s/d|sd)\s+", cleaned, flags=re.IGNORECASE)
+    if len(parts) >= 2:
+        return (
+            clean_gi_name(parts[0], "GI Local"),
+            clean_gi_name(parts[1], "GI Remote"),
+        )
+
+    return "GI Local", "GI Remote"
+
+
+def orient_remote_as_line_current(remote_phasors: dict, remote_direction: str):
+    if remote_direction == "opposite_to_line":
+        return invert_current_phasors(remote_phasors)
+
+    return remote_phasors
+
+
+def build_two_ended_reverse_result(
+    local_phasors: dict,
+    adapted_remote_phasors: dict,
+    normal_result: dict,
+    line_param: dict,
+    local_label: str,
+    remote_label: str,
+):
+    remote_direction = normal_result["remote_current_direction"]
+    reverse_local_phasors = orient_remote_as_line_current(
+        adapted_remote_phasors,
+        remote_direction,
+    )
+
+    reverse_result = calculate_positive_sequence_two_ended(
+        local_phasors=reverse_local_phasors,
+        remote_phasors=local_phasors,
+        line_param=line_param,
+        remote_current_direction="into_line",
+    )
+    reverse_quality = evaluate_two_ended_quality(reverse_result, line_param)
+    L = line_param["length_km"]
+
+    reverse_result.update(
+        {
+            "calculation_reference_mode": "uploaded_remote_to_original_local",
+            "calculation_local_label": remote_label,
+            "calculation_remote_label": local_label,
+            "uploaded_remote_current_direction": remote_direction,
+            "distance_from_original_local_km": L - reverse_result["distance_km"],
+            "distance_from_original_local_percent": (
+                (L - reverse_result["distance_km"]) / L * 100.0
+            ),
+        }
+    )
+
+    return reverse_result, reverse_quality
+
+
+def build_two_ended_comparison_dataframe(
+    normal_result: dict,
+    normal_quality: dict,
+    reverse_result: dict,
+    reverse_quality: dict,
+    local_label: str,
+    remote_label: str,
+):
+    rows = [
+        {
+            "Method": f"Double-ended {local_label} -> {remote_label}",
+            "Reference Side": local_label,
+            "Distance from Reference km": normal_result["distance_km"],
+            f"Distance from {local_label} km": normal_result["distance_from_original_local_km"],
+            f"Distance from {local_label} %": normal_result["distance_from_original_local_percent"],
+            f"Distance from {remote_label} km": normal_result["distance_from_remote_km"],
+            "Quality": normal_quality["quality_score"],
+            "Mismatch Ratio": normal_quality["mismatch_ratio"],
+            "Imag Distance km": normal_result["distance_complex"].imag,
+            "Warnings": "; ".join(normal_quality["warnings"]) if normal_quality["warnings"] else "-",
+        },
+        {
+            "Method": f"Double-ended {remote_label} -> {local_label}",
+            "Reference Side": remote_label,
+            "Distance from Reference km": reverse_result["distance_km"],
+            f"Distance from {local_label} km": reverse_result["distance_from_original_local_km"],
+            f"Distance from {local_label} %": reverse_result["distance_from_original_local_percent"],
+            f"Distance from {remote_label} km": reverse_result["distance_km"],
+            "Quality": reverse_quality["quality_score"],
+            "Mismatch Ratio": reverse_quality["mismatch_ratio"],
+            "Imag Distance km": reverse_result["distance_complex"].imag,
+            "Warnings": "; ".join(reverse_quality["warnings"]) if reverse_quality["warnings"] else "-",
+        },
+    ]
+
+    return pd.DataFrame(rows)
 
 
 st.set_page_config(
@@ -1304,6 +1509,8 @@ with tab6:
         if fault_type_result["faulted_phases"] else "-"
     )
 
+    st.info(explain_fault_type_result(fault_type_result, context="Rekaman local"))
+
     st.markdown("### Metrik Deteksi")
 
     metrics_df = build_fault_type_metrics_dataframe(fault_type_result)
@@ -2203,6 +2410,8 @@ with tab8:
                 f"HR evidence score: {hr_result['evidence_score']}/10."
             )
 
+        st.info(explain_high_resistance_result(hr_result))
+
         if hr_result["warnings"]:
             st.markdown("### Warning")
             for warning in hr_result["warnings"]:
@@ -2433,6 +2642,8 @@ with tab9:
             st.warning("Hasil single-ended perlu dicek ulang dengan waveform, SOE, dan data lapangan.")
         else:
             st.error("Hasil single-ended tidak pasti. Cek polaritas, line parameter, dan fault type.")
+
+        st.info(explain_single_ended_status(single_result["status"]))
 
         if single_result["warnings"]:
             st.markdown("### Warning")
@@ -3129,6 +3340,8 @@ with tab10:
         else "-",
     )
 
+    st.info(explain_fault_type_result(remote_fault_type_result, context="Rekaman remote"))
+
     with st.expander("Remote Fault Type Detection Detail"):
         st.dataframe(remote_fault_type_df, use_container_width=True)
 
@@ -3178,12 +3391,22 @@ with tab10:
                 "Perbedaan waktu fault local dan remote lebih dari 1 siklus. "
                 "Cek sinkronisasi rekaman, trigger, sampling rate, atau pilih cursor manual."
             )
+            st.info(explain_sync_warning())
         else:
             st.success("Perbedaan waktu fault local dan remote masih dalam batas 1 siklus.")
     else:
         st.warning("Local fault window belum tersedia.")
 
     st.markdown("### Two-Ended Calculation")
+
+    local_gi_label, remote_gi_label = infer_gi_names_from_line_name(
+        line_param.get("line_name", "")
+    )
+
+    st.caption(
+        f"Nama GI dibaca dari Line Name: {local_gi_label} sebagai sisi local dan "
+        f"{remote_gi_label} sebagai sisi remote. Jika belum sesuai, ubah Line Name di tab Line Parameter."
+    )
 
     remote_direction_mode = st.selectbox(
         "Remote Record Adaptation",
@@ -3250,6 +3473,35 @@ with tab10:
                 st.session_state.pop("two_ended_candidates", None)
                 st.session_state["two_ended_adapted_remote_phasors"] = remote_phasors
 
+            two_result.update(
+                {
+                    "calculation_reference_mode": "original_local_to_uploaded_remote",
+                    "calculation_local_label": local_gi_label,
+                    "calculation_remote_label": remote_gi_label,
+                    "uploaded_remote_current_direction": two_result["remote_current_direction"],
+                    "distance_from_original_local_km": two_result["distance_km"],
+                    "distance_from_original_local_percent": two_result["distance_percent"],
+                }
+            )
+
+            two_reverse_result, two_reverse_quality = build_two_ended_reverse_result(
+                local_phasors=local_phasors,
+                adapted_remote_phasors=adapted_remote_phasors,
+                normal_result=two_result,
+                line_param=line_param,
+                local_label=local_gi_label,
+                remote_label=remote_gi_label,
+            )
+
+            two_comparison_df = build_two_ended_comparison_dataframe(
+                normal_result=two_result,
+                normal_quality=two_quality,
+                reverse_result=two_reverse_result,
+                reverse_quality=two_reverse_quality,
+                local_label=local_gi_label,
+                remote_label=remote_gi_label,
+            )
+
             single_ended_compare_error = None
 
             try:
@@ -3266,7 +3518,7 @@ with tab10:
                 )
                 remote_single_phasors = adapted_remote_phasors
 
-                if two_result["remote_current_direction"] == "opposite_to_line":
+                if two_result.get("uploaded_remote_current_direction") == "opposite_to_line":
                     remote_single_phasors = invert_current_phasors(adapted_remote_phasors)
 
                 local_single_result = calculate_single_ended_fault_location(
@@ -3307,7 +3559,12 @@ with tab10:
 
             st.session_state["two_ended_result"] = two_result
             st.session_state["two_ended_quality"] = two_quality
+            st.session_state["two_ended_reverse_result"] = two_reverse_result
+            st.session_state["two_ended_reverse_quality"] = two_reverse_quality
+            st.session_state["two_ended_comparison_df"] = two_comparison_df
             st.session_state["two_ended_single_ended_error"] = single_ended_compare_error
+            st.session_state["two_ended_local_gi_label"] = local_gi_label
+            st.session_state["two_ended_remote_gi_label"] = remote_gi_label
 
             st.success("Two-ended fault location berhasil dihitung.")
 
@@ -3324,41 +3581,87 @@ with tab10:
     if "two_ended_result" in st.session_state:
         two_result = st.session_state["two_ended_result"]
         two_quality = st.session_state["two_ended_quality"]
+        two_reverse_result = st.session_state.get("two_ended_reverse_result")
+        two_reverse_quality = st.session_state.get("two_ended_reverse_quality")
+        two_comparison_df = st.session_state.get("two_ended_comparison_df")
+        local_gi_label = st.session_state.get("two_ended_local_gi_label", "GI Local")
+        remote_gi_label = st.session_state.get("two_ended_remote_gi_label", "GI Remote")
 
         st.markdown("### Two-Ended Result")
 
         col_te1, col_te2, col_te3, col_te4 = st.columns(4)
 
         col_te1.metric(
-            "Distance from Local",
-            f'{two_result["distance_km"]:.3f} km',
+            f"Original DE from {local_gi_label}",
+            f'{two_result["distance_from_original_local_km"]:.3f} km',
         )
 
         col_te2.metric(
-            "Distance from Remote",
-            f'{two_result["distance_from_remote_km"]:.3f} km',
+            f"Reverse DE from {remote_gi_label}",
+            (
+                f'{two_reverse_result["distance_km"]:.3f} km'
+                if two_reverse_result
+                else "-"
+            ),
         )
 
         col_te3.metric(
-            "Distance %",
-            f'{two_result["distance_percent"]:.2f} %',
-        )
-
-        col_te4.metric(
-            "Quality",
+            "Original Quality",
             f'{two_quality["quality_score"]}/10',
         )
 
+        col_te4.metric(
+            "Reverse Quality",
+            f'{two_reverse_quality["quality_score"]}/10' if two_reverse_quality else "-",
+        )
+
+        st.info(explain_two_ended_quality(two_quality))
+
+        if two_comparison_df is not None:
+            st.markdown("### Perbandingan Double-Ended Dua Arah")
+            st.dataframe(
+                two_comparison_df.style.format(
+                    {
+                        "Distance from Reference km": "{:.6f}",
+                        f"Distance from {local_gi_label} km": "{:.6f}",
+                        f"Distance from {local_gi_label} %": "{:.2f}",
+                        f"Distance from {remote_gi_label} km": "{:.6f}",
+                        "Quality": "{:.2f}",
+                        "Mismatch Ratio": "{:.6f}",
+                        "Imag Distance km": "{:.6f}",
+                    }
+                ),
+                use_container_width=True,
+            )
+
         two_result_df = build_two_ended_result_dataframe(two_result, two_quality)
 
-        st.dataframe(
-            two_result_df.style.format(
-                {
-                    "Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x
-                }
-            ),
-            use_container_width=True,
-        )
+        with st.expander("Detail Double-Ended Original Direction"):
+            st.dataframe(
+                two_result_df.style.format(
+                    {
+                        "Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x
+                    }
+                ),
+                use_container_width=True,
+            )
+
+        if two_reverse_result and two_reverse_quality:
+            with st.expander("Detail Double-Ended Reverse Direction"):
+                reverse_df = build_two_ended_result_dataframe(
+                    two_reverse_result,
+                    two_reverse_quality,
+                )
+                st.dataframe(
+                    reverse_df.style.format(
+                        {
+                            "Value": lambda x: f"{x:.6f}"
+                            if isinstance(x, (int, float))
+                            else x
+                        }
+                    ),
+                    use_container_width=True,
+                )
 
         if st.session_state.get("two_ended_single_ended_error"):
             st.warning(
@@ -3394,49 +3697,55 @@ with tab10:
             col_se1, col_se2, col_se3, col_se4 = st.columns(4)
 
             col_se1.metric(
-                "Local SE from Local",
+                f"{local_gi_label} SE",
                 f'{local_single_result["recommended_distance_km"]:.3f} km',
             )
             col_se2.metric(
-                "Remote SE from Remote",
+                f"{remote_gi_label} SE",
                 f'{remote_single_result["recommended_distance_km"]:.3f} km',
             )
             col_se3.metric(
-                "Remote SE from Local",
+                f"{remote_gi_label} SE from {local_gi_label}",
                 f"{remote_single_from_local_km:.3f} km",
             )
             col_se4.metric(
-                "Remote SE from Local %",
+                f"{remote_gi_label} SE from {local_gi_label} %",
                 f"{remote_single_from_local_percent:.2f} %",
             )
 
             st.caption(
-                "Remote single-ended ditampilkan sebagai jarak dari remote end dan "
-                "konversinya ke referensi local end. Jika arah arus remote dipilih "
+                f"Single-ended {remote_gi_label} ditampilkan sebagai jarak dari sisi remote dan "
+                f"konversinya ke referensi {local_gi_label}. Jika arah arus remote dipilih "
                 "`opposite_to_line`, arus fasor remote dibalik untuk perhitungan single-ended."
+            )
+
+            st.info(
+                "Single-ended comparison adalah pembanding tambahan, bukan hasil utama double-ended. "
+                "Status VALID/CHECK/UNCERTAIN pada baris local dan remote menunjukkan kewajaran estimasi satu ujung masing-masing relay. "
+                "Jika pembanding ini memberi warning tetapi quality two-ended tinggi, prioritaskan hasil two-ended sambil tetap memeriksa waveform dan data relay."
             )
 
             se_summary_df = pd.DataFrame(
                 [
                     {
-                        "End": "Local GI",
+                        "End": local_gi_label,
                         "Fault Type": local_fault_type_result.get("fault_type", "-"),
                         "Selected Loop": local_single_result["selected_loop"],
                         "Distance from Own End km": local_single_result["recommended_distance_km"],
-                        "Distance from Local End km": local_single_result["recommended_distance_km"],
-                        "Distance from Local End %": local_single_result["recommended_distance_percent"],
+                        f"Distance from {local_gi_label} km": local_single_result["recommended_distance_km"],
+                        f"Distance from {local_gi_label} %": local_single_result["recommended_distance_percent"],
                         "Zapp R ohm": local_single_result["Zapp_R"],
                         "Zapp X ohm": local_single_result["Zapp_X"],
                         "Rf Est ohm": local_single_result["Rf_est_ohm"],
                         "Status": local_single_result["status"],
                     },
                     {
-                        "End": "Remote GI",
+                        "End": remote_gi_label,
                         "Fault Type": remote_fault_type_result.get("fault_type", "-"),
                         "Selected Loop": remote_single_result["selected_loop"],
                         "Distance from Own End km": remote_single_result["recommended_distance_km"],
-                        "Distance from Local End km": remote_single_from_local_km,
-                        "Distance from Local End %": remote_single_from_local_percent,
+                        f"Distance from {local_gi_label} km": remote_single_from_local_km,
+                        f"Distance from {local_gi_label} %": remote_single_from_local_percent,
                         "Zapp R ohm": remote_single_result["Zapp_R"],
                         "Zapp X ohm": remote_single_result["Zapp_X"],
                         "Rf Est ohm": remote_single_result["Rf_est_ohm"],
@@ -3449,8 +3758,8 @@ with tab10:
                 se_summary_df.style.format(
                     {
                         "Distance from Own End km": "{:.6f}",
-                        "Distance from Local End km": "{:.6f}",
-                        "Distance from Local End %": "{:.2f}",
+                        f"Distance from {local_gi_label} km": "{:.6f}",
+                        f"Distance from {local_gi_label} %": "{:.2f}",
                         "Zapp R ohm": "{:.6f}",
                         "Zapp X ohm": "{:.6f}",
                         "Rf Est ohm": "{:.6f}",
@@ -3485,6 +3794,10 @@ with tab10:
 
             if local_single_result["warnings"] or remote_single_result["warnings"]:
                 st.markdown("### Warning Pembanding Single-Ended")
+                st.info(
+                    "Warning di bagian ini berasal dari perhitungan single-ended pembanding. "
+                    "Artinya aplikasi melihat gejala yang perlu dicek pada estimasi satu ujung, bukan otomatis menyatakan hasil double-ended salah."
+                )
 
             for warning in local_single_result["warnings"]:
                 st.warning(f"Local GI single-ended comparison: {warning}")
@@ -3500,50 +3813,323 @@ with tab10:
         st.markdown("### Line Position Visualization")
 
         L = line_param["length_km"]
-        d = two_result["distance_km"]
-        point_names = ["Local End", "Two-Ended Fault", "Remote End"]
-        point_distances = [0.0, d, L]
+        marker_rows = [
+            {
+                "Point": "Double-ended original",
+                "Distance km": two_result.get("distance_from_original_local_km", two_result["distance_km"]),
+                "Score": two_quality["quality_score"],
+                "Track": "Double-ended",
+                "Color": "#2563eb",
+                "Symbol": "diamond",
+            }
+        ]
+
+        if two_reverse_result:
+            marker_rows.append(
+                {
+                    "Point": "Double-ended reverse",
+                    "Distance km": two_reverse_result["distance_from_original_local_km"],
+                    "Score": two_reverse_quality["quality_score"] if two_reverse_quality else 0.0,
+                    "Track": "Double-ended",
+                    "Color": "#7c3aed",
+                    "Symbol": "diamond-open",
+                }
+            )
 
         if "two_ended_local_single_result" in st.session_state:
-            point_names.append("Local Single-Ended")
-            point_distances.append(
-                st.session_state["two_ended_local_single_result"]["recommended_distance_km"]
+            marker_rows.append(
+                {
+                    "Point": f"Single-ended {local_gi_label}",
+                    "Distance km": st.session_state["two_ended_local_single_result"]["recommended_distance_km"],
+                    "Score": max(
+                        0.0,
+                        {
+                            "VALID": 9.0,
+                            "CHECK": 6.0,
+                            "UNCERTAIN": 3.0,
+                        }.get(
+                            st.session_state["two_ended_local_single_result"]["status"],
+                            5.0,
+                        )
+                        - 0.4 * len(st.session_state["two_ended_local_single_result"]["warnings"]),
+                    ),
+                    "Track": "Single-ended",
+                    "Color": "#059669",
+                    "Symbol": "circle",
+                }
             )
 
         if "two_ended_remote_single_result" in st.session_state:
-            point_names.append("Remote Single-Ended")
-            point_distances.append(
-                L - st.session_state["two_ended_remote_single_result"]["recommended_distance_km"]
+            marker_rows.append(
+                {
+                    "Point": f"Single-ended {remote_gi_label}",
+                    "Distance km": L - st.session_state["two_ended_remote_single_result"]["recommended_distance_km"],
+                    "Score": max(
+                        0.0,
+                        {
+                            "VALID": 9.0,
+                            "CHECK": 6.0,
+                            "UNCERTAIN": 3.0,
+                        }.get(
+                            st.session_state["two_ended_remote_single_result"]["status"],
+                            5.0,
+                        )
+                        - 0.4 * len(st.session_state["two_ended_remote_single_result"]["warnings"]),
+                    ),
+                    "Track": "Single-ended",
+                    "Color": "#d97706",
+                    "Symbol": "circle-open",
+                }
             )
 
-        pos_df = pd.DataFrame(
-            {
-                "Point": point_names,
-                "Distance km": point_distances,
-                "Y": [0.0] * len(point_names),
-            }
-        )
+        theme_base = st.get_option("theme.base")
+        theme_background = st.get_option("theme.backgroundColor")
+        if theme_base is None and theme_background:
+            bg = str(theme_background).lstrip("#")
+            if len(bg) >= 6:
+                r = int(bg[0:2], 16)
+                g = int(bg[2:4], 16)
+                b = int(bg[4:6], 16)
+                is_dark_theme = (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
+            else:
+                is_dark_theme = False
+        else:
+            is_dark_theme = theme_base == "dark"
+        plot_template = "plotly_dark" if is_dark_theme else "plotly_white"
+        paper_bg = "rgba(0,0,0,0)"
+        plot_bg = "#0b1220" if is_dark_theme else "#ffffff"
+        text_color = "#f8fafc" if is_dark_theme else "#111827"
+        muted_text_color = "#cbd5e1" if is_dark_theme else "#475569"
+        axis_title_color = "#f8fafc" if is_dark_theme else "#0f172a"
+        annotation_bg = "rgba(15,23,42,0.92)" if is_dark_theme else "rgba(255,255,255,0.96)"
+        annotation_border = "#94a3b8" if is_dark_theme else "#cbd5e1"
+        terminal_color = "#f8fafc" if is_dark_theme else "#111827"
 
-        fig_two = px.scatter(
-            pos_df,
-            x="Distance km",
-            y="Y",
-            text="Point",
-            title="Two-Ended Fault Location Along Transmission Line",
-        )
+        sorted_marker_rows = sorted(marker_rows, key=lambda item: float(item["Distance km"]))
+        min_gap_km = max(0.02 * L, 0.75)
+        grouped_marker_rows = []
+
+        for row in sorted_marker_rows:
+            if (
+                not grouped_marker_rows
+                or abs(
+                    float(row["Distance km"])
+                    - float(grouped_marker_rows[-1][-1]["Distance km"])
+                )
+                >= min_gap_km
+            ):
+                grouped_marker_rows.append([row])
+            else:
+                grouped_marker_rows[-1].append(row)
+
+        label_layout = {}
+        double_slots = [
+            (-64, -160),
+            (-64, 160),
+            (-100, -160),
+            (-100, 160),
+        ]
+        single_slots = [
+            (96, -190),
+            (96, 190),
+            (150, -190),
+            (150, 190),
+        ]
+
+        for group in grouped_marker_rows:
+            double_rows = [row for row in group if row["Track"] == "Double-ended"]
+            single_rows = [row for row in group if row["Track"] == "Single-ended"]
+
+            if len(group) == 1:
+                row = group[0]
+                label_layout[id(row)] = (
+                    (-64, 0) if row["Track"] == "Double-ended" else (108, 0)
+                )
+            else:
+                for index, row in enumerate(double_rows):
+                    label_layout[id(row)] = double_slots[index % len(double_slots)]
+
+                for index, row in enumerate(single_rows):
+                    label_layout[id(row)] = single_slots[index % len(single_slots)]
+
+        for row in marker_rows:
+            row["Distance km"] = max(0.0, min(L, float(row["Distance km"])))
+            row["Distance %"] = row["Distance km"] / L * 100.0
+            row["Score"] = max(0.0, min(10.0, float(row["Score"])))
+            short_name = (
+                row["Point"]
+                .replace("Double-ended", "DE")
+                .replace("Single-ended", "SE")
+            )
+            row["Label"] = (
+                f"<b>{short_name}</b><br>"
+                f"{row['Distance km']:.2f} km | {row['Score']:.1f}/10"
+            )
+            row["Annotation Ay"], row["Annotation Ax"] = label_layout.get(
+                id(row),
+                (-64, 0) if row["Track"] == "Double-ended" else (108, 0),
+            )
+
+        marker_df = pd.DataFrame(marker_rows)
+
+        fig_two = go.Figure()
+
+        baseline_y = 0.0
+        gi_label_y = 10.7
 
         fig_two.add_shape(
             type="line",
             x0=0,
-            y0=0,
             x1=L,
-            y1=0,
+            y0=baseline_y,
+            y1=baseline_y,
+            line=dict(color=muted_text_color, width=1.2),
         )
 
-        fig_two.update_traces(textposition="top center")
+        fig_two.add_trace(
+            go.Scatter(
+                x=[0, L],
+                y=[gi_label_y, gi_label_y],
+                mode="markers+text",
+                marker=dict(size=10, color=[terminal_color, terminal_color], symbol="line-ns"),
+                text=[local_gi_label, remote_gi_label],
+                textposition=["bottom left", "bottom right"],
+                textfont=dict(color=text_color, size=12),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+        legend_shown = set()
+        x_profile = [i * L / 300.0 for i in range(301)]
+
+        for _, row in marker_df.iterrows():
+            show_legend = row["Track"] not in legend_shown
+            legend_shown.add(row["Track"])
+            center = float(row["Distance km"])
+            score = float(row["Score"])
+            curve_width = max(L * (0.09 if row["Track"] == "Double-ended" else 0.06), 2.5)
+            curve_y = [
+                baseline_y + score / (1.0 + abs(x - center) / curve_width)
+                for x in x_profile
+            ]
+
+            fig_two.add_trace(
+                go.Scatter(
+                    x=x_profile,
+                    y=curve_y,
+                    mode="lines",
+                    line=dict(color=row["Color"], width=1.5),
+                    opacity=0.9,
+                    hoverinfo="skip",
+                    showlegend=False,
+                    legendgroup=row["Track"],
+                )
+            )
+
+            fig_two.add_trace(
+                go.Scatter(
+                    x=[row["Distance km"]],
+                    y=[row["Score"]],
+                    mode="markers",
+                    marker=dict(
+                        size=16,
+                        color=row["Color"],
+                        symbol=row["Symbol"],
+                        line=dict(width=2, color=terminal_color),
+                    ),
+                    name=row["Track"],
+                    showlegend=show_legend,
+                    legendgroup=row["Track"],
+                    customdata=[[row["Point"], row["Distance km"], row["Distance %"], row["Score"]]],
+                    hovertemplate=(
+                        "%{customdata[0]}<br>"
+                        "%{customdata[1]:.2f} km (%{customdata[2]:.1f}%)<br>"
+                        "Score %{customdata[3]:.1f}/10"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            fig_two.add_shape(
+                type="line",
+                x0=row["Distance km"],
+                x1=row["Distance km"],
+                y0=baseline_y,
+                y1=row["Score"],
+                line=dict(color=row["Color"], width=1.4),
+            )
+
+            fig_two.add_annotation(
+                x=row["Distance km"],
+                y=row["Score"],
+                text=row["Label"],
+                showarrow=True,
+                arrowhead=2,
+                arrowsize=0.8,
+                arrowwidth=1.4,
+                arrowcolor=row["Color"],
+                ax=row["Annotation Ax"],
+                ay=row["Annotation Ay"],
+                bgcolor=annotation_bg,
+                bordercolor=annotation_border,
+                borderwidth=1,
+                borderpad=4,
+                font=dict(color=text_color, size=11),
+            )
+
         fig_two.update_layout(
-            yaxis=dict(visible=False),
-            xaxis_title="Distance from Local End (km)",
+            title=f"Fault Location Map - {line_param.get('line_name', '')}",
+            template=plot_template,
+            paper_bgcolor=plot_bg,
+            plot_bgcolor=plot_bg,
+            font=dict(color=text_color),
+            xaxis=dict(
+                title=dict(
+                    text=f"Distance from {local_gi_label} (km)",
+                    font=dict(color=axis_title_color),
+                ),
+                range=[-0.06 * L, 1.06 * L],
+                zeroline=False,
+                color=text_color,
+                tickfont=dict(color=muted_text_color),
+                gridcolor="rgba(148,163,184,0.22)" if is_dark_theme else "rgba(148,163,184,0.35)",
+            ),
+            yaxis=dict(
+                title=dict(
+                    text="Quality / Confidence (0-10)",
+                    font=dict(color=axis_title_color),
+                ),
+                range=[-0.4, 11.2],
+                showgrid=True,
+                gridcolor="rgba(148,163,184,0.14)" if is_dark_theme else "rgba(148,163,184,0.22)",
+                zeroline=False,
+                color=text_color,
+                tickfont=dict(color=muted_text_color),
+            ),
+            height=720,
+            margin=dict(l=78, r=170, t=130, b=92),
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.24,
+                xanchor="right",
+                x=1,
+                bgcolor="rgba(15,23,42,0.85)" if is_dark_theme else "rgba(255,255,255,0.90)",
+                bordercolor="#475569" if is_dark_theme else "#cbd5e1",
+                borderwidth=1,
+                font=dict(color=text_color),
+            ),
+        )
+
+        fig_two.update_xaxes(
+            tickfont=dict(color=muted_text_color),
+            title_font=dict(color=axis_title_color),
+        )
+        fig_two.update_yaxes(
+            tickfont=dict(color=muted_text_color),
+            title_font=dict(color=axis_title_color),
         )
 
         st.plotly_chart(fig_two, use_container_width=True)
