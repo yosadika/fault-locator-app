@@ -291,7 +291,10 @@ def calculate_single_ended_fault_location(
         warnings.append("Estimasi tahanan gangguan cukup besar. Hasil single-ended perlu divalidasi.")
 
     if angle_deviation > 15:
-        warnings.append("Sudut Zapp menyimpang dari sudut Z1. Indikasi komponen resistif cukup besar.")
+        warnings.append(
+            "Sudut Zapp loop single-ended menyimpang dari sudut Z1. "
+            "Ini indikasi pembanding single-ended lebih resistif atau data tidak ideal, bukan warning langsung dari metode double-ended."
+        )
 
     status = "VALID"
 

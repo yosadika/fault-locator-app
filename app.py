@@ -106,10 +106,175 @@ def invert_current_phasors(phasors):
     return inverted
 
 
+def install_print_friendly_tables():
+    """
+    Streamlit dataframe memakai grid interaktif yang tidak ramah print.
+    Wrapper ini mempertahankan tampilan interaktif di layar, lalu menambahkan
+    tabel HTML khusus cetak dengan lebar kolom adaptif dan teks wrap.
+    """
+
+    if getattr(st, "_print_tables_installed", False):
+        return
+
+    original_dataframe = st.dataframe
+
+    def _table_source(data):
+        if type(data).__name__ == "Styler" and hasattr(data, "data"):
+            return data.data, data.to_html()
+
+        if isinstance(data, pd.DataFrame):
+            return data, data.to_html(index=False, escape=True)
+
+        try:
+            df = pd.DataFrame(data)
+            return df, df.to_html(index=False, escape=True)
+        except Exception:
+            return None, None
+
+    def printable_dataframe(data=None, *args, **kwargs):
+        result = original_dataframe(data, *args, **kwargs)
+        source_df, table_html = _table_source(data)
+
+        if source_df is not None and table_html:
+            column_count = max(1, len(source_df.columns))
+            row_count = len(source_df.index)
+            density_class = "print-table-wide" if column_count >= 8 else "print-table-normal"
+            if column_count >= 14:
+                density_class = "print-table-ultrawide"
+
+            st.markdown(
+                f"""
+                <div class="print-table-wrapper {density_class}"
+                     data-print-columns="{column_count}"
+                     data-print-rows="{row_count}">
+                    {table_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        return result
+
+    st.dataframe = printable_dataframe
+    st._print_tables_installed = True
+
+
 st.set_page_config(
     page_title="Transmission Fault Locator",
     layout="wide"
 )
+
+st.markdown(
+    """
+    <style>
+    .print-table-wrapper {
+        display: none;
+    }
+
+    @media print {
+        @page {
+            size: A4 landscape;
+            margin: 10mm;
+        }
+
+        html,
+        body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"],
+        .block-container {
+            width: 100% !important;
+            max-width: none !important;
+            overflow: visible !important;
+        }
+
+        [data-testid="stSidebar"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"],
+        [data-testid="stFileUploader"],
+        [data-testid="stDataFrame"],
+        .stDataFrame,
+        div[data-testid="stElementToolbar"] {
+            display: none !important;
+        }
+
+        .print-table-wrapper {
+            display: block !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            overflow: visible !important;
+            break-inside: auto;
+            page-break-inside: auto;
+            margin: 4mm 0 6mm 0;
+        }
+
+        .print-table-wrapper table {
+            width: 100% !important;
+            max-width: 100% !important;
+            border-collapse: collapse !important;
+            table-layout: fixed !important;
+            font-size: 8.5pt !important;
+            line-height: 1.25 !important;
+            color: #111 !important;
+            background: #fff !important;
+        }
+
+        .print-table-wrapper.print-table-wide table {
+            font-size: 7.2pt !important;
+        }
+
+        .print-table-wrapper.print-table-ultrawide table {
+            font-size: 6.2pt !important;
+        }
+
+        .print-table-wrapper thead {
+            display: table-header-group !important;
+        }
+
+        .print-table-wrapper tr {
+            break-inside: avoid;
+            page-break-inside: avoid;
+        }
+
+        .print-table-wrapper th,
+        .print-table-wrapper td {
+            border: 0.35pt solid #777 !important;
+            padding: 2.2pt 3pt !important;
+            vertical-align: top !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            word-break: break-word !important;
+            hyphens: auto !important;
+            max-width: none !important;
+            min-width: 0 !important;
+        }
+
+        .print-table-wrapper th {
+            font-weight: 700 !important;
+            background: #f0f2f6 !important;
+        }
+
+        .print-table-wrapper tbody tr:nth-child(even) td {
+            background: #fafafa !important;
+        }
+
+        .print-table-wrapper .row_heading,
+        .print-table-wrapper .blank {
+            width: 8mm !important;
+        }
+
+        .element-container,
+        .stMarkdown,
+        [data-testid="column"] {
+            overflow: visible !important;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+install_print_friendly_tables()
 
 st.title("Transmission Fault Locator")
 
@@ -2025,7 +2190,7 @@ with tab8:
             "Suspected" if hr_result["high_resistance_suspected"] else "No",
         )
         col_c.metric("Rf Estimate", f'{hr_result["Rf_est_ohm"]:.3f} Ω')
-        col_d.metric("Confidence", f'{hr_result["confidence"]}/10')
+        col_d.metric("Analysis Confidence", f'{hr_result["analysis_confidence"]}/10')
 
         if hr_result["high_resistance_suspected"]:
             st.warning(
@@ -2033,7 +2198,10 @@ with tab8:
                 "Hasil fault location single-ended perlu diberi status UNCERTAIN."
             )
         else:
-            st.success("Belum ada indikasi kuat gangguan high resistance.")
+            st.success(
+                "Belum ada indikasi kuat gangguan high resistance. "
+                f"HR evidence score: {hr_result['evidence_score']}/10."
+            )
 
         if hr_result["warnings"]:
             st.markdown("### Warning")
@@ -2772,6 +2940,8 @@ with tab10:
         min_prefault_cycles=2,
     )
 
+    st.session_state["remote_fault_detection"] = remote_detection
+
     if not remote_detection["detected"]:
         st.warning(
             "Remote fault inception tidak terdeteksi otomatis. "
@@ -2819,6 +2989,68 @@ with tab10:
     col_rw2.metric("Remote DFT Time", f'{remote_fault_window["dft_time"]:.6f} s')
     col_rw3.metric("Remote Samples/Cycle", remote_samples_per_cycle)
 
+    st.markdown("#### Remote Fault Detection & Cursor")
+
+    col_rdc1, col_rdc2, col_rdc3, col_rdc4 = st.columns(4)
+
+    col_rdc1.metric(
+        "Detection",
+        "AUTO" if remote_detection["detected"] else "MANUAL",
+    )
+    col_rdc2.metric("Left Cursor", f'{remote_fault_window["left_time"]:.6f} s')
+    col_rdc3.metric("DFT Cursor", f'{remote_fault_window["dft_time"]:.6f} s')
+    col_rdc4.metric("Right Cursor", f'{remote_fault_window["right_time"]:.6f} s')
+
+    remote_cursor_df = pd.DataFrame(
+        [
+            {"Parameter": "Detected Automatically", "Value": remote_detection["detected"]},
+            {"Parameter": "Fault Index", "Value": remote_fault_window["fault_index"]},
+            {"Parameter": "Fault Time s", "Value": remote_fault_window["fault_time"]},
+            {"Parameter": "Left Cursor Index", "Value": remote_fault_window["left_index"]},
+            {"Parameter": "Left Cursor Time s", "Value": remote_fault_window["left_time"]},
+            {"Parameter": "DFT Cursor Index", "Value": remote_fault_window["dft_index"]},
+            {"Parameter": "DFT Cursor Time s", "Value": remote_fault_window["dft_time"]},
+            {"Parameter": "Right Cursor Index", "Value": remote_fault_window["right_index"]},
+            {"Parameter": "Right Cursor Time s", "Value": remote_fault_window["right_time"]},
+            {"Parameter": "Samples per Cycle", "Value": remote_samples_per_cycle},
+            {"Parameter": "Frequency Hz", "Value": remote_frequency},
+        ]
+    )
+
+    with st.expander("Remote Fault Detection & Cursor Detail"):
+        st.dataframe(
+            remote_cursor_df.style.format(
+                {
+                    "Value": lambda x: f"{x:.6f}"
+                    if isinstance(x, (int, float)) and not isinstance(x, bool)
+                    else x
+                }
+            ),
+            use_container_width=True,
+        )
+
+        remote_detection_detail_df = pd.DataFrame(
+            [
+                {
+                    "Parameter": key,
+                    "Value": value,
+                }
+                for key, value in remote_detection.items()
+                if isinstance(value, (str, int, float, bool))
+            ]
+        )
+
+        st.dataframe(
+            remote_detection_detail_df.style.format(
+                {
+                    "Value": lambda x: f"{x:.6f}"
+                    if isinstance(x, (int, float)) and not isinstance(x, bool)
+                    else x
+                }
+            ),
+            use_container_width=True,
+        )
+
     remote_phasors = calculate_all_phasors(
         df=remote_assigned_df,
         cursor_index=remote_fault_window["dft_index"],
@@ -2828,6 +3060,77 @@ with tab10:
     remote_phasors = add_sequence_components_to_phasor_dict(remote_phasors)
 
     st.session_state["remote_phasors"] = remote_phasors
+
+    st.markdown("#### Remote Fault Type Detection")
+
+    st.caption(
+        "Parameter di bawah ini memengaruhi klasifikasi tipe gangguan remote. "
+        "Remote Current Fault Multiplier di atas hanya dipakai untuk mencari fault cursor."
+    )
+
+    col_rftp1, col_rftp2, col_rftp3 = st.columns(3)
+
+    with col_rftp1:
+        remote_fault_type_voltage_drop_threshold = st.number_input(
+            "Remote Fault Type Voltage Drop Threshold",
+            value=0.80,
+            min_value=0.10,
+            max_value=1.00,
+            step=0.01,
+            key="remote_fault_type_voltage_drop_threshold",
+            help="Fasa remote dianggap drop jika Vphase <= threshold x Vmax.",
+        )
+
+    with col_rftp2:
+        remote_fault_type_current_rise_threshold = st.number_input(
+            "Remote Fault Type Current Rise Threshold",
+            value=1.50,
+            min_value=1.05,
+            max_value=10.00,
+            step=0.05,
+            key="remote_fault_type_current_rise_threshold",
+            help="Fasa remote dianggap faulted jika Iphase >= threshold x Imin.",
+        )
+
+    with col_rftp3:
+        remote_fault_type_ground_current_threshold = st.number_input(
+            "Remote Fault Type Ground Current Threshold",
+            value=0.20,
+            min_value=0.01,
+            max_value=1.00,
+            step=0.01,
+            key="remote_fault_type_ground_current_threshold",
+            help="Ground fault remote jika IE/Imax atau I0/Iavg melebihi threshold.",
+        )
+
+    remote_fault_type_result = detect_fault_type(
+        phasors=remote_phasors,
+        voltage_drop_threshold=remote_fault_type_voltage_drop_threshold,
+        current_rise_threshold=remote_fault_type_current_rise_threshold,
+        ground_current_threshold=remote_fault_type_ground_current_threshold,
+    )
+    remote_fault_type_df = build_fault_type_metrics_dataframe(remote_fault_type_result)
+
+    st.session_state["remote_fault_type_result"] = remote_fault_type_result
+    st.session_state["remote_fault_type_df"] = remote_fault_type_df
+
+    col_rft1, col_rft2, col_rft3, col_rft4 = st.columns(4)
+
+    col_rft1.metric("Remote Fault Type", remote_fault_type_result["fault_type"])
+    col_rft2.metric(
+        "Ground Involved",
+        "Yes" if remote_fault_type_result["ground_involved"] else "No",
+    )
+    col_rft3.metric("Confidence", f'{remote_fault_type_result["confidence"]}/10')
+    col_rft4.metric(
+        "Faulted Phases",
+        ", ".join(remote_fault_type_result["faulted_phases"])
+        if remote_fault_type_result["faulted_phases"]
+        else "-",
+    )
+
+    with st.expander("Remote Fault Type Detection Detail"):
+        st.dataframe(remote_fault_type_df, use_container_width=True)
 
     remote_phasor_df = build_phasor_dataframe(remote_phasors)
 
@@ -2955,7 +3258,12 @@ with tab10:
                 if local_fault_type_result is None:
                     local_fault_type_result = detect_fault_type(local_phasors)
 
-                remote_fault_type_result = detect_fault_type(adapted_remote_phasors)
+                remote_fault_type_result = detect_fault_type(
+                    phasors=adapted_remote_phasors,
+                    voltage_drop_threshold=remote_fault_type_voltage_drop_threshold,
+                    current_rise_threshold=remote_fault_type_current_rise_threshold,
+                    ground_current_threshold=remote_fault_type_ground_current_threshold,
+                )
                 remote_single_phasors = adapted_remote_phasors
 
                 if two_result["remote_current_direction"] == "opposite_to_line":
@@ -3175,11 +3483,14 @@ with tab10:
                     use_container_width=True,
                 )
 
+            if local_single_result["warnings"] or remote_single_result["warnings"]:
+                st.markdown("### Warning Pembanding Single-Ended")
+
             for warning in local_single_result["warnings"]:
-                st.warning(f"Local GI single-ended: {warning}")
+                st.warning(f"Local GI single-ended comparison: {warning}")
 
             for warning in remote_single_result["warnings"]:
-                st.warning(f"Remote GI single-ended: {warning}")
+                st.warning(f"Remote GI single-ended comparison: {warning}")
 
         if two_quality["warnings"]:
             st.markdown("### Warning")

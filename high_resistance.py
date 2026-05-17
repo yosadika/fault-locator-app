@@ -223,24 +223,46 @@ def detect_high_resistance_fault(
         "distance_x_inside_line": 0.0 <= distance_x_km <= 1.2 * line_length_km,
     }
 
-    score = 0.0
+    evidence_score = 0.0
 
     if indicators["rf_large"]:
-        score += 4.0
+        evidence_score += 4.0
 
     if indicators["angle_more_resistive"]:
-        score += 2.0
+        evidence_score += 2.0
 
     if indicators["distance_methods_diverge"]:
-        score += 2.0
+        evidence_score += 2.0
 
     if indicators["distance_x_inside_line"]:
-        score += 1.0
+        evidence_score += 1.0
 
     if "G" in fault_type:
-        score += 1.0
+        evidence_score += 1.0
 
-    confidence = min(score, 10.0)
+    evidence_score = min(evidence_score, 10.0)
+
+    analysis_confidence = 10.0
+
+    if not indicators["distance_x_inside_line"]:
+        analysis_confidence -= 3.0
+
+    if distance_x_km < 0:
+        analysis_confidence -= 2.0
+
+    if distance_x_km > line_length_km:
+        analysis_confidence -= 2.0
+
+    if distance_deviation_percent >= 2.0 * distance_deviation_threshold_percent:
+        analysis_confidence -= 1.5
+    elif distance_deviation_percent >= distance_deviation_threshold_percent:
+        analysis_confidence -= 0.75
+
+    residual_x_ratio = abs(residual_z.imag) / max(abs(z_app), 1e-9)
+    if residual_x_ratio > 0.20:
+        analysis_confidence -= 1.0
+
+    analysis_confidence = max(0.0, min(10.0, analysis_confidence))
 
     high_resistance_suspected = (
         indicators["rf_large"]
@@ -276,7 +298,9 @@ def detect_high_resistance_fault(
         "fault_type": fault_type,
         "selected_loop": selected_loop,
         "high_resistance_suspected": high_resistance_suspected,
-        "confidence": round(confidence, 2),
+        "confidence": round(analysis_confidence, 2),
+        "analysis_confidence": round(analysis_confidence, 2),
+        "evidence_score": round(evidence_score, 2),
         "Zapp": z_app,
         "Zapp_R": z_app.real,
         "Zapp_X": z_app.imag,
@@ -308,7 +332,8 @@ def build_high_resistance_dataframe(result: dict):
             "Metric": "High Resistance Suspected",
             "Value": result["high_resistance_suspected"],
         },
-        {"Metric": "Confidence 0-10", "Value": result["confidence"]},
+        {"Metric": "Analysis Confidence 0-10", "Value": result["analysis_confidence"]},
+        {"Metric": "High Resistance Evidence 0-10", "Value": result["evidence_score"]},
         {"Metric": "Zapp R ohm", "Value": result["Zapp_R"]},
         {"Metric": "Zapp X ohm", "Value": result["Zapp_X"]},
         {"Metric": "Zapp Magnitude ohm", "Value": result["Zapp_mag"]},
