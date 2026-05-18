@@ -6,6 +6,7 @@ import re
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from comtrade_reader import read_comtrade
 from signal_assignment import apply_signal_assignment
@@ -245,6 +246,142 @@ def explain_sync_warning():
     )
 
 
+def add_fault_window_vlines(fig, fault_window, prefix=""):
+    labels = {
+        "left_time": "Left Cursor",
+        "fault_time": "Fault",
+        "dft_time": "DFT Cursor",
+        "right_time": "Right Cursor",
+    }
+    styles = {
+        "left_time": "dash",
+        "fault_time": "solid",
+        "dft_time": "dot",
+        "right_time": "dash",
+    }
+    positions = {
+        "left_time": "top left",
+        "fault_time": "top",
+        "dft_time": "top",
+        "right_time": "top right",
+    }
+
+    for key, label in labels.items():
+        fig.add_vline(
+            x=fault_window[key],
+            line_dash=styles[key],
+            annotation_text=f"{prefix}{label}",
+            annotation_position=positions[key],
+        )
+
+
+def build_fault_window_plot(df, fault_window, selected_channels, title):
+    fig = px.line(
+        df,
+        x="time",
+        y=selected_channels,
+        title=title,
+    )
+
+    add_fault_window_vlines(fig, fault_window)
+
+    fig.update_layout(
+        xaxis_title="Time (s)",
+        yaxis_title="Magnitude Primary",
+        legend_title="Signal",
+    )
+
+    return fig
+
+
+def build_synchronized_fault_plot(
+    local_df,
+    remote_df,
+    local_fault_window,
+    remote_fault_window,
+    selected_channels,
+    title,
+):
+    fig = go.Figure()
+
+    local_time = local_df["time"] - local_fault_window["fault_time"]
+    remote_time = remote_df["time"] - remote_fault_window["fault_time"]
+
+    for channel in selected_channels:
+        if channel in local_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=local_time,
+                    y=local_df[channel],
+                    mode="lines",
+                    name=f"Local {channel}",
+                    line=dict(width=1.4),
+                )
+            )
+
+        if channel in remote_df.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=remote_time,
+                    y=remote_df[channel],
+                    mode="lines",
+                    name=f"Remote {channel}",
+                    line=dict(width=1.4, dash="dash"),
+                )
+            )
+
+    sync_events = [
+        (0.0, "Fault", "solid"),
+        (
+            local_fault_window["left_time"] - local_fault_window["fault_time"],
+            "Local Left",
+            "dash",
+        ),
+        (
+            local_fault_window["dft_time"] - local_fault_window["fault_time"],
+            "Local DFT",
+            "dot",
+        ),
+        (
+            local_fault_window["right_time"] - local_fault_window["fault_time"],
+            "Local Right",
+            "dash",
+        ),
+        (
+            remote_fault_window["dft_time"] - remote_fault_window["fault_time"],
+            "Remote DFT",
+            "dot",
+        ),
+    ]
+
+    for x_value, label, dash in sync_events:
+        fig.add_vline(
+            x=x_value,
+            line_dash=dash,
+            annotation_text=label,
+            annotation_position="top",
+        )
+
+    left_limit = min(
+        local_fault_window["left_time"] - local_fault_window["fault_time"],
+        remote_fault_window["left_time"] - remote_fault_window["fault_time"],
+    )
+    right_limit = max(
+        local_fault_window["right_time"] - local_fault_window["fault_time"],
+        remote_fault_window["right_time"] - remote_fault_window["fault_time"],
+    )
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Aligned Time from Fault (s)",
+        yaxis_title="Magnitude Primary",
+        legend_title="Signal",
+        xaxis=dict(range=[left_limit, right_limit], autorange=False),
+    )
+
+    return fig
+
+
 def clean_gi_name(raw_name: str, fallback: str):
     name = str(raw_name or "").strip()
     if not name:
@@ -278,6 +415,25 @@ def infer_gi_names_from_line_name(line_name: str):
         )
 
     return "GI Local", "GI Remote"
+
+
+def reverse_line_name(line_name: str):
+    cleaned = str(line_name or "").strip()
+    if not cleaned:
+        return "Reverse Line"
+
+    base, sep, suffix = cleaned.partition("#")
+    suffix = f"{sep}{suffix}" if sep else ""
+
+    if "-" in base:
+        left, right = base.split("-", 1)
+        return f"{right.strip()}-{left.strip()}{suffix}"
+
+    parts = re.split(r"\s+(to|ke|s/d|sd)\s+", base, flags=re.IGNORECASE)
+    if len(parts) >= 3:
+        return f"{parts[2].strip()} {parts[1].strip()} {parts[0].strip()}{suffix}"
+
+    return f"{cleaned} reverse"
 
 
 def orient_remote_as_line_current(remote_phasors: dict, remote_direction: str):
@@ -805,24 +961,32 @@ with tab2:
         ct_primary = st.number_input(
             "CT Primary (A)",
             value=float(auto_transformer_data.get("ct_primary", 800.0)),
+            step=0.001,
+            format="%.5f",
         )
 
     with col_ct2:
         ct_secondary = st.number_input(
             "CT Secondary (A)",
             value=float(auto_transformer_data.get("ct_secondary", 1.0)),
+            step=0.001,
+            format="%.5f",
         )
 
     with col_vt1:
         vt_primary = st.number_input(
             "VT/CVT Primary (V)",
             value=float(auto_transformer_data.get("vt_primary", 150000.0)),
+            step=0.001,
+            format="%.5f",
         )
 
     with col_vt2:
         vt_secondary = st.number_input(
             "VT/CVT Secondary (V)",
             value=float(auto_transformer_data.get("vt_secondary", 100.0)),
+            step=0.001,
+            format="%.5f",
         )
     
     st.caption(
@@ -944,7 +1108,8 @@ with tab4:
             value=float(metadata["frequency"]) if metadata["frequency"] else 50.0,
             min_value=40.0,
             max_value=70.0,
-            step=0.1
+            step=0.001,
+            format="%.5f",
         )
 
     with col_fd2:
@@ -953,7 +1118,8 @@ with tab4:
             value=2.0,
             min_value=1.1,
             max_value=10.0,
-            step=0.1
+            step=0.001,
+            format="%.5f",
         )
 
     with col_fd3:
@@ -962,7 +1128,8 @@ with tab4:
             value=0.85,
             min_value=0.1,
             max_value=1.0,
-            step=0.01
+            step=0.0001,
+            format="%.5f",
         )
 
     col_w1, col_w2 = st.columns(2)
@@ -1008,7 +1175,8 @@ with tab4:
                 value=6.0,
                 min_value=2.0,
                 max_value=20.0,
-                step=0.5,
+                step=0.001,
+                format="%.5f",
                 help="Threshold adaptif terhadap noise pre-fault. Lebih kecil = lebih sensitif.",
                 disabled=not use_advanced_fault_detection,
             )
@@ -1019,7 +1187,8 @@ with tab4:
                 value=8.0,
                 min_value=2.0,
                 max_value=30.0,
-                step=0.5,
+                step=0.001,
+                format="%.5f",
                 disabled=(
                     not use_advanced_fault_detection
                     or fault_detection_method != "hybrid_superimposed"
@@ -1174,45 +1343,11 @@ with tab4:
             default=["Ia", "Ib", "Ic"]
         )
 
-        fig = px.line(
+        fig = build_fault_window_plot(
             display_df,
-            x="time",
-            y=selected_plot,
-            title="Fault Detection dan Cursor Window"
-        )
-
-        fig.add_vline(
-            x=fault_window["left_time"],
-            line_dash="dash",
-            annotation_text="Left Cursor",
-            annotation_position="top left"
-        )
-
-        fig.add_vline(
-            x=fault_window["fault_time"],
-            line_dash="solid",
-            annotation_text="Fault",
-            annotation_position="top"
-        )
-
-        fig.add_vline(
-            x=fault_window["dft_time"],
-            line_dash="dot",
-            annotation_text="DFT Cursor",
-            annotation_position="top"
-        )
-
-        fig.add_vline(
-            x=fault_window["right_time"],
-            line_dash="dash",
-            annotation_text="Right Cursor",
-            annotation_position="top right"
-        )
-
-        fig.update_layout(
-            xaxis_title="Time (s)",
-            yaxis_title="Magnitude Primary",
-            legend_title="Signal"
+            fault_window,
+            selected_plot,
+            "Fault Detection dan Cursor Window",
         )
 
         st.plotly_chart(fig, use_container_width=True)
@@ -1456,7 +1591,8 @@ with tab6:
             value=0.80,
             min_value=0.10,
             max_value=1.00,
-            step=0.01,
+            step=0.0001,
+            format="%.5f",
             help="Fasa dianggap drop jika Vphase <= threshold × Vmax."
         )
 
@@ -1466,7 +1602,8 @@ with tab6:
             value=1.50,
             min_value=1.05,
             max_value=10.00,
-            step=0.05,
+            step=0.0001,
+            format="%.5f",
             help="Fasa dianggap faulted jika Iphase >= threshold × Imin."
         )
 
@@ -1476,7 +1613,8 @@ with tab6:
             value=0.20,
             min_value=0.01,
             max_value=1.00,
-            step=0.01,
+            step=0.0001,
+            format="%.5f",
             help="Ground fault jika IE/Imax atau I0/Iavg melebihi threshold."
         )
 
@@ -1970,7 +2108,8 @@ with tab7:
                 "Line Length",
                 value=default_line_length,
                 min_value=0.001,
-                step=1.0,
+                step=0.001,
+                format="%.5f",
             )
 
         with col_lp3:
@@ -2044,6 +2183,8 @@ with tab7:
                 "Line CT Primary (A)",
                 value=default_lp_ct_primary,
                 min_value=0.001,
+                step=0.001,
+                format="%.5f",
             )
 
         with col_tr2:
@@ -2051,6 +2192,8 @@ with tab7:
                 "Line CT Secondary (A)",
                 value=default_lp_ct_secondary,
                 min_value=0.001,
+                step=0.001,
+                format="%.5f",
             )
 
         with col_tr3:
@@ -2058,6 +2201,8 @@ with tab7:
                 "Line VT Primary (V)",
                 value=default_lp_vt_primary,
                 min_value=0.001,
+                step=0.001,
+                format="%.5f",
             )
 
         with col_tr4:
@@ -2065,6 +2210,8 @@ with tab7:
                 "Line VT Secondary (V)",
                 value=default_lp_vt_secondary,
                 min_value=0.001,
+                step=0.001,
+                format="%.5f",
             )
 
         st.markdown("### Positive-Sequence System")
@@ -2099,12 +2246,16 @@ with tab7:
                 r1 = st.number_input(
                     "R1 / R1' (ohm or ohm/km)",
                     value=default_r1,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z1b:
                 x1 = st.number_input(
                     "X1 / X1' (ohm or ohm/km)",
                     value=default_x1,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
         elif positive_sequence_mode == "Z_PHI":
@@ -2114,12 +2265,16 @@ with tab7:
                 z1_mag = st.number_input(
                     "Z1 Magnitude",
                     value=0.4275,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z1b:
                 phi1_deg = st.number_input(
                     "Phi1 Angle (deg)",
                     value=79.22,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
         elif positive_sequence_mode == "X_PHI":
@@ -2129,12 +2284,16 @@ with tab7:
                 x1 = st.number_input(
                     "X1 / X1' (ohm or ohm/km)",
                     value=0.42,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z1b:
                 phi1_deg = st.number_input(
                     "Phi1 Angle (deg)",
                     value=79.22,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
         st.markdown("### Zero-Sequence System")
@@ -2168,12 +2327,16 @@ with tab7:
                 r0 = st.number_input(
                     "R0 / R0' (ohm or ohm/km)",
                     value=default_r0,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z0b:
                 x0 = st.number_input(
                     "X0 / X0' (ohm or ohm/km)",
                     value=default_x0,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
         elif zero_sequence_mode == "RE_RL_XE_XL":
@@ -2183,12 +2346,16 @@ with tab7:
                 re_rl = st.number_input(
                     "RE/RL",
                     value=3.125,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z0b:
                 xe_xl = st.number_input(
                     "XE/XL",
                     value=2.976,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             st.info(
@@ -2203,12 +2370,16 @@ with tab7:
                 z0_z1_mag = st.number_input(
                     "Z0/Z1 Magnitude",
                     value=3.0,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z0b:
                 z0_z1_angle_deg = st.number_input(
                     "Z0/Z1 Angle (deg)",
                     value=0.0,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
         elif zero_sequence_mode == "KL":
@@ -2218,12 +2389,16 @@ with tab7:
                 kl_mag = st.number_input(
                     "kL Magnitude",
                     value=0.70,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             with col_z0b:
                 kl_angle_deg = st.number_input(
                     "kL Angle (deg)",
                     value=0.0,
+                    step=0.00001,
+                    format="%.5f",
                 )
 
             st.warning(
@@ -2356,7 +2531,8 @@ with tab8:
             "Rf Threshold (ohm primary)",
             value=10.0,
             min_value=0.1,
-            step=1.0,
+            step=0.001,
+            format="%.5f",
         )
 
     with col_hr2:
@@ -2364,7 +2540,8 @@ with tab8:
             "Angle Deviation Threshold (deg)",
             value=10.0,
             min_value=1.0,
-            step=1.0,
+            step=0.001,
+            format="%.5f",
         )
 
     with col_hr3:
@@ -2372,7 +2549,8 @@ with tab8:
             "Distance Deviation Threshold (%)",
             value=15.0,
             min_value=1.0,
-            step=1.0,
+            step=0.001,
+            format="%.5f",
         )
 
     try:
@@ -3054,6 +3232,8 @@ with tab10:
             "Remote CT Primary (A)",
             value=float(remote_auto_transformer_data.get("ct_primary", 800.0)),
             min_value=0.001,
+            step=0.001,
+            format="%.5f",
             key="remote_ct_primary",
         )
 
@@ -3062,6 +3242,8 @@ with tab10:
             "Remote CT Secondary (A)",
             value=float(remote_auto_transformer_data.get("ct_secondary", 1.0)),
             min_value=0.001,
+            step=0.001,
+            format="%.5f",
             key="remote_ct_secondary",
         )
 
@@ -3070,6 +3252,8 @@ with tab10:
             "Remote VT Primary (V)",
             value=float(remote_auto_transformer_data.get("vt_primary", 150000.0)),
             min_value=0.001,
+            step=0.001,
+            format="%.5f",
             key="remote_vt_primary",
         )
 
@@ -3078,6 +3262,8 @@ with tab10:
             "Remote VT Secondary (V)",
             value=float(remote_auto_transformer_data.get("vt_secondary", 100.0)),
             min_value=0.001,
+            step=0.001,
+            format="%.5f",
             key="remote_vt_secondary",
         )
 
@@ -3119,7 +3305,8 @@ with tab10:
             value=float(remote_metadata["frequency"]) if remote_metadata["frequency"] else 50.0,
             min_value=40.0,
             max_value=70.0,
-            step=0.1,
+            step=0.001,
+            format="%.5f",
             key="remote_frequency",
         )
 
@@ -3129,7 +3316,8 @@ with tab10:
             value=2.0,
             min_value=1.1,
             max_value=10.0,
-            step=0.1,
+            step=0.001,
+            format="%.5f",
             key="remote_current_multiplier",
         )
 
@@ -3139,7 +3327,8 @@ with tab10:
             value=0.85,
             min_value=0.1,
             max_value=1.0,
-            step=0.01,
+            step=0.0001,
+            format="%.5f",
             key="remote_voltage_threshold",
         )
 
@@ -3211,6 +3400,30 @@ with tab10:
     col_rdc2.metric("Left Cursor", f'{remote_fault_window["left_time"]:.6f} s')
     col_rdc3.metric("DFT Cursor", f'{remote_fault_window["dft_time"]:.6f} s')
     col_rdc4.metric("Right Cursor", f'{remote_fault_window["right_time"]:.6f} s')
+
+    remote_plot_channels = [
+        channel
+        for channel in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
+        if channel in remote_assigned_df.columns
+    ]
+    remote_default_channels = [
+        channel for channel in ["Ia", "Ib", "Ic"] if channel in remote_plot_channels
+    ]
+    remote_selected_plot = st.multiselect(
+        "Pilih sinyal remote untuk validasi fault window",
+        remote_plot_channels,
+        default=remote_default_channels or remote_plot_channels[:3],
+        key="remote_fault_window_plot_channels",
+    )
+
+    if remote_selected_plot:
+        remote_fault_fig = build_fault_window_plot(
+            remote_assigned_df,
+            remote_fault_window,
+            remote_selected_plot,
+            "Remote Fault Detection dan Cursor Window",
+        )
+        st.plotly_chart(remote_fault_fig, use_container_width=True)
 
     remote_cursor_df = pd.DataFrame(
         [
@@ -3287,7 +3500,8 @@ with tab10:
             value=0.80,
             min_value=0.10,
             max_value=1.00,
-            step=0.01,
+            step=0.0001,
+            format="%.5f",
             key="remote_fault_type_voltage_drop_threshold",
             help="Fasa remote dianggap drop jika Vphase <= threshold x Vmax.",
         )
@@ -3298,7 +3512,8 @@ with tab10:
             value=1.50,
             min_value=1.05,
             max_value=10.00,
-            step=0.05,
+            step=0.0001,
+            format="%.5f",
             key="remote_fault_type_current_rise_threshold",
             help="Fasa remote dianggap faulted jika Iphase >= threshold x Imin.",
         )
@@ -3309,7 +3524,8 @@ with tab10:
             value=0.20,
             min_value=0.01,
             max_value=1.00,
-            step=0.01,
+            step=0.0001,
+            format="%.5f",
             key="remote_fault_type_ground_current_threshold",
             help="Ground fault remote jika IE/Imax atau I0/Iavg melebihi threshold.",
         )
@@ -3394,6 +3610,45 @@ with tab10:
             st.info(explain_sync_warning())
         else:
             st.success("Perbedaan waktu fault local dan remote masih dalam batas 1 siklus.")
+
+        st.markdown("#### Synchronized Local vs Remote Fault Waveform")
+        st.caption(
+            "Grafik ini menggeser waktu masing-masing rekaman sehingga fault lokal dan remote "
+            "berada di t = 0 s. Gunakan grafik ini untuk memeriksa apakah bentuk gelombang "
+            "di sekitar fault sudah sejajar setelah sinkronisasi berbasis fault cursor."
+        )
+
+        local_assigned_df = st.session_state.get("assigned_df")
+        sync_plot_channels = [
+            channel
+            for channel in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
+            if (
+                local_assigned_df is not None
+                and channel in local_assigned_df.columns
+                and channel in remote_assigned_df.columns
+            )
+        ]
+        sync_default_channels = [
+            channel for channel in ["Ia", "Ib", "Ic"] if channel in sync_plot_channels
+        ]
+
+        sync_selected_channels = st.multiselect(
+            "Pilih sinyal untuk grafik sinkronisasi local-remote",
+            sync_plot_channels,
+            default=sync_default_channels or sync_plot_channels[:3],
+            key="sync_fault_waveform_channels",
+        )
+
+        if local_assigned_df is not None and sync_selected_channels:
+            sync_fig = build_synchronized_fault_plot(
+                local_assigned_df,
+                remote_assigned_df,
+                local_fault_window,
+                remote_fault_window,
+                sync_selected_channels,
+                "Synchronized Fault Waveform - Local vs Remote",
+            )
+            st.plotly_chart(sync_fig, use_container_width=True)
     else:
         st.warning("Local fault window belum tersedia.")
 
@@ -3813,9 +4068,14 @@ with tab10:
         st.markdown("### Line Position Visualization")
 
         L = line_param["length_km"]
+        line_display_name = str(line_param.get("line_name") or "").strip()
+        if not line_display_name:
+            line_display_name = f"{local_gi_label.replace('GI ', '')}-{remote_gi_label.replace('GI ', '')}"
+        de_original_label = f"DE {line_display_name}"
+        de_reverse_label = f"DE {reverse_line_name(line_display_name)}"
         marker_rows = [
             {
-                "Point": "Double-ended original",
+                "Point": de_original_label,
                 "Distance km": two_result.get("distance_from_original_local_km", two_result["distance_km"]),
                 "Score": two_quality["quality_score"],
                 "Track": "Double-ended",
@@ -3827,7 +4087,7 @@ with tab10:
         if two_reverse_result:
             marker_rows.append(
                 {
-                    "Point": "Double-ended reverse",
+                    "Point": de_reverse_label,
                     "Distance km": two_reverse_result["distance_from_original_local_km"],
                     "Score": two_reverse_quality["quality_score"] if two_reverse_quality else 0.0,
                     "Track": "Double-ended",
@@ -3961,9 +4221,11 @@ with tab10:
                 .replace("Double-ended", "DE")
                 .replace("Single-ended", "SE")
             )
+            row["Legend Name"] = short_name
             row["Label"] = (
                 f"<b>{short_name}</b><br>"
-                f"{row['Distance km']:.2f} km | {row['Score']:.1f}/10"
+                f"{row['Distance km']:.2f} km ({row['Distance %']:.1f}%)<br>"
+                f"{row['Score']:.1f}/10"
             )
             row["Annotation Ay"], row["Annotation Ax"] = label_layout.get(
                 id(row),
@@ -3972,10 +4234,17 @@ with tab10:
 
         marker_df = pd.DataFrame(marker_rows)
 
-        fig_two = go.Figure()
+        fig_two = make_subplots(
+            rows=2,
+            cols=1,
+            shared_xaxes=True,
+            row_heights=[0.18, 0.82],
+            vertical_spacing=0.08,
+        )
 
         baseline_y = 0.0
-        gi_label_y = 10.7
+        gi_line_y = 0.5
+        gi_marker_y_base = 0.5
 
         fig_two.add_shape(
             type="line",
@@ -3984,28 +4253,92 @@ with tab10:
             y0=baseline_y,
             y1=baseline_y,
             line=dict(color=muted_text_color, width=1.2),
+            row=2,
+            col=1,
+        )
+
+        fig_two.add_shape(
+            type="line",
+            x0=0,
+            x1=L,
+            y0=gi_line_y,
+            y1=gi_line_y,
+            line=dict(color=muted_text_color, width=2),
+            row=1,
+            col=1,
         )
 
         fig_two.add_trace(
             go.Scatter(
                 x=[0, L],
-                y=[gi_label_y, gi_label_y],
-                mode="markers+text",
-                marker=dict(size=10, color=[terminal_color, terminal_color], symbol="line-ns"),
-                text=[local_gi_label, remote_gi_label],
-                textposition=["bottom left", "bottom right"],
-                textfont=dict(color=text_color, size=12),
+                y=[gi_line_y, gi_line_y],
+                mode="markers",
+                marker=dict(size=12, color=[terminal_color, terminal_color], symbol="square"),
                 hoverinfo="skip",
                 showlegend=False,
-            )
+            ),
+            row=1,
+            col=1,
         )
 
-        legend_shown = set()
+        fig_two.add_annotation(
+            x=0,
+            y=gi_line_y,
+            text=local_gi_label,
+            showarrow=False,
+            xanchor="left",
+            yanchor="bottom",
+            xshift=8,
+            yshift=12,
+            font=dict(color=text_color, size=13),
+            row=1,
+            col=1,
+        )
+        fig_two.add_annotation(
+            x=L,
+            y=gi_line_y,
+            text=remote_gi_label,
+            showarrow=False,
+            xanchor="right",
+            yanchor="bottom",
+            xshift=-8,
+            yshift=12,
+            font=dict(color=text_color, size=13),
+            row=1,
+            col=1,
+        )
+
+        for index, (_, row) in enumerate(marker_df.sort_values(["Distance km", "Track"]).iterrows()):
+            strip_y = gi_marker_y_base
+
+            fig_two.add_trace(
+                go.Scatter(
+                    x=[row["Distance km"]],
+                    y=[strip_y],
+                    mode="markers",
+                    marker=dict(
+                        size=13,
+                        color=row["Color"],
+                        symbol=row["Symbol"],
+                        line=dict(width=2, color=terminal_color),
+                    ),
+                    name=row["Legend Name"],
+                    legendgroup=row["Point"],
+                    showlegend=True,
+                    hovertemplate=(
+                        f"{row['Point']}<br>"
+                        f"{row['Distance km']:.2f} km ({row['Distance %']:.1f}%)<br>"
+                        f"Score {row['Score']:.1f}/10"
+                        "<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=1,
+            )
+
         x_profile = [i * L / 300.0 for i in range(301)]
 
         for _, row in marker_df.iterrows():
-            show_legend = row["Track"] not in legend_shown
-            legend_shown.add(row["Track"])
             center = float(row["Distance km"])
             score = float(row["Score"])
             curve_width = max(L * (0.09 if row["Track"] == "Double-ended" else 0.06), 2.5)
@@ -4023,8 +4356,10 @@ with tab10:
                     opacity=0.9,
                     hoverinfo="skip",
                     showlegend=False,
-                    legendgroup=row["Track"],
-                )
+                    legendgroup=row["Point"],
+                ),
+                row=2,
+                col=1,
             )
 
             fig_two.add_trace(
@@ -4038,9 +4373,9 @@ with tab10:
                         symbol=row["Symbol"],
                         line=dict(width=2, color=terminal_color),
                     ),
-                    name=row["Track"],
-                    showlegend=show_legend,
-                    legendgroup=row["Track"],
+                    name=row["Legend Name"],
+                    showlegend=False,
+                    legendgroup=row["Point"],
                     customdata=[[row["Point"], row["Distance km"], row["Distance %"], row["Score"]]],
                     hovertemplate=(
                         "%{customdata[0]}<br>"
@@ -4048,7 +4383,9 @@ with tab10:
                         "Score %{customdata[3]:.1f}/10"
                         "<extra></extra>"
                     ),
-                )
+                ),
+                row=2,
+                col=1,
             )
 
             fig_two.add_shape(
@@ -4058,6 +4395,8 @@ with tab10:
                 y0=baseline_y,
                 y1=row["Score"],
                 line=dict(color=row["Color"], width=1.4),
+                row=2,
+                col=1,
             )
 
             fig_two.add_annotation(
@@ -4076,6 +4415,8 @@ with tab10:
                 borderwidth=1,
                 borderpad=4,
                 font=dict(color=text_color, size=11),
+                row=2,
+                col=1,
             )
 
         fig_two.update_layout(
@@ -4085,35 +4426,51 @@ with tab10:
             plot_bgcolor=plot_bg,
             font=dict(color=text_color),
             xaxis=dict(
+                range=[0, L],
+                autorange=False,
+                showgrid=False,
+                zeroline=False,
+                showticklabels=False,
+                color=text_color,
+            ),
+            yaxis=dict(
+                range=[0.0, 1.0],
+                showgrid=False,
+                zeroline=False,
+                showticklabels=False,
+                color=text_color,
+            ),
+            xaxis2=dict(
                 title=dict(
                     text=f"Distance from {local_gi_label} (km)",
                     font=dict(color=axis_title_color),
                 ),
-                range=[-0.06 * L, 1.06 * L],
+                range=[0, L],
+                autorange=False,
                 zeroline=False,
                 color=text_color,
                 tickfont=dict(color=muted_text_color),
                 gridcolor="rgba(148,163,184,0.22)" if is_dark_theme else "rgba(148,163,184,0.35)",
             ),
-            yaxis=dict(
+            yaxis2=dict(
                 title=dict(
                     text="Quality / Confidence (0-10)",
                     font=dict(color=axis_title_color),
                 ),
-                range=[-0.4, 11.2],
+                range=[-0.4, 11.4],
                 showgrid=True,
                 gridcolor="rgba(148,163,184,0.14)" if is_dark_theme else "rgba(148,163,184,0.22)",
                 zeroline=False,
                 color=text_color,
                 tickfont=dict(color=muted_text_color),
             ),
-            height=720,
-            margin=dict(l=78, r=170, t=130, b=92),
+            height=800,
+            margin=dict(l=58, r=34, t=118, b=92),
             showlegend=True,
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
-                y=1.24,
+                y=1.12,
                 xanchor="right",
                 x=1,
                 bgcolor="rgba(15,23,42,0.85)" if is_dark_theme else "rgba(255,255,255,0.90)",
@@ -4126,10 +4483,14 @@ with tab10:
         fig_two.update_xaxes(
             tickfont=dict(color=muted_text_color),
             title_font=dict(color=axis_title_color),
+            row=2,
+            col=1,
         )
         fig_two.update_yaxes(
             tickfont=dict(color=muted_text_color),
             title_font=dict(color=axis_title_color),
+            row=2,
+            col=1,
         )
 
         st.plotly_chart(fig_two, use_container_width=True)
