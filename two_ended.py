@@ -367,6 +367,7 @@ def build_two_ended_result_dataframe(result: dict, quality: dict):
         {"Parameter": "Uploaded Remote Current Direction", "Value": result.get("uploaded_remote_current_direction", result["remote_current_direction"])},
         {"Parameter": "Remote DFT Index Used", "Value": result.get("remote_dft_index_used", "-")},
         {"Parameter": "Remote Waveform Sync Reference", "Value": result.get("remote_waveform_sync_reference", "fault_cursor")},
+        {"Parameter": "Remote Waveform Sync Method", "Value": result.get("remote_waveform_sync_method", "fault_cursor")},
         {"Parameter": "Remote Waveform Sync Shift (s)", "Value": result.get("remote_waveform_sync_shift_s", 0.0)},
         {"Parameter": "Remote Waveform Sync Score", "Value": result.get("remote_waveform_sync_score", 0.0)},
         {"Parameter": "Remote Voltage Polarity", "Value": result.get("remote_voltage_polarity", 1)},

@@ -358,6 +358,8 @@ def detect_fault_inception(
     refine_fault_bar: bool = False,
     method: str = "legacy_rms",
     superimposed_threshold_sigma: float = 8.0,
+    nominal_phase_voltage_rms: float | None = None,
+    nominal_current_rms: float | None = None,
 ):
     """
     Deteksi awal gangguan berdasarkan:
@@ -419,8 +421,24 @@ def detect_fault_inception(
         voltage_rms_min[samples_per_cycle:prefault_samples]
     )
 
-    current_pickup = prefault_current * current_threshold_multiplier
-    voltage_pickup = prefault_voltage * voltage_drop_threshold
+    reference_current = prefault_current
+    reference_voltage = prefault_voltage
+    reference_mode = "prefault_rms"
+
+    if nominal_phase_voltage_rms and nominal_phase_voltage_rms > 0:
+        nominal_phase_voltage_rms = float(nominal_phase_voltage_rms)
+        if prefault_voltage < 0.97 * nominal_phase_voltage_rms:
+            reference_voltage = nominal_phase_voltage_rms
+            reference_mode = "nominal_vt_assisted"
+
+    if nominal_current_rms and nominal_current_rms > 0:
+        nominal_current_rms = float(nominal_current_rms)
+        if prefault_current > 1.20 * nominal_current_rms:
+            reference_current = nominal_current_rms
+            reference_mode = "nominal_ct_vt_assisted"
+
+    current_pickup = reference_current * current_threshold_multiplier
+    voltage_pickup = reference_voltage * voltage_drop_threshold
 
     current_condition = current_rms_max > current_pickup
     voltage_condition = voltage_rms_min < voltage_pickup
@@ -514,6 +532,11 @@ def detect_fault_inception(
             "samples_per_cycle": samples_per_cycle,
             "prefault_current": prefault_current,
             "prefault_voltage": prefault_voltage,
+            "reference_current": reference_current,
+            "reference_voltage": reference_voltage,
+            "nominal_current_rms": float(nominal_current_rms or 0.0),
+            "nominal_phase_voltage_rms": float(nominal_phase_voltage_rms or 0.0),
+            "reference_mode": reference_mode,
             "current_sigma": current_sigma,
             "voltage_sigma": voltage_sigma,
             "adaptive_threshold_sigma": adaptive_threshold_sigma,
@@ -567,6 +590,11 @@ def detect_fault_inception(
         "samples_per_cycle": samples_per_cycle,
         "prefault_current": prefault_current,
         "prefault_voltage": prefault_voltage,
+        "reference_current": reference_current,
+        "reference_voltage": reference_voltage,
+        "nominal_current_rms": float(nominal_current_rms or 0.0),
+        "nominal_phase_voltage_rms": float(nominal_phase_voltage_rms or 0.0),
+        "reference_mode": reference_mode,
         "current_sigma": current_sigma,
         "voltage_sigma": voltage_sigma,
         "current_pickup": current_pickup,
