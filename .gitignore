@@ -28,6 +28,9 @@ dist/
 credentials.json
 service-account*.json
 
+# Local/private database files
+database/
+
 # Editor and OS local files
 .vscode/
 .idea/
