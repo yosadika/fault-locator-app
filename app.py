@@ -1,5 +1,6 @@
 import streamlit as st
 import tempfile
+import os
 import math
 import cmath
 import re
@@ -66,6 +67,61 @@ from single_ended import (
     calculate_single_ended_fault_location,
     build_single_ended_result_dataframe,
 )
+
+
+MAX_PLOT_POINTS = 6000
+
+
+@st.cache_data(show_spinner="Membaca file COMTRADE...")
+def read_comtrade_cached(cfg_bytes: bytes, dat_bytes: bytes, cfg_name: str = "", dat_name: str = ""):
+    cfg_path = None
+    dat_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".cfg") as temp_cfg:
+            temp_cfg.write(cfg_bytes)
+            cfg_path = temp_cfg.name
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as temp_dat:
+            temp_dat.write(dat_bytes)
+            dat_path = temp_dat.name
+
+        return read_comtrade(cfg_path, dat_path)
+    finally:
+        for temp_path in [cfg_path, dat_path]:
+            if temp_path:
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+
+@st.cache_data(ttl=1800, show_spinner="Membaca Google Spreadsheet...")
+def read_google_spreadsheet_table_cached(url_or_id: str, sheet_name: str):
+    return read_google_spreadsheet_table(url_or_id, sheet_name)
+
+
+@st.cache_data(ttl=1800, show_spinner="Membaca daftar sheet...")
+def get_google_spreadsheet_sheet_names_cached(url_or_id: str):
+    return get_google_spreadsheet_sheet_names(url_or_id)
+
+
+def downsample_xy(x_values, y_values, max_points: int = MAX_PLOT_POINTS):
+    length = len(x_values)
+    if length <= max_points:
+        return x_values, y_values
+
+    step = max(1, int(math.ceil(length / max_points)))
+    return x_values[::step], y_values[::step]
+
+
+def downsample_dataframe_for_plot(df: pd.DataFrame, x_col: str, y_cols, max_points: int = MAX_PLOT_POINTS):
+    if df is None or len(df) <= max_points:
+        return df
+
+    selected_cols = [x_col] + [col for col in y_cols if col in df.columns]
+    step = max(1, int(math.ceil(len(df) / max_points)))
+    return df.loc[df.index[::step], selected_cols]
 
 
 def make_streamlit_safe_columns(df):
@@ -271,6 +327,8 @@ def build_assigned_waveform_plot(
         plot_df = df
         yaxis_title = "Instantaneous Primary Magnitude (peak)"
         caption = "Mode instantaneous menampilkan nilai sample/peak seperti waveform mentah."
+
+    plot_df = downsample_dataframe_for_plot(plot_df, "time", channels)
 
     fig = px.line(
         plot_df,
@@ -725,8 +783,10 @@ def add_fault_window_vlines(fig, fault_window, prefix=""):
 
 
 def build_fault_window_plot(df, fault_window, selected_channels, title):
+    plot_df = downsample_dataframe_for_plot(df, "time", selected_channels)
+
     fig = px.line(
-        df,
+        plot_df,
         x="time",
         y=selected_channels,
         title=title,
@@ -763,10 +823,11 @@ def build_synchronized_fault_plot(
 
     for channel in selected_channels:
         if channel in local_df.columns:
+            local_x, local_y = downsample_xy(local_time, local_df[channel])
             fig.add_trace(
                 go.Scatter(
-                    x=local_time,
-                    y=local_df[channel],
+                    x=local_x,
+                    y=local_y,
                     mode="lines",
                     name=f"Local {channel}",
                     line=dict(width=1.4),
@@ -774,10 +835,11 @@ def build_synchronized_fault_plot(
             )
 
         if channel in remote_df.columns:
+            remote_x, remote_y = downsample_xy(remote_time, remote_df[channel])
             fig.add_trace(
                 go.Scatter(
-                    x=remote_time,
-                    y=remote_df[channel],
+                    x=remote_x,
+                    y=remote_y,
                     mode="lines",
                     name=f"Remote {channel}",
                     line=dict(width=1.4, dash="dash"),
@@ -1112,10 +1174,11 @@ def build_summary_focus_waveform(
     if local_df is not None and local_fault_window is not None and channel in local_df.columns:
         local_time = local_df["time"] - local_fault_window["fault_time"]
         local_mask = (local_time >= -seconds_before) & (local_time <= seconds_after)
+        local_x, local_y = downsample_xy(local_time[local_mask], local_df.loc[local_mask, channel])
         fig.add_trace(
             go.Scatter(
-                x=local_time[local_mask],
-                y=local_df.loc[local_mask, channel],
+                x=local_x,
+                y=local_y,
                 mode="lines",
                 name=f"Local {channel}",
                 line=dict(width=1.4),
@@ -1125,10 +1188,11 @@ def build_summary_focus_waveform(
     if remote_df is not None and remote_fault_window is not None and channel in remote_df.columns:
         remote_time = remote_df["time"] - remote_fault_window["fault_time"] + remote_time_shift_s
         remote_mask = (remote_time >= -seconds_before) & (remote_time <= seconds_after)
+        remote_x, remote_y = downsample_xy(remote_time[remote_mask], remote_df.loc[remote_mask, channel])
         fig.add_trace(
             go.Scatter(
-                x=remote_time[remote_mask],
-                y=remote_df.loc[remote_mask, channel],
+                x=remote_x,
+                y=remote_y,
                 mode="lines",
                 name=f"Remote {channel}",
                 line=dict(width=1.4, dash="dash"),
@@ -1393,6 +1457,23 @@ def build_summary_location_plot(
 
     return fig
 
+
+def build_summary_line_position_from_session():
+    line_param = st.session_state.get("line_param")
+    two_result = st.session_state.get("two_ended_result")
+
+    if not line_param or not two_result:
+        return None
+
+    return build_summary_location_plot(
+        line_param=line_param,
+        local_gi_label=st.session_state.get("two_ended_local_gi_label", "GI Local"),
+        remote_gi_label=st.session_state.get("two_ended_remote_gi_label", "GI Remote"),
+        single_result=st.session_state.get("two_ended_local_single_result") or st.session_state.get("single_ended_result"),
+        remote_single_result=st.session_state.get("two_ended_remote_single_result"),
+        two_result=two_result,
+        reverse_two_result=st.session_state.get("two_ended_reverse_result"),
+    )
 
 def get_index_at_time(df, time_value: float):
     return int((df["time"] - time_value).abs().idxmin())
@@ -1821,16 +1902,16 @@ if cfg_file is None or dat_file is None:
     st.info("Silakan upload pasangan file .cfg dan .dat terlebih dahulu.")
     st.stop()
 
-with tempfile.NamedTemporaryFile(delete=False, suffix=".cfg") as temp_cfg:
-    temp_cfg.write(cfg_file.read())
-    cfg_path = temp_cfg.name
-
-with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as temp_dat:
-    temp_dat.write(dat_file.read())
-    dat_path = temp_dat.name
+local_cfg_bytes = cfg_file.getvalue()
+local_dat_bytes = dat_file.getvalue()
 
 try:
-    df, metadata = read_comtrade(cfg_path, dat_path)
+    df, metadata = read_comtrade_cached(
+        local_cfg_bytes,
+        local_dat_bytes,
+        cfg_file.name,
+        dat_file.name,
+    )
 
     auto_assignment = detect_voltage_current_channels(df, metadata)
     auto_transformer_data = get_auto_transformer_data(metadata)
@@ -2086,33 +2167,41 @@ with summary_container:
         ),
     ]
 
-    for channel_name, waveform_title in waveform_specs:
-        if (
-            (
-                local_assigned_df is not None
-                and local_fault_window is not None
-                and channel_name in local_assigned_df.columns
-            )
-            or (
-                remote_assigned_df is not None
-                and remote_fault_window is not None
-                and channel_name in remote_assigned_df.columns
-            )
-        ):
-            st.plotly_chart(
-                build_summary_focus_waveform(
-                    local_assigned_df,
-                    remote_assigned_df,
-                    local_fault_window,
-                    remote_fault_window,
-                    channel_name,
-                    waveform_title,
-                    remote_time_shift_s=summary_remote_shift_s,
-                ),
-                use_container_width=True,
-            )
-        else:
-            st.info(f"Channel {channel_name} belum tersedia untuk grafik {waveform_title}.")
+    show_summary_waveforms = st.toggle(
+        "Tampilkan waveform fokus di Summary",
+        value=False,
+        key="show_summary_waveforms",
+        help="Matikan default agar Summary tetap ringan di hosting. Aktifkan saat ingin membuat report atau validasi visual.",
+    )
+
+    if show_summary_waveforms:
+        for channel_name, waveform_title in waveform_specs:
+            if (
+                (
+                    local_assigned_df is not None
+                    and local_fault_window is not None
+                    and channel_name in local_assigned_df.columns
+                )
+                or (
+                    remote_assigned_df is not None
+                    and remote_fault_window is not None
+                    and channel_name in remote_assigned_df.columns
+                )
+            ):
+                st.plotly_chart(
+                    build_summary_focus_waveform(
+                        local_assigned_df,
+                        remote_assigned_df,
+                        local_fault_window,
+                        remote_fault_window,
+                        channel_name,
+                        waveform_title,
+                        remote_time_shift_s=summary_remote_shift_s,
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info(f"Channel {channel_name} belum tersedia untuk grafik {waveform_title}.")
 
     st.markdown("### Estimasi Penyebab Gangguan")
     estimated_cause, estimated_cause_note = estimate_summary_disturbance_cause(
@@ -2137,18 +2226,17 @@ with summary_container:
     st.caption(estimated_cause_note)
 
     st.markdown("### Grafik SE dan DE")
-    if "two_ended_line_position_fig" in st.session_state:
+    summary_location_fig = build_summary_line_position_from_session()
+    if summary_location_fig is not None:
         st.plotly_chart(
-            st.session_state["two_ended_line_position_fig"],
+            summary_location_fig,
             use_container_width=True,
             key="summary_two_ended_line_position_fig",
         )
     else:
         st.info(
-            "Grafik SE/DE akan muncul sama persis dengan Line Position Visualization setelah tab Double-End "
-            "selesai menghitung dan grafiknya terbentuk."
+            "Grafik SE/DE akan muncul setelah Single-End atau Double-End selesai menghitung."
         )
-
     if "high_resistance_result" in st.session_state:
         st.info(explain_high_resistance_result(st.session_state["high_resistance_result"]))
 
@@ -2220,7 +2308,7 @@ with tab0:
     with col_refresh:
         if st.button("Refresh Sheets", key="refresh_database_sheets"):
             try:
-                available_sheets = get_google_spreadsheet_sheet_names(database_spreadsheet_url)
+                available_sheets = get_google_spreadsheet_sheet_names_cached(database_spreadsheet_url)
                 st.session_state["database_available_sheets"] = available_sheets
                 st.session_state["line_data_available_sheets"] = available_sheets
                 st.session_state["cable_data_available_sheets"] = available_sheets
@@ -2264,7 +2352,7 @@ with tab0:
         with st.expander(f"Preview {label} Spreadsheet"):
             if st.button(f"Load Preview {label}", key=f"preview_{source_key}_spreadsheet"):
                 try:
-                    preview_df = read_google_spreadsheet_table(
+                    preview_df = read_google_spreadsheet_table_cached(
                         st.session_state["database_spreadsheet_url"],
                         st.session_state[f"{source_key}_sheet_name"],
                     )
@@ -3192,8 +3280,9 @@ with tab5:
             default=["Ia", "Ib", "Ic"],
         )
 
+        dft_plot_df = downsample_dataframe_for_plot(assigned_df, "time", selected_dft_plot)
         fig_dft = px.line(
-            assigned_df,
+            dft_plot_df,
             x="time",
             y=selected_dft_plot,
             title="DFT Window pada Waveform",
@@ -3589,7 +3678,7 @@ with tab7:
             )
 
             try:
-                conductor_df = read_google_spreadsheet_table(
+                conductor_df = read_google_spreadsheet_table_cached(
                     database_spreadsheet_url,
                     database_sheet_name,
                 )
@@ -4802,19 +4891,16 @@ with tab10:
 
     st.success("Remote end COMTRADE sudah dipilih dari panel upload.")
 
-    remote_cfg_file.seek(0)
-    remote_dat_file.seek(0)
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".cfg") as temp_remote_cfg:
-        temp_remote_cfg.write(remote_cfg_file.read())
-        remote_cfg_path = temp_remote_cfg.name
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as temp_remote_dat:
-        temp_remote_dat.write(remote_dat_file.read())
-        remote_dat_path = temp_remote_dat.name
+    remote_cfg_bytes = remote_cfg_file.getvalue()
+    remote_dat_bytes = remote_dat_file.getvalue()
 
     try:
-        remote_df, remote_metadata = read_comtrade(remote_cfg_path, remote_dat_path)
+        remote_df, remote_metadata = read_comtrade_cached(
+            remote_cfg_bytes,
+            remote_dat_bytes,
+            remote_cfg_file.name,
+            remote_dat_file.name,
+        )
 
         remote_auto_assignment = detect_voltage_current_channels(
             remote_df,
@@ -6277,6 +6363,7 @@ with tab10:
             st.session_state["two_ended_single_ended_error"] = single_ended_compare_error
             st.session_state["two_ended_local_gi_label"] = local_gi_label
             st.session_state["two_ended_remote_gi_label"] = remote_gi_label
+            st.session_state.pop("two_ended_line_position_fig", None)
 
             st.success("Two-ended fault location berhasil dihitung.")
 
@@ -6285,6 +6372,8 @@ with tab10:
                     "Two-ended berhasil, tetapi single-ended comparison gagal: "
                     f"{single_ended_compare_error}"
                 )
+
+            st.rerun()
 
         except Exception as e:
             st.error("Two-ended fault location gagal.")
@@ -6950,7 +7039,6 @@ with tab10:
             col=1,
         )
 
-        st.session_state["two_ended_line_position_fig"] = fig_two
         st.plotly_chart(fig_two, use_container_width=True)
 
         if "two_ended_candidates" in st.session_state:
