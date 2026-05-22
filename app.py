@@ -115,6 +115,21 @@ def downsample_xy(x_values, y_values, max_points: int = MAX_PLOT_POINTS):
     return x_values[::step], y_values[::step]
 
 
+def validate_uploaded_extension(uploaded_file, expected_extension: str, label: str):
+    if uploaded_file is None:
+        return True
+
+    file_name = str(uploaded_file.name or "").lower()
+    if file_name.endswith(expected_extension.lower()):
+        return True
+
+    st.error(
+        f"{label} harus berekstensi `{expected_extension}`. "
+        f"File yang dipilih: `{uploaded_file.name}`. "
+        "Pada smartphone, simpan file ke Files/Downloads dan pastikan ekstensi tidak berubah."
+    )
+    return False
+
 def downsample_dataframe_for_plot(df: pd.DataFrame, x_col: str, y_cols, max_points: int = MAX_PLOT_POINTS):
     if df is None or len(df) <= max_points:
         return df
@@ -1877,15 +1892,20 @@ st.title("Transmission Fault Locator")
 
 st.sidebar.header("Upload Local End COMTRADE")
 
-cfg_file = st.sidebar.file_uploader("Local .cfg", type=["cfg"], key="local_cfg_file")
-dat_file = st.sidebar.file_uploader("Local .dat", type=["dat"], key="local_dat_file")
+cfg_file = st.sidebar.file_uploader("Local .cfg", key="local_cfg_file")
+dat_file = st.sidebar.file_uploader("Local .dat", key="local_dat_file")
 
 st.sidebar.divider()
 st.sidebar.header("Upload Remote End COMTRADE")
 st.sidebar.caption("Opsional. Diisi jika ingin menghitung double-ended.")
-remote_cfg_file = st.sidebar.file_uploader("Remote .cfg", type=["cfg"], key="remote_cfg_file")
-remote_dat_file = st.sidebar.file_uploader("Remote .dat", type=["dat"], key="remote_dat_file")
+remote_cfg_file = st.sidebar.file_uploader("Remote .cfg", key="remote_cfg_file")
+remote_dat_file = st.sidebar.file_uploader("Remote .dat", key="remote_dat_file")
 
+if not validate_uploaded_extension(cfg_file, ".cfg", "File local CFG"):
+    st.stop()
+
+if not validate_uploaded_extension(dat_file, ".dat", "File local DAT"):
+    st.stop()
 if cfg_file is None or dat_file is None:
     tab_summary_empty = st.tabs(["Summary"])[0]
     with tab_summary_empty:
@@ -4887,6 +4907,12 @@ with tab10:
             "Upload pasangan file .cfg dan .dat dari relay ujung remote pada panel kiri "
             "untuk menjalankan double-ended calculation."
         )
+        st.stop()
+
+    if not validate_uploaded_extension(remote_cfg_file, ".cfg", "File remote CFG"):
+        st.stop()
+
+    if not validate_uploaded_extension(remote_dat_file, ".dat", "File remote DAT"):
         st.stop()
 
     st.success("Remote end COMTRADE sudah dipilih dari panel upload.")
