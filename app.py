@@ -1,4 +1,4 @@
-﻿import streamlit as st
+import streamlit as st
 import tempfile
 import os
 import math
@@ -2287,334 +2287,1108 @@ except Exception as e:
 st.success("File COMTRADE berhasil dibaca.")
 
 st.caption(
-    "Workflow ringkas: upload local/remote di panel kiri -> cek Signals -> validasi Waveform/Fault Cursor "
+    "Workflow ringkas: upload local/remote di panel kiri -> siapkan Local End dan Remote End "
     "-> isi Line -> hitung Single-End atau Double-End."
 )
 
-tab_summary, tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+tab_summary, tab0, tab_local, tab_remote, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     [
         "Summary",
         "Setup DB",
-        "Record",
-        "Signals",
-        "Waveform",
-        "Fault Cursor",
-        "Phasor",
-        "Fault Type",
+        "Local End",
+        "Remote End",
         "Line",
         "HR Check",
         "Single-End",
         "Double-End",
+        "R-X Locus",
     ]
 )
 
+with tab_local:
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+        [
+            "Record",
+            "Signals",
+            "Waveform",
+            "Fault Cursor",
+            "Phasor",
+            "Fault Type",
+        ]
+    )
+
+
+with tab_remote:
+    st.subheader("Remote End")
+    remote_tab_record, remote_tab_signals, remote_tab_waveform, remote_tab_cursor, remote_tab_phasor, remote_tab_fault_type = st.tabs(
+        [
+            "Record",
+            "Signals",
+            "Waveform",
+            "Fault Cursor",
+            "Phasor",
+            "Fault Type",
+        ]
+    )
+
+    remote_end_uploaded = remote_cfg_file is not None and remote_dat_file is not None
+    remote_df = None
+    remote_metadata = st.session_state.get("remote_metadata", {})
+    remote_auto_assignment = st.session_state.get("remote_auto_assignment", {})
+    remote_auto_transformer_data = st.session_state.get("remote_auto_transformer_data", {})
+    remote_auto_recorded_side = st.session_state.get("remote_auto_recorded_side", "secondary")
+
+    if remote_end_uploaded:
+        cfg_ok = validate_uploaded_extension(remote_cfg_file, ".cfg", "File remote CFG")
+        dat_ok = validate_uploaded_extension(remote_dat_file, ".dat", "File remote DAT")
+        if cfg_ok and dat_ok:
+            try:
+                remote_df, remote_metadata = read_comtrade_cached(
+                    remote_cfg_file.getvalue(),
+                    remote_dat_file.getvalue(),
+                    remote_cfg_file.name,
+                    remote_dat_file.name,
+                )
+                remote_auto_assignment = detect_voltage_current_channels(remote_df, remote_metadata)
+                remote_auto_transformer_data = get_auto_transformer_data(remote_metadata)
+                remote_auto_recorded_side = detect_recorded_side(remote_metadata)
+                st.session_state["remote_metadata"] = remote_metadata
+                st.session_state["remote_auto_assignment"] = remote_auto_assignment
+                st.session_state["remote_auto_transformer_data"] = remote_auto_transformer_data
+                st.session_state["remote_auto_recorded_side"] = remote_auto_recorded_side
+            except Exception as e:
+                remote_df = None
+                with remote_tab_record:
+                    st.error("Remote end COMTRADE gagal dibaca.")
+                    st.exception(e)
+
+    with remote_tab_record:
+        st.markdown("### Remote Record")
+        if not remote_end_uploaded:
+            st.info("Upload pasangan file .cfg dan .dat remote pada panel kiri.")
+        elif remote_df is not None:
+            st.success("Remote end COMTRADE berhasil dibaca.")
+            col_ram1, col_ram2, col_ram3, col_ram4 = st.columns(4)
+            col_ram1.metric("Remote CFG Start Time", str(remote_metadata.get("cfg_start_time") or "-"))
+            col_ram2.metric("Remote CFG Trigger Time", str(remote_metadata.get("cfg_trigger_time") or "-"))
+            col_ram3.metric("Remote VT Ratio from CFG", str(remote_metadata.get("vt_ratio_from_cfg") or "-"))
+            col_ram4.metric("Remote CT Ratio from CFG", str(remote_metadata.get("ct_ratio_from_cfg") or "-"))
+            st.write("Analog Channels:")
+            st.write(remote_metadata.get("analog_channels", []))
+            with st.expander("Remote Analog Metadata dari .cfg"):
+                st.dataframe(pd.DataFrame(remote_metadata.get("analog_metadata", [])), use_container_width=True)
+            st.subheader("Preview Data Original Remote")
+            st.dataframe(remote_df.head(20), use_container_width=True)
+
+    with remote_tab_signals:
+        st.markdown("### Remote Signal Assignment")
+        if remote_df is None:
+            st.info("Upload dan baca rekaman remote terlebih dahulu.")
+        else:
+            with st.expander("Remote Auto Signal Assignment Preview", expanded=False):
+                st.dataframe(
+                    build_auto_assignment_summary(remote_auto_assignment, remote_auto_transformer_data, remote_metadata),
+                    use_container_width=True,
+                )
+
+            remote_channel_options = [col for col in remote_df.columns if col != "time"]
+            remote_ground_options = ["None"] + remote_channel_options
+
+            def get_remote_channel_index(channel_name, options, default_index=0):
+                return options.index(channel_name) if channel_name in options else default_index
+
+            def get_remote_ground_index(channel_name, options):
+                return options.index(channel_name) if channel_name in options else 0
+
+            col_rv1, col_rv2, col_rv3 = st.columns(3)
+            with col_rv1:
+                remote_va_channel = st.selectbox(
+                    "Remote Va / VL1",
+                    remote_channel_options,
+                    index=get_remote_channel_index(remote_auto_assignment.get("Va"), remote_channel_options, 0),
+                    key="remote_va_channel",
+                )
+            with col_rv2:
+                remote_vb_channel = st.selectbox(
+                    "Remote Vb / VL2",
+                    remote_channel_options,
+                    index=get_remote_channel_index(remote_auto_assignment.get("Vb"), remote_channel_options, 1 if len(remote_channel_options) > 1 else 0),
+                    key="remote_vb_channel",
+                )
+            with col_rv3:
+                remote_vc_channel = st.selectbox(
+                    "Remote Vc / VL3",
+                    remote_channel_options,
+                    index=get_remote_channel_index(remote_auto_assignment.get("Vc"), remote_channel_options, 2 if len(remote_channel_options) > 2 else 0),
+                    key="remote_vc_channel",
+                )
+
+            col_ri1, col_ri2, col_ri3 = st.columns(3)
+            with col_ri1:
+                remote_ia_channel = st.selectbox(
+                    "Remote Ia / IL1",
+                    remote_channel_options,
+                    index=get_remote_channel_index(remote_auto_assignment.get("Ia"), remote_channel_options, 3 if len(remote_channel_options) > 3 else 0),
+                    key="remote_ia_channel",
+                )
+            with col_ri2:
+                remote_ib_channel = st.selectbox(
+                    "Remote Ib / IL2",
+                    remote_channel_options,
+                    index=get_remote_channel_index(remote_auto_assignment.get("Ib"), remote_channel_options, 4 if len(remote_channel_options) > 4 else 0),
+                    key="remote_ib_channel",
+                )
+            with col_ri3:
+                remote_ic_channel = st.selectbox(
+                    "Remote Ic / IL3",
+                    remote_channel_options,
+                    index=get_remote_channel_index(remote_auto_assignment.get("Ic"), remote_channel_options, 5 if len(remote_channel_options) > 5 else 0),
+                    key="remote_ic_channel",
+                )
+
+            remote_ie_channel = st.selectbox(
+                "Remote IE / IN / 3I0 jika tersedia",
+                remote_ground_options,
+                index=get_remote_ground_index(remote_auto_assignment.get("IE"), remote_ground_options),
+                key="remote_ie_channel",
+            )
+
+            st.markdown("### Remote End Transformer Data")
+            remote_recorded_side_options = ["secondary", "primary"]
+            remote_recorded_side_default_index = (
+                remote_recorded_side_options.index(remote_auto_recorded_side)
+                if remote_auto_recorded_side in remote_recorded_side_options
+                else 0
+            )
+            remote_recorded_side = st.radio(
+                "Nilai remote COMTRADE direkam sebagai:",
+                remote_recorded_side_options,
+                index=remote_recorded_side_default_index,
+                horizontal=True,
+                key="remote_recorded_side",
+            )
+
+            col_rct1, col_rct2, col_rvt1, col_rvt2 = st.columns(4)
+            with col_rct1:
+                remote_ct_primary = st.number_input(
+                    "Remote CT Primary (A)",
+                    value=float(remote_auto_transformer_data.get("ct_primary", 800.0)),
+                    min_value=0.001,
+                    step=0.001,
+                    format="%.5f",
+                    key="remote_ct_primary",
+                )
+            with col_rct2:
+                remote_ct_secondary = st.number_input(
+                    "Remote CT Secondary (A)",
+                    value=float(remote_auto_transformer_data.get("ct_secondary", 1.0)),
+                    min_value=0.001,
+                    step=0.001,
+                    format="%.5f",
+                    key="remote_ct_secondary",
+                )
+            with col_rvt1:
+                remote_vt_primary = st.number_input(
+                    "Remote VT Primary (V)",
+                    value=float(remote_auto_transformer_data.get("vt_primary", 150000.0)),
+                    min_value=0.001,
+                    step=0.001,
+                    format="%.5f",
+                    key="remote_vt_primary",
+                )
+            with col_rvt2:
+                remote_vt_secondary = st.number_input(
+                    "Remote VT Secondary (V)",
+                    value=float(remote_auto_transformer_data.get("vt_secondary", 100.0)),
+                    min_value=0.001,
+                    step=0.001,
+                    format="%.5f",
+                    key="remote_vt_secondary",
+                )
+
+            remote_assigned_df = apply_signal_assignment(
+                df=remote_df,
+                va_channel=remote_va_channel,
+                vb_channel=remote_vb_channel,
+                vc_channel=remote_vc_channel,
+                ia_channel=remote_ia_channel,
+                ib_channel=remote_ib_channel,
+                ic_channel=remote_ic_channel,
+                ie_channel=remote_ie_channel,
+                recorded_side=remote_recorded_side,
+                ct_primary=remote_ct_primary,
+                ct_secondary=remote_ct_secondary,
+                vt_primary=remote_vt_primary,
+                vt_secondary=remote_vt_secondary,
+            )
+            st.session_state["remote_assigned_df"] = remote_assigned_df
+            st.session_state["remote_transformer_data"] = {
+                "recorded_side": remote_recorded_side,
+                "ct_primary": remote_ct_primary,
+                "ct_secondary": remote_ct_secondary,
+                "vt_primary": remote_vt_primary,
+                "vt_secondary": remote_vt_secondary,
+                "nominal_phase_voltage_rms": remote_vt_primary / math.sqrt(3.0),
+                "nominal_current_rms": remote_ct_primary,
+            }
+            st.session_state["remote_ie_selected_channel"] = remote_ie_channel if remote_ie_channel != "None" else None
+            st.session_state["remote_ie_source"] = (
+                "measured" if remote_ie_channel != "None" else "calculated_from_3_phase_currents"
+            )
+            st.success("Remote signal assignment berhasil dibuat.")
+            st.dataframe(remote_assigned_df.head(20), use_container_width=True)
+
+    with remote_tab_waveform:
+        st.markdown("### Remote Waveform")
+        remote_assigned_df = st.session_state.get("remote_assigned_df")
+        if remote_assigned_df is None:
+            st.info("Selesaikan Remote End > Signals terlebih dahulu.")
+        else:
+            remote_signal_groups = {
+                "Tegangan 3 Fasa": ["Va", "Vb", "Vc"],
+                "Arus 3 Fasa": ["Ia", "Ib", "Ic"],
+                "Ground Current": ["IE", "I0"],
+                "Semua": ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE", "I0"],
+            }
+            remote_waveform_group = st.selectbox(
+                "Pilih kelompok sinyal remote",
+                list(remote_signal_groups.keys()),
+                key="remote_assigned_waveform_group",
+            )
+            remote_waveform_channels = [
+                channel for channel in remote_signal_groups[remote_waveform_group]
+                if channel in remote_assigned_df.columns
+            ]
+            remote_waveform_display_mode = st.radio(
+                "Mode tampilan waveform remote",
+                ["Instantaneous / peak", "RMS 1 siklus"],
+                horizontal=True,
+                key="remote_assigned_waveform_display_mode",
+            )
+            remote_waveform_frequency = float(remote_metadata.get("frequency") or 50.0)
+            remote_rms_summary_df = build_waveform_rms_summary(
+                remote_assigned_df,
+                remote_waveform_channels,
+                frequency=remote_waveform_frequency,
+            )
+            if not remote_rms_summary_df.empty:
+                with st.expander("Remote RMS vs Peak Awal Rekaman", expanded=False):
+                    st.dataframe(
+                        remote_rms_summary_df.style.format(
+                            {
+                                "RMS Awal Rekaman": "{:.3f}",
+                                "Peak Absolut Awal": "{:.3f}",
+                                "Peak/RMS": "{:.3f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
+            if remote_waveform_channels:
+                remote_assigned_fig, remote_waveform_caption = build_assigned_waveform_plot(
+                    remote_assigned_df,
+                    remote_waveform_channels,
+                    f"Remote Waveform {remote_waveform_group} - {remote_waveform_display_mode}",
+                    remote_waveform_display_mode,
+                    frequency=remote_waveform_frequency,
+                )
+                st.caption(remote_waveform_caption)
+                st.plotly_chart(remote_assigned_fig, use_container_width=True)
+
+    with remote_tab_cursor:
+        st.markdown("### Remote Fault Cursor")
+        remote_assigned_df = st.session_state.get("remote_assigned_df")
+        if remote_assigned_df is None:
+            st.info("Selesaikan Remote End > Signals terlebih dahulu.")
+        else:
+            remote_transformer_data = st.session_state.get("remote_transformer_data", {})
+            col_rf1, col_rf2, col_rf3 = st.columns(3)
+            with col_rf1:
+                remote_frequency = st.number_input(
+                    "Remote Frequency (Hz)",
+                    value=float(remote_metadata.get("frequency") or 50.0),
+                    min_value=40.0,
+                    max_value=70.0,
+                    step=0.001,
+                    format="%.5f",
+                    key="remote_frequency",
+                )
+            remote_auto_fault_detection_settings = calculate_auto_fault_detection_parameters(
+                remote_assigned_df,
+                frequency=remote_frequency,
+                pre_fault_cycles=2,
+                nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
+                nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
+            )
+            use_remote_auto_fault_detection = st.checkbox(
+                "Gunakan deteksi otomatis adaptif remote nominal + pre-fault",
+                value=True,
+                key="use_remote_auto_fault_detection",
+            )
+            with col_rf2:
+                remote_current_multiplier = st.number_input(
+                    "Remote Current Fault Multiplier",
+                    value=float(remote_auto_fault_detection_settings["current_threshold_multiplier"]),
+                    min_value=1.01,
+                    max_value=10.0,
+                    step=0.001,
+                    format="%.5f",
+                    key="remote_current_multiplier",
+                    disabled=use_remote_auto_fault_detection,
+                )
+            with col_rf3:
+                remote_voltage_threshold = st.number_input(
+                    "Remote Voltage Drop Threshold",
+                    value=float(remote_auto_fault_detection_settings["voltage_drop_threshold"]),
+                    min_value=0.1,
+                    max_value=1.0,
+                    step=0.0001,
+                    format="%.5f",
+                    key="remote_voltage_threshold",
+                    disabled=use_remote_auto_fault_detection,
+                )
+            if use_remote_auto_fault_detection:
+                remote_current_multiplier = remote_auto_fault_detection_settings["current_threshold_multiplier"]
+                remote_voltage_threshold = remote_auto_fault_detection_settings["voltage_drop_threshold"]
+            remote_detection = detect_fault_inception(
+                remote_assigned_df,
+                frequency=remote_frequency,
+                current_threshold_multiplier=remote_current_multiplier,
+                voltage_drop_threshold=remote_voltage_threshold,
+                min_prefault_cycles=2,
+                adaptive_threshold_sigma=(
+                    remote_auto_fault_detection_settings["adaptive_threshold_sigma"]
+                    if use_remote_auto_fault_detection
+                    else None
+                ),
+                refine_fault_bar=use_remote_auto_fault_detection,
+                method=(
+                    remote_auto_fault_detection_settings["fault_detection_method"]
+                    if use_remote_auto_fault_detection
+                    else "legacy_rms"
+                ),
+                superimposed_threshold_sigma=remote_auto_fault_detection_settings["superimposed_threshold_sigma"],
+                nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
+                nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
+            )
+            st.session_state["remote_fault_detection"] = remote_detection
+            if not remote_detection["detected"]:
+                st.warning("Remote fault inception tidak terdeteksi otomatis. Gunakan slider manual.")
+                min_remote_time = float(remote_assigned_df["time"].min())
+                max_remote_time = float(remote_assigned_df["time"].max())
+                manual_remote_fault_time = st.slider(
+                    "Pilih waktu awal gangguan remote manual (s)",
+                    min_value=min_remote_time,
+                    max_value=max_remote_time,
+                    value=min_remote_time,
+                    step=(max_remote_time - min_remote_time) / 1000,
+                    key="manual_remote_fault_time",
+                )
+                remote_fault_index = int((remote_assigned_df["time"] - manual_remote_fault_time).abs().idxmin())
+                remote_samples_per_cycle = int(round(estimate_sampling_rate(remote_assigned_df) / remote_frequency))
+            else:
+                st.success("Remote fault inception berhasil terdeteksi otomatis.")
+                remote_fault_index = remote_detection["fault_index"]
+                remote_samples_per_cycle = remote_detection["samples_per_cycle"]
+            remote_fault_window = build_fault_window(
+                remote_assigned_df,
+                fault_index=remote_fault_index,
+                samples_per_cycle=remote_samples_per_cycle,
+                pre_fault_cycles=2,
+                post_fault_cycles=4,
+            )
+            st.session_state["remote_fault_window"] = remote_fault_window
+            st.session_state["remote_samples_per_cycle"] = remote_samples_per_cycle
+            st.session_state["remote_frequency_hz"] = remote_frequency
+            col_rw1, col_rw2, col_rw3 = st.columns(3)
+            col_rw1.metric("Remote Fault Time", f'{remote_fault_window["fault_time"]:.6f} s')
+            col_rw2.metric("Remote DFT Time", f'{remote_fault_window["dft_time"]:.6f} s')
+            col_rw3.metric("Remote Samples/Cycle", remote_samples_per_cycle)
+            remote_plot_channels = [
+                channel for channel in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
+                if channel in remote_assigned_df.columns
+            ]
+            remote_selected_plot = st.multiselect(
+                "Pilih sinyal remote untuk validasi fault window",
+                remote_plot_channels,
+                default=[channel for channel in ["Ia", "Ib", "Ic"] if channel in remote_plot_channels] or remote_plot_channels[:3],
+                key="remote_fault_window_plot_channels",
+            )
+            if remote_selected_plot:
+                remote_fault_fig = build_fault_window_plot(
+                    remote_assigned_df,
+                    remote_fault_window,
+                    remote_selected_plot,
+                    "Remote Fault Detection dan Cursor Window",
+                )
+                st.plotly_chart(remote_fault_fig, use_container_width=True)
+
+    with remote_tab_phasor:
+        st.markdown("### Remote Phasor")
+        remote_assigned_df = st.session_state.get("remote_assigned_df")
+        remote_fault_window = st.session_state.get("remote_fault_window")
+        remote_samples_per_cycle = st.session_state.get("remote_samples_per_cycle")
+        if remote_assigned_df is None or remote_fault_window is None or remote_samples_per_cycle is None:
+            st.info("Selesaikan Remote End > Fault Cursor terlebih dahulu.")
+        else:
+            remote_phasors = calculate_all_phasors(
+                df=remote_assigned_df,
+                cursor_index=remote_fault_window["dft_index"],
+                samples_per_cycle=int(remote_samples_per_cycle),
+            )
+            remote_phasors = add_sequence_components_to_phasor_dict(remote_phasors)
+            st.session_state["remote_phasors"] = remote_phasors
+            st.session_state["two_ended_remote_phasors_for_calculation"] = remote_phasors
+            st.session_state["two_ended_remote_dft_index_for_calculation"] = remote_fault_window["dft_index"]
+            st.session_state["two_ended_remote_sync_shift_s"] = 0.0
+            st.session_state["two_ended_remote_sync_score"] = 0.0
+            st.session_state["two_ended_remote_sync_reference"] = "fault_cursor"
+            try:
+                remote_prefault_phasors = calculate_all_phasors(
+                    df=remote_assigned_df,
+                    cursor_index=remote_fault_window["fault_index"],
+                    samples_per_cycle=int(remote_samples_per_cycle),
+                )
+                remote_prefault_phasors = add_sequence_components_to_phasor_dict(remote_prefault_phasors)
+                st.session_state["remote_prefault_phasors"] = remote_prefault_phasors
+            except Exception:
+                st.session_state.pop("remote_prefault_phasors", None)
+            st.dataframe(
+                build_phasor_dataframe(remote_phasors).style.format(
+                    {
+                        "Magnitude RMS": "{:.4f}",
+                        "Angle Deg": "{:.2f}",
+                        "Real": "{:.4f}",
+                        "Imag": "{:.4f}",
+                    }
+                ),
+                use_container_width=True,
+            )
+
+    with remote_tab_fault_type:
+        st.markdown("### Remote Fault Type")
+        remote_phasors = st.session_state.get("remote_phasors")
+        if remote_phasors is None:
+            st.info("Selesaikan Remote End > Phasor terlebih dahulu.")
+        else:
+            remote_auto_fault_settings = calculate_auto_fault_type_thresholds(
+                remote_phasors,
+                st.session_state.get("remote_prefault_phasors"),
+            )
+            use_remote_auto_fault_type_thresholds = st.toggle(
+                "Gunakan threshold otomatis remote dari kondisi pre-fault",
+                value=True,
+                key="use_remote_auto_fault_type_thresholds",
+            )
+            col_rftp1, col_rftp2, col_rftp3 = st.columns(3)
+            with col_rftp1:
+                remote_fault_type_voltage_drop_threshold = st.number_input(
+                    "Remote Fault Type Voltage Drop Threshold",
+                    value=0.80,
+                    min_value=0.10,
+                    max_value=1.00,
+                    step=0.0001,
+                    format="%.5f",
+                    key="remote_fault_type_voltage_drop_threshold",
+                )
+            with col_rftp2:
+                remote_fault_type_current_rise_threshold = st.number_input(
+                    "Remote Fault Type Current Rise Threshold",
+                    value=1.50,
+                    min_value=1.05,
+                    max_value=10.00,
+                    step=0.0001,
+                    format="%.5f",
+                    key="remote_fault_type_current_rise_threshold",
+                )
+            with col_rftp3:
+                remote_fault_type_ground_current_threshold = st.number_input(
+                    "Remote Fault Type Ground Current Threshold",
+                    value=0.20,
+                    min_value=0.01,
+                    max_value=1.00,
+                    step=0.0001,
+                    format="%.5f",
+                    key="remote_fault_type_ground_current_threshold",
+                )
+            with st.expander("Remote Advanced Resistive Fault / Delta Detection"):
+                col_rftd1, col_rftd2 = st.columns(2)
+                with col_rftd1:
+                    remote_delta_current_threshold = st.number_input(
+                        "Remote Delta Current Dominance Threshold",
+                        value=0.45,
+                        min_value=0.05,
+                        max_value=1.00,
+                        step=0.0001,
+                        format="%.5f",
+                        key="remote_delta_current_threshold",
+                    )
+                with col_rftd2:
+                    remote_delta_voltage_threshold = st.number_input(
+                        "Remote Delta Voltage Threshold",
+                        value=0.01,
+                        min_value=0.0001,
+                        max_value=0.20,
+                        step=0.0001,
+                        format="%.5f",
+                        key="remote_delta_voltage_threshold",
+                    )
+            if use_remote_auto_fault_type_thresholds:
+                remote_fault_type_voltage_drop_threshold = remote_auto_fault_settings["voltage_drop_threshold"]
+                remote_fault_type_current_rise_threshold = remote_auto_fault_settings["current_rise_threshold"]
+                remote_fault_type_ground_current_threshold = remote_auto_fault_settings["ground_current_threshold"]
+                remote_delta_current_threshold = remote_auto_fault_settings["delta_current_threshold"]
+                remote_delta_voltage_threshold = remote_auto_fault_settings["delta_voltage_threshold"]
+            remote_fault_type_result = detect_fault_type(
+                phasors=remote_phasors,
+                prefault_phasors=st.session_state.get("remote_prefault_phasors"),
+                voltage_drop_threshold=remote_fault_type_voltage_drop_threshold,
+                current_rise_threshold=remote_fault_type_current_rise_threshold,
+                ground_current_threshold=remote_fault_type_ground_current_threshold,
+                delta_current_threshold=remote_delta_current_threshold,
+                delta_voltage_threshold=remote_delta_voltage_threshold,
+            )
+            remote_fault_type_result["auto_thresholds"] = remote_auto_fault_settings
+            remote_fault_type_result["threshold_mode"] = "auto_prefault" if use_remote_auto_fault_type_thresholds else "manual"
+            remote_fault_type_df = build_fault_type_metrics_dataframe(remote_fault_type_result)
+            st.session_state["remote_fault_type_result"] = remote_fault_type_result
+            st.session_state["remote_fault_type_df"] = remote_fault_type_df
+            col_rft1, col_rft2, col_rft3, col_rft4 = st.columns(4)
+            col_rft1.metric("Remote Fault Type", remote_fault_type_result["fault_type"])
+            col_rft2.metric("Ground Involved", "Yes" if remote_fault_type_result["ground_involved"] else "No")
+            col_rft3.metric("Confidence", f'{remote_fault_type_result["confidence"]}/10')
+            col_rft4.metric(
+                "Faulted Phases",
+                ", ".join(remote_fault_type_result["faulted_phases"])
+                if remote_fault_type_result["faulted_phases"]
+                else "-",
+            )
+            st.info(explain_fault_type_result(remote_fault_type_result, context="Rekaman remote"))
+            with st.expander("Remote Fault Type Detection Detail"):
+                st.dataframe(remote_fault_type_df, use_container_width=True)
 
 with tab_summary:
     summary_container = st.container()
 
-with summary_container:
-    st.subheader("Summary / Report Ringkas")
-    st.caption(
-        "Halaman ini merangkum rekaman gangguan, hasil utama, dan grafik pendukung. "
-        "Summary dirender setelah workflow selesai sehingga hasil Single-End/Double-End terbaru ikut terbaca."
-    )
+def calculate_locus_loop_impedance(phasors: dict, loop_name: str, k0: complex):
+    loop_name = str(loop_name or "").upper()
+    va = phasors["Va"]["complex"]
+    vb = phasors["Vb"]["complex"]
+    vc = phasors["Vc"]["complex"]
+    ia = phasors["Ia"]["complex"]
+    ib = phasors["Ib"]["complex"]
+    ic = phasors["Ic"]["complex"]
+    i0 = phasors.get("I0", {"complex": (ia + ib + ic) / 3.0})["complex"]
 
-    local_name = str(metadata.get("station_name") or "Local End")
-    remote_loaded = "remote_metadata" in st.session_state or (remote_cfg_file is not None and remote_dat_file is not None)
-    remote_status = "Uploaded" if remote_loaded else "Not uploaded"
-    remote_metadata_summary = st.session_state.get("remote_metadata", {})
-    remote_name = str(remote_metadata_summary.get("station_name") or "Remote End")
+    if loop_name == "AG":
+        num, den = va, ia + k0 * i0
+    elif loop_name == "BG":
+        num, den = vb, ib + k0 * i0
+    elif loop_name == "CG":
+        num, den = vc, ic + k0 * i0
+    elif loop_name == "AB":
+        num, den = va - vb, ia - ib
+    elif loop_name == "BC":
+        num, den = vb - vc, ib - ic
+    elif loop_name == "CA":
+        num, den = vc - va, ic - ia
+    else:
+        raise ValueError(f"Loop R-X tidak dikenali: {loop_name}")
 
-    col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
-    col_sum1.metric("Local Record", local_name)
-    col_sum2.metric("Remote Record", remote_name if remote_loaded else remote_status)
-    col_sum3.metric("Samples", metadata.get("total_samples", "-"))
-    col_sum4.metric("Frequency", f"{metadata.get('frequency') or '-'} Hz")
+    if abs(den) < 1e-9:
+        raise ZeroDivisionError("Loop current terlalu kecil.")
+    return num / den
 
-    ie_local_text = (
-        f"measured ({st.session_state.get('local_ie_channel')})"
-        if st.session_state.get("local_ie_source") == "measured"
-        else "calculated from Ia+Ib+Ic"
-    )
-    ie_remote_text = (
-        f"measured ({st.session_state.get('remote_ie_selected_channel')})"
-        if st.session_state.get("remote_ie_source") == "measured"
-        else "calculated from Ia+Ib+Ic"
-    )
-    st.caption(f"IE source: Local = {ie_local_text}; Remote = {ie_remote_text}.")
 
-    st.markdown("### Calculation Status")
-    status_rows = [
-        {
-            "Step": "Signal Assignment",
-            "Status": "Done" if "assigned_df" in st.session_state else "Pending",
-            "Main Result": "Local waveform mapped" if "assigned_df" in st.session_state else "-",
-        },
-        {
-            "Step": "Fault Cursor",
-            "Status": "Done" if "fault_window" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["fault_window"]["fault_time"]:.6f} s'
-                if "fault_window" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Phasor",
-            "Status": "Done" if "phasors" in st.session_state else "Pending",
-            "Main Result": (
-                f'V1 {st.session_state["phasors"]["V1"]["magnitude"]:.3f}, '
-                f'I1 {st.session_state["phasors"]["I1"]["magnitude"]:.3f}'
-                if "phasors" in st.session_state and "V1" in st.session_state["phasors"]
-                else "-"
-            ),
-        },
-        {
-            "Step": "Fault Type",
-            "Status": "Done" if "fault_type_result" in st.session_state else "Pending",
-            "Main Result": (
-                st.session_state["fault_type_result"].get("fault_type", "-")
-                if "fault_type_result" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Line Parameter",
-            "Status": "Done" if "line_param" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["line_param"].get("line_name", "-")} | '
-                f'{st.session_state["line_param"]["length_km"]:.3f} km'
-                if "line_param" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Single-End",
-            "Status": "Done" if "single_ended_result" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["single_ended_result"]["recommended_distance_km"]:.3f} km '
-                f'({st.session_state["single_ended_result"]["status"]})'
-                if "single_ended_result" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Double-End",
-            "Status": "Done" if "two_ended_result" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["two_ended_result"].get("distance_from_original_local_km", st.session_state["two_ended_result"].get("distance_km", 0.0)):.3f} km | '
-                f'Q {st.session_state.get("two_ended_quality", {}).get("quality_score", "-")}/10'
-                if "two_ended_result" in st.session_state
-                else "-"
-            ),
-        },
-    ]
-    st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+def normalize_locus_fault_type(fault_type: str):
+    text = str(fault_type or "").upper().replace("-", "").replace(" ", "")
+    aliases = {
+        "A-G": "AG",
+        "B-G": "BG",
+        "C-G": "CG",
+        "A-B": "AB",
+        "B-C": "BC",
+        "C-A": "CA",
+    }
+    text = aliases.get(text, text)
+    return text if text in ["AG", "BG", "CG", "AB", "BC", "CA", "ABG", "BCG", "CAG", "ABC", "ABCG"] else "AG"
 
-    st.markdown("### Key Results")
-    key_col1, key_col2, key_col3, key_col4 = st.columns(4)
-    fault_type_summary = st.session_state.get("fault_type_result", {})
-    remote_fault_type_summary = st.session_state.get("remote_fault_type_result", {})
-    single_summary = st.session_state.get("single_ended_result")
-    two_summary = st.session_state.get("two_ended_result")
-    two_quality_summary = st.session_state.get("two_ended_quality", {})
 
-    key_col1.metric("Fault Type", fault_type_summary.get("fault_type", "-"))
-    key_col2.metric(
-        "Single-End",
-        f'{single_summary["recommended_distance_km"]:.3f} km' if single_summary else "-",
-    )
-    key_col3.metric(
-        "Double-End",
-        f'{two_summary.get("distance_from_original_local_km", two_summary.get("distance_km", 0.0)):.3f} km' if two_summary else "-",
-    )
-    key_col4.metric(
-        "DE Quality",
-        f'{two_quality_summary.get("quality_score", "-")}/10'
-        if two_quality_summary
-        else "-",
-    )
+def parse_distance_setting_number(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return None if pd.isna(value) else float(value)
+    text = str(value).strip()
+    if not text or text.lower() in ["nan", "none", "null", "n/a", "na"]:
+        return None
+    match = re.search(r"[-+]?\d+(?:[.,]\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", "."))
+    except ValueError:
+        return None
 
-    summary_operating_status = st.session_state.get("two_ended_operating_status")
-    if summary_operating_status:
-        st.markdown("### Status Diagnostik DE")
-        status_text = ", ".join(summary_operating_status.get("statuses", []))
-        if summary_operating_status.get("can_use_de_distance"):
-            st.success(f"Status: {status_text}")
-        else:
-            st.warning(f"Status: {status_text}")
-        for note in summary_operating_status.get("notes", []):
-            st.info(note)
-        st.caption(summary_operating_status.get("recommendation", ""))
-    st.markdown("### Perbandingan Pre-fault dan Fault")
-    local_comparison_df = build_prefault_fault_comparison_dataframe(
-        st.session_state.get("phasors"),
-        st.session_state.get("prefault_phasors"),
-        st.session_state.get("two_ended_local_gi_label", "Local"),
-    )
-    if not local_comparison_df.empty:
-        st.markdown("#### Rekaman GI Lokal")
-        st.dataframe(
-            local_comparison_df.style.format(
+
+def normalize_distance_setting_column(name: str):
+    text = str(name or "").lower().strip()
+    text = re.sub(r"\s+", "", text)
+    for old in ["(", ")", "-", "_", "/", "\\", ".", "ohm", "Ω"]:
+        text = text.replace(old, "")
+    return text
+
+
+def find_distance_setting_column(df: pd.DataFrame, candidates: list[str]):
+    normalized = {normalize_distance_setting_column(col): col for col in df.columns}
+    for candidate in candidates:
+        key = normalize_distance_setting_column(candidate)
+        if key in normalized:
+            return normalized[key]
+    for key, col in normalized.items():
+        for candidate in candidates:
+            candidate_key = normalize_distance_setting_column(candidate)
+            if candidate_key and candidate_key in key:
+                return col
+    return None
+
+
+def detect_locus_distance_setting_columns(df: pd.DataFrame):
+    return {
+        "substation": find_distance_setting_column(df, ["Substation", "GI"]),
+        "bay": find_distance_setting_column(df, ["Bay"]),
+        "line": find_distance_setting_column(df, ["Line"]),
+        "merk": find_distance_setting_column(df, ["Merk", "Brand"]),
+        "type": find_distance_setting_column(df, ["Type"]),
+        "z1_x": find_distance_setting_column(df, ["Z1/X1 (ohm)", "Z1/X1", "X1"]),
+        "z2_x": find_distance_setting_column(df, ["Z2/X2 (ohm)", "Z2/X2", "X2"]),
+        "z3_x": find_distance_setting_column(df, ["Z3/X3 (ohm)", "Z3/X3", "X3"]),
+        "z1_res_phi": find_distance_setting_column(df, ["Z1 Res Phi (ohm)", "Z1 Res Phi"]),
+        "z1_res_gnd": find_distance_setting_column(df, ["Z1 Res Gnd (ohm)", "Z1 Res Gnd"]),
+        "z2_res_phi": find_distance_setting_column(df, ["Z2 Res Phi (ohm)", "Z2 Res Phi"]),
+        "z2_res_gnd": find_distance_setting_column(df, ["Z2 Res Gnd (ohm)", "Z2 Res Gnd"]),
+        "z3_res_phi": find_distance_setting_column(df, ["Z3 Res Phi (ohm)", "Z3 Res Phi"]),
+        "z3_res_gnd": find_distance_setting_column(df, ["Z3 Res Gnd (ohm)", "Z3 Res Gnd"]),
+    }
+
+
+def sorted_nonempty_values(df: pd.DataFrame, column_name: str | None):
+    if not column_name or column_name not in df.columns:
+        return []
+    values = []
+    for value in df[column_name].dropna().tolist():
+        text = str(value).strip()
+        if text and text.lower() not in ["nan", "none", "null", "n/a", "na"]:
+            values.append(text)
+    return sorted(set(values), key=lambda item: item.upper())
+
+
+def build_locus_setting_row_labels(df: pd.DataFrame, columns: dict):
+    labels = []
+    seen = {}
+    for idx, row in df.iterrows():
+        parts = []
+        for key in ["substation", "bay", "line", "merk", "type"]:
+            col = columns.get(key)
+            if col and col in row and str(row[col]).strip() not in ["", "nan", "None"]:
+                parts.append(str(row[col]).strip())
+        label = " | ".join(parts) if parts else f"Row {idx + 1}"
+        seen[label] = seen.get(label, 0) + 1
+        labels.append(label if seen[label] == 1 else f"{label} #{seen[label]}")
+    return labels
+
+
+def extract_locus_zone_settings(row, columns: dict, loop_name: str):
+    is_ground = str(loop_name or "").upper() in ["AG", "BG", "CG"]
+    zones = []
+    for zone in [1, 2, 3]:
+        x_col = columns.get(f"z{zone}_x")
+        r_col = columns.get(f"z{zone}_res_gnd" if is_ground else f"z{zone}_res_phi")
+        r_fallback_col = columns.get(f"z{zone}_res_phi" if is_ground else f"z{zone}_res_gnd")
+        x_reach = parse_distance_setting_number(row.get(x_col)) if x_col else None
+        r_reach = parse_distance_setting_number(row.get(r_col)) if r_col else None
+        if r_reach is None and r_fallback_col:
+            r_reach = parse_distance_setting_number(row.get(r_fallback_col))
+        if x_reach is None or r_reach is None or x_reach <= 0 or r_reach <= 0:
+            continue
+        zones.append({"zone": f"Z{zone}", "x_reach_ohm": x_reach, "r_reach_ohm": r_reach})
+    return zones
+
+
+def impedance_secondary_scale_from_transformer(transformer_data: dict | None):
+    if not transformer_data:
+        return None
+    ct_primary = parse_distance_setting_number(transformer_data.get("ct_primary"))
+    ct_secondary = parse_distance_setting_number(transformer_data.get("ct_secondary"))
+    vt_primary = parse_distance_setting_number(transformer_data.get("vt_primary"))
+    vt_secondary = parse_distance_setting_number(transformer_data.get("vt_secondary"))
+    if not all([ct_primary, ct_secondary, vt_primary, vt_secondary]):
+        return None
+    vtr = vt_primary / vt_secondary
+    ctr = ct_primary / ct_secondary
+    if abs(vtr) < 1e-9:
+        return None
+    return ctr / vtr
+
+
+def scale_locus_zone_settings(zones: list[dict], scale: float):
+    scaled = []
+    for zone in zones:
+        item = dict(zone)
+        item["x_reach_ohm"] = float(item["x_reach_ohm"]) * scale
+        item["r_reach_ohm"] = float(item["r_reach_ohm"]) * scale
+        scaled.append(item)
+    return scaled
+
+
+def add_locus_zone_overlay(fig, zones: list[dict], line_angle_deg: float):
+    colors = {
+        "Z1": ("rgba(34,197,94,0.20)", "#16a34a"),
+        "Z2": ("rgba(59,130,246,0.16)", "#2563eb"),
+        "Z3": ("rgba(245,158,11,0.14)", "#d97706"),
+    }
+    tan_angle = math.tan(math.radians(line_angle_deg)) if abs(math.tan(math.radians(line_angle_deg))) > 1e-9 else None
+    for zone in zones:
+        name = zone["zone"]
+        r = float(zone["r_reach_ohm"])
+        x = float(zone["x_reach_ohm"])
+        center_r = x / tan_angle if tan_angle else 0.0
+        reverse_r = r * 0.35
+        lower_x = x * -0.15
+        xs = [0.0, r, center_r + r, center_r - reverse_r, -reverse_r, 0.0]
+        ys = [0.0, lower_x, x, x, x * 0.35, 0.0]
+        fill_color, line_color = colors.get(name, ("rgba(100,116,139,0.12)", "#64748b"))
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                fill="toself",
+                name=f"{name} locus",
+                line=dict(color=line_color, width=1.5),
+                fillcolor=fill_color,
+                hovertemplate=f"{name}<br>R reach {r:.3f}<br>X reach {x:.3f}<extra></extra>",
+            )
+        )
+    return fig
+
+
+def build_simple_rx_locus_trajectory(
+    assigned_df: pd.DataFrame,
+    fault_window: dict,
+    samples_per_cycle: int,
+    line_param: dict,
+    loop_name: str,
+    pre_cycles: float,
+    post_cycles: float,
+    step_samples: int,
+):
+    rows = []
+    fault_index = int(fault_window["fault_index"])
+    start_index = max(int(samples_per_cycle), fault_index - int(round(pre_cycles * samples_per_cycle)))
+    end_index = min(len(assigned_df) - 1, fault_index + int(round(post_cycles * samples_per_cycle)))
+    step_samples = max(1, int(step_samples))
+
+    for cursor_index in range(start_index, end_index + 1, step_samples):
+        try:
+            ph = calculate_all_phasors(
+                df=assigned_df,
+                cursor_index=cursor_index,
+                samples_per_cycle=int(samples_per_cycle),
+            )
+            ph = add_sequence_components_to_phasor_dict(ph)
+            z_loop = calculate_locus_loop_impedance(ph, loop_name, line_param["K0"])
+            if not np.isfinite(z_loop.real) or not np.isfinite(z_loop.imag):
+                continue
+            rows.append(
                 {
-                    "Pre-fault RMS": "{:.3f}",
-                    "Fault RMS": "{:.3f}",
-                    "Delta RMS": "{:.3f}",
-                    "Delta %": "{:.2f}",
-                    "Fault Angle deg": "{:.2f}",
-                },
-                na_rep="-",
-            ),
-            use_container_width=True,
-        )
+                    "cursor_index": cursor_index,
+                    "time_s": float(assigned_df["time"].iloc[cursor_index]),
+                    "R_ohm": z_loop.real,
+                    "X_ohm": z_loop.imag,
+                    "Z_mag_ohm": abs(z_loop),
+                    "Z_angle_deg": math.degrees(cmath.phase(z_loop)),
+                }
+            )
+        except Exception:
+            continue
+
+    return pd.DataFrame(rows)
+
+
+def get_rx_locus_context_from_session(end_side: str):
+    if "line_param" not in st.session_state:
+        return None, "Silakan lakukan Line Parameter terlebih dahulu."
+
+    line_param = st.session_state["line_param"]
+    local_label, remote_label = infer_gi_names_from_line_name(line_param.get("line_name", ""))
+    if end_side == "local":
+        assigned_df = st.session_state.get("assigned_df")
+        fault_window = st.session_state.get("fault_window")
+        detection = st.session_state.get("fault_detection", {})
+        fault_type_result = st.session_state.get("fault_type_result", {})
+        transformer_data = st.session_state.get("local_transformer_data", {})
+        label = local_label
     else:
-        st.info("Tabel pre-fault/fault GI lokal belum tersedia. Jalankan Fault Cursor dan Phasor lokal dahulu.")
+        assigned_df = st.session_state.get("remote_assigned_df")
+        fault_window = st.session_state.get("remote_fault_window")
+        detection = st.session_state.get("remote_fault_detection", {})
+        fault_type_result = st.session_state.get("remote_fault_type_result", {})
+        transformer_data = st.session_state.get("remote_transformer_data", {})
+        label = remote_label
 
-    remote_comparison_df = build_prefault_fault_comparison_dataframe(
-        st.session_state.get("remote_phasors"),
-        st.session_state.get("remote_prefault_phasors"),
-        st.session_state.get("two_ended_remote_gi_label", "Remote"),
-    )
-    if not remote_comparison_df.empty:
-        st.markdown("#### Rekaman GI Remote")
-        st.dataframe(
-            remote_comparison_df.style.format(
-                {
-                    "Pre-fault RMS": "{:.3f}",
-                    "Fault RMS": "{:.3f}",
-                    "Delta RMS": "{:.3f}",
-                    "Delta %": "{:.2f}",
-                    "Fault Angle deg": "{:.2f}",
-                },
-                na_rep="-",
-            ),
-            use_container_width=True,
+    if assigned_df is None:
+        return None, f"Selesaikan {'Local' if end_side == 'local' else 'Remote'} End > Signals terlebih dahulu."
+    if fault_window is None:
+        return None, f"Selesaikan {'Local' if end_side == 'local' else 'Remote'} End > Fault Cursor terlebih dahulu."
+
+    frequency = float(detection.get("frequency", 50.0) or 50.0)
+    samples_per_cycle = int(
+        st.session_state.get(
+            "remote_samples_per_cycle" if end_side == "remote" else "local_samples_per_cycle",
+            detection.get("samples_per_cycle") or max(1, round(estimate_sampling_rate(assigned_df) / frequency)),
         )
-    else:
-        st.info("Tabel pre-fault/fault GI remote belum tersedia. Jalankan Double-End sampai remote phasor terbaca.")
-
-    st.markdown("### Waveform Fokus Fault Detection")
-    summary_fault_type, summary_voltage_channel, summary_current_channel = choose_summary_fault_signals(
-        fault_type_summary,
-        remote_fault_type_summary,
     )
-    local_assigned_df = st.session_state.get("assigned_df")
-    remote_assigned_df = st.session_state.get("remote_assigned_df")
-    local_fault_window = st.session_state.get("fault_window")
-    remote_fault_window = st.session_state.get("remote_fault_window")
-    summary_remote_shift_s = float(st.session_state.get("two_ended_remote_sync_shift_s", 0.0) or 0.0)
-    if abs(summary_remote_shift_s) > 1e-9:
-        st.caption(
-            "Waveform Summary memakai shift sinkronisasi remote dari tab Double-End: "
-            f"{summary_remote_shift_s:+.6f} s."
+
+    default_loop = normalize_locus_fault_type(fault_type_result.get("fault_type", "AG"))
+    if default_loop in ["ABG"]:
+        default_loop = "AB"
+    elif default_loop in ["BCG"]:
+        default_loop = "BC"
+    elif default_loop in ["CAG"]:
+        default_loop = "CA"
+    elif default_loop in ["ABC", "ABCG", "UNKNOWN"]:
+        default_loop = "AG"
+
+    return {
+        "assigned_df": assigned_df,
+        "fault_window": fault_window,
+        "line_param": line_param,
+        "transformer_data": transformer_data,
+        "samples_per_cycle": samples_per_cycle,
+        "default_loop": default_loop,
+        "label": label,
+    }, None
+
+
+def build_locus_zone_settings_from_session(end_side: str, label: str, loop_name: str):
+    if not st.session_state.get(f"rx_locus_show_zone_{end_side}", True):
+        return [], {"zone_count": 0}, None
+
+    zone_setting_base = st.session_state.get(f"rx_locus_zone_setting_base_{end_side}", "primary")
+    transformer_data = st.session_state.get(
+        "remote_transformer_data" if end_side == "remote" else "local_transformer_data",
+        {},
+    )
+    secondary_scale = impedance_secondary_scale_from_transformer(transformer_data)
+    if zone_setting_base == "secondary" and secondary_scale is None:
+        return [], {"zone_count": 0, "zone_setting_base": zone_setting_base}, (
+            "Rasio CT/VT dari Signal Assignment belum tersedia, zona secondary belum bisa dikonversi ke primary."
         )
 
-    if (
-        (local_assigned_df is not None and "IE" in local_assigned_df.columns)
-        or (remote_assigned_df is not None and "IE" in remote_assigned_df.columns)
-    ):
-        neutral_channel = "IE"
-    else:
-        neutral_channel = "I0"
-
-    waveform_specs = [
-        (
-            summary_voltage_channel,
-            f"Waveform Tegangan Fasa Terganggu ({summary_voltage_channel})",
-        ),
-        (
-            summary_current_channel,
-            f"Waveform Arus Fasa Terganggu ({summary_current_channel})",
-        ),
-        (
-            neutral_channel,
-            f"Waveform Arus Netral ({neutral_channel})",
-        ),
-    ]
-
-    show_summary_waveforms = st.toggle(
-        "Tampilkan waveform fokus di Summary",
-        value=False,
-        key="show_summary_waveforms",
-        help="Matikan default agar Summary tetap ringan di hosting. Aktifkan saat ingin membuat report atau validasi visual.",
-    )
-
-    if show_summary_waveforms:
-        for channel_name, waveform_title in waveform_specs:
-            if (
-                (
-                    local_assigned_df is not None
-                    and local_fault_window is not None
-                    and channel_name in local_assigned_df.columns
-                )
-                or (
-                    remote_assigned_df is not None
-                    and remote_fault_window is not None
-                    and channel_name in remote_assigned_df.columns
-                )
-            ):
-                st.plotly_chart(
-                    build_summary_focus_waveform(
-                        local_assigned_df,
-                        remote_assigned_df,
-                        local_fault_window,
-                        remote_fault_window,
-                        channel_name,
-                        waveform_title,
-                        remote_time_shift_s=summary_remote_shift_s,
-                    ),
-                    use_container_width=True,
-                )
-            else:
-                st.info(f"Channel {channel_name} belum tersedia untuk grafik {waveform_title}.")
-
-    st.markdown("### Estimasi Penyebab Gangguan")
-    estimated_cause, estimated_cause_note = estimate_summary_disturbance_cause(
-        fault_type_summary,
-        st.session_state.get("high_resistance_result"),
-    )
-    cause_options = [
-        "Auto estimate",
-        "Petir",
-        "Pohon",
-        "Benda asing",
-        "Power swing",
-        "Belum diketahui",
-    ]
-    cause_choice = st.selectbox(
-        "Penyebab gangguan untuk report",
-        cause_options,
-        key="summary_disturbance_cause_choice",
-    )
-    displayed_cause = estimated_cause if cause_choice == "Auto estimate" else cause_choice
-    st.metric("Penyebab Gangguan", displayed_cause)
-    st.caption(estimated_cause_note)
-
-    st.markdown("### Grafik SE dan DE")
-    summary_location_fig = build_summary_line_position_from_session()
-    if summary_location_fig is not None:
-        st.plotly_chart(
-            summary_location_fig,
-            use_container_width=True,
-            key="summary_two_ended_line_position_fig",
+    try:
+        distance_settings_df = read_google_spreadsheet_table_cached(
+            st.session_state.get("database_spreadsheet_url", ""),
+            st.session_state.get("distance_settings_sheet_name", "distance_settings"),
         )
-    else:
-        st.info(
-            "Grafik SE/DE akan muncul setelah Single-End atau Double-End selesai menghitung."
+        distance_settings_df = make_streamlit_safe_columns(distance_settings_df)
+    except Exception as exc:
+        return [], {"zone_count": 0, "zone_setting_base": zone_setting_base}, (
+            f"Setting distance relay belum dapat dibaca dari spreadsheet: {exc}"
         )
-    if "high_resistance_result" in st.session_state:
-        st.info(explain_high_resistance_result(st.session_state["high_resistance_result"]))
 
-    if two_quality_summary and two_quality_summary.get("warnings"):
-        st.markdown("### Double-End Warnings")
-        for warning in two_quality_summary["warnings"]:
-            st.warning(warning)
+    distance_columns = detect_locus_distance_setting_columns(distance_settings_df)
+    substation_col = distance_columns.get("substation")
+    bay_col = distance_columns.get("bay")
+    substation_options = sorted_nonempty_values(distance_settings_df, substation_col)
+    substation_labels = ["Semua GI/Substation"] + substation_options
+    selected_substation = st.session_state.get(f"rx_locus_substation_{end_side}")
+    if selected_substation not in substation_labels:
+        default_substation = label.replace("GI ", "").strip().upper()
+        selected_substation = "Semua GI/Substation"
+        for option in substation_labels:
+            if default_substation and option.upper().replace(" ", "") == default_substation.replace(" ", ""):
+                selected_substation = option
+                break
 
-    st.markdown("### Report Hint")
-    st.write(
-        "Untuk hasil cetak ringkas, buka tab ini lalu gunakan menu browser/Streamlit Print. "
-        "Untuk analisis detail, lanjutkan ke tab workflow di sebelah kanan."
+    filtered_settings_df = distance_settings_df
+    if selected_substation != "Semua GI/Substation" and substation_col:
+        filtered_settings_df = filtered_settings_df[
+            filtered_settings_df[substation_col].astype(str).str.strip() == selected_substation
+        ].reset_index(drop=True)
+
+    bay_labels = ["Semua Bay"] + sorted_nonempty_values(filtered_settings_df, bay_col)
+    selected_bay = st.session_state.get(f"rx_locus_bay_{end_side}", "Semua Bay")
+    if selected_bay not in bay_labels:
+        selected_bay = "Semua Bay"
+    if selected_bay != "Semua Bay" and bay_col:
+        filtered_settings_df = filtered_settings_df[
+            filtered_settings_df[bay_col].astype(str).str.strip() == selected_bay
+        ].reset_index(drop=True)
+
+    extra_filter = str(st.session_state.get(f"rx_locus_filter_{end_side}", "") or "").strip()
+    if extra_filter:
+        mask = filtered_settings_df.apply(
+            lambda row: extra_filter.lower() in " ".join(str(value).lower() for value in row.values),
+            axis=1,
+        )
+        filtered_settings_df = filtered_settings_df[mask].reset_index(drop=True)
+
+    if filtered_settings_df.empty:
+        return [], {
+            "zone_count": 0,
+            "zone_setting_base": zone_setting_base,
+            "selected_substation": selected_substation,
+            "selected_bay": selected_bay,
+        }, "Tidak ada baris distance_settings yang cocok dengan filter."
+
+    row_labels = build_locus_setting_row_labels(filtered_settings_df, distance_columns)
+    selected_label = st.session_state.get(f"rx_locus_setting_row_{end_side}")
+    if selected_label not in row_labels:
+        selected_label = row_labels[0]
+    selected_row = filtered_settings_df.iloc[row_labels.index(selected_label)]
+    zones = extract_locus_zone_settings(selected_row, distance_columns, loop_name)
+    if zone_setting_base == "secondary":
+        zones = scale_locus_zone_settings(zones, 1.0 / secondary_scale)
+
+    return zones, {
+        "zone_count": int(len(zones)),
+        "zone_setting_base": zone_setting_base,
+        "selected_substation": selected_substation,
+        "selected_bay": selected_bay,
+        "selected_setting": selected_label,
+    }, None
+
+
+def build_rx_locus_figure_from_session(end_side: str):
+    ctx, message = get_rx_locus_context_from_session(end_side)
+    if message:
+        return None, None, None, message
+
+    loop_options = ["AG", "BG", "CG", "AB", "BC", "CA"]
+    loop_name = st.session_state.get(f"rx_locus_loop_{end_side}", ctx["default_loop"])
+    if loop_name not in loop_options:
+        loop_name = ctx["default_loop"] if ctx["default_loop"] in loop_options else "AG"
+
+    pre_cycles = float(st.session_state.get(f"rx_locus_pre_{end_side}", 2.0))
+    post_cycles = float(st.session_state.get(f"rx_locus_post_{end_side}", 8.0))
+    density = st.session_state.get(f"rx_locus_density_{end_side}", "1/4 cycle")
+    plot_focus_mode = st.session_state.get(f"rx_locus_focus_{end_side}", "relay_zones")
+    samples_per_cycle = int(ctx["samples_per_cycle"])
+    step_lookup = {
+        "Every sample": 1,
+        "1/4 cycle": max(1, samples_per_cycle // 4),
+        "1/2 cycle": max(1, samples_per_cycle // 2),
+        "1 cycle": max(1, samples_per_cycle),
+    }
+
+    trajectory_df = build_simple_rx_locus_trajectory(
+        assigned_df=ctx["assigned_df"],
+        fault_window=ctx["fault_window"],
+        samples_per_cycle=samples_per_cycle,
+        line_param=ctx["line_param"],
+        loop_name=loop_name,
+        pre_cycles=pre_cycles,
+        post_cycles=post_cycles,
+        step_samples=step_lookup.get(density, max(1, samples_per_cycle // 4)),
     )
+    if trajectory_df.empty:
+        return None, None, None, "Trajectory R-X tidak dapat dihitung. Cek loop, window, atau sinyal yang tersedia."
+
+    fault_time = float(ctx["fault_window"]["fault_time"])
+    trajectory_df["relative_time_s"] = trajectory_df["time_s"] - fault_time
+    trajectory_df["Stage"] = np.where(trajectory_df["relative_time_s"] < 0, "Pre-fault", "Fault/Post-fault")
+
+    fig_locus = px.line(
+        trajectory_df,
+        x="R_ohm",
+        y="X_ohm",
+        color="Stage",
+        markers=True,
+        hover_data={"relative_time_s": ":.6f", "R_ohm": ":.4f", "X_ohm": ":.4f", "Z_mag_ohm": ":.4f", "Z_angle_deg": ":.2f"},
+        title=f"R-X Locus Trajectory - {ctx['label']} - {loop_name}",
+    )
+
+    z1_total = ctx["line_param"]["Z1_total"]
+    fig_locus.add_trace(
+        go.Scatter(
+            x=[0.0, z1_total.real],
+            y=[0.0, z1_total.imag],
+            mode="markers+text",
+            text=["Origin", "Z Line Total"],
+            textposition="top center",
+            marker=dict(size=9, color="#111827"),
+            name="Reference",
+        )
+    )
+    fig_locus.add_shape(type="line", x0=0, y0=0, x1=z1_total.real, y1=z1_total.imag, line=dict(color="#111827", width=2, dash="dot"))
+
+    dft_index = int(ctx["fault_window"].get("dft_index", ctx["fault_window"]["fault_index"]))
+    dft_df = build_simple_rx_locus_trajectory(ctx["assigned_df"], ctx["fault_window"], samples_per_cycle, ctx["line_param"], loop_name, 0, 0, 1)
+    dft_df = dft_df[dft_df["cursor_index"] == dft_index] if not dft_df.empty else dft_df
+    if dft_df.empty:
+        dft_window = {"fault_index": dft_index, "fault_time": float(ctx["assigned_df"]["time"].iloc[dft_index])}
+        dft_df = build_simple_rx_locus_trajectory(ctx["assigned_df"], dft_window, samples_per_cycle, ctx["line_param"], loop_name, 0, 0, 1)
+    if not dft_df.empty:
+        row = dft_df.iloc[0]
+        fig_locus.add_trace(
+            go.Scatter(
+                x=[row["R_ohm"]],
+                y=[row["X_ohm"]],
+                mode="markers+text",
+                text=["DFT fault cursor"],
+                textposition="top right",
+                marker=dict(size=15, color="#ef4444", symbol="x", line=dict(width=1.5, color="#111827")),
+                name="Fault cursor",
+            )
+        )
+
+    locus_zone_settings, zone_meta, zone_warning = build_locus_zone_settings_from_session(
+        end_side,
+        ctx["label"],
+        loop_name,
+    )
+    if locus_zone_settings:
+        fig_locus = add_locus_zone_overlay(
+            fig_locus,
+            locus_zone_settings,
+            line_angle_deg=math.degrees(cmath.phase(ctx["line_param"]["Z1_per_km"])),
+        )
+
+    fig_locus.update_layout(
+        xaxis_title="R (ohm primary)",
+        yaxis_title="X (ohm primary)",
+        yaxis=dict(scaleanchor="x", scaleratio=1),
+        height=720,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    if plot_focus_mode == "relay_zones" and locus_zone_settings:
+        line_angle = cmath.phase(ctx["line_param"]["Z1_per_km"])
+        tan_angle = math.tan(line_angle) if abs(math.tan(line_angle)) > 1e-9 else None
+        zone_x_values = []
+        zone_y_values = []
+        for zone in locus_zone_settings:
+            r = float(zone["r_reach_ohm"])
+            x = float(zone["x_reach_ohm"])
+            center_r = x / tan_angle if tan_angle else 0.0
+            reverse_r = r * 0.35
+            lower_x = x * -0.15
+            zone_x_values.extend([0.0, r, center_r + r, center_r - reverse_r, -reverse_r])
+            zone_y_values.extend([0.0, lower_x, x, x, x * 0.35])
+        pad_x = max(5.0, 0.18 * (max(zone_x_values) - min(zone_x_values)))
+        pad_y = max(5.0, 0.18 * (max(zone_y_values) - min(zone_y_values)))
+        fig_locus.update_xaxes(range=[min(zone_x_values) - pad_x, max(zone_x_values) + pad_x])
+        fig_locus.update_yaxes(range=[min(zone_y_values) - pad_y, max(zone_y_values) + pad_y])
+
+    meta = {
+        "label": ctx["label"],
+        "loop": loop_name,
+        "point_count": int(len(trajectory_df)),
+        "plot_focus_mode": plot_focus_mode,
+        **zone_meta,
+    }
+    return fig_locus, trajectory_df, meta, zone_warning
+
 
 
 
@@ -4724,25 +5498,67 @@ with tab7:
             )
 
 
-with tab8:
-    st.subheader("High Resistance Fault Detection")
-
-    if "phasors" not in st.session_state:
-        st.warning("Silakan lakukan Phasor Calculation terlebih dahulu.")
-        st.stop()
-
-    if "fault_type_result" not in st.session_state:
-        st.warning("Silakan lakukan Fault Type Detection terlebih dahulu.")
-        st.stop()
-
+def resolve_end_analysis_context(end_side: str, feature_label: str):
     if "line_param" not in st.session_state:
         st.warning("Silakan lakukan Line Parameter terlebih dahulu.")
-        st.stop()
+        return None
 
-    phasors = st.session_state["phasors"]
-    fault_type_result = st.session_state["fault_type_result"]
     line_param = st.session_state["line_param"]
+    local_gi_label, remote_gi_label = infer_gi_names_from_line_name(
+        line_param.get("line_name", "")
+    )
 
+    if end_side == "local":
+        if "phasors" not in st.session_state:
+            st.warning("Selesaikan Local End > Phasor terlebih dahulu.")
+            return None
+        if "fault_type_result" not in st.session_state:
+            st.warning("Selesaikan Local End > Fault Type terlebih dahulu.")
+            return None
+        return {
+            "label": local_gi_label,
+            "phasors": st.session_state["phasors"],
+            "fault_type_result": st.session_state["fault_type_result"],
+            "prefault_phasors": st.session_state.get("prefault_phasors"),
+            "line_param": line_param,
+            "invertible": False,
+        }
+
+    if "remote_phasors" not in st.session_state:
+        st.warning("Selesaikan Remote End > Phasor terlebih dahulu.")
+        return None
+    if "remote_fault_type_result" not in st.session_state:
+        st.warning("Selesaikan Remote End > Fault Type terlebih dahulu.")
+        return None
+
+    phasors = st.session_state["remote_phasors"]
+    prefault_phasors = st.session_state.get("remote_prefault_phasors")
+    if st.checkbox(
+        f"Balik arus remote untuk {feature_label}",
+        value=False,
+        key=f"{feature_label.lower().replace(' ', '_')}_invert_remote_current",
+        help="Aktifkan jika arah arus rekaman remote perlu dibaca sebagai arus dari GI remote menuju line.",
+    ):
+        phasors = invert_current_phasors(phasors)
+        if prefault_phasors is not None:
+            prefault_phasors = invert_current_phasors(prefault_phasors)
+
+    return {
+        "label": remote_gi_label,
+        "phasors": phasors,
+        "fault_type_result": st.session_state["remote_fault_type_result"],
+        "prefault_phasors": prefault_phasors,
+        "line_param": line_param,
+        "invertible": True,
+    }
+
+
+def render_high_resistance_check(end_side: str):
+    ctx = resolve_end_analysis_context(end_side, "HR Check")
+    if ctx is None:
+        return
+
+    suffix = end_side
     st.info(
         "High resistance fault biasanya membuat Zapp bergeser ke arah resistif. "
         "Karena itu aplikasi membandingkan jarak berbasis magnitude, reactance, "
@@ -4750,9 +5566,7 @@ with tab8:
     )
 
     st.markdown("### Threshold Deteksi")
-
     col_hr1, col_hr2, col_hr3 = st.columns(3)
-
     with col_hr1:
         rf_threshold_ohm = st.number_input(
             "Rf Threshold (ohm primary)",
@@ -4760,8 +5574,8 @@ with tab8:
             min_value=0.1,
             step=0.001,
             format="%.5f",
+            key=f"hr_rf_threshold_{suffix}",
         )
-
     with col_hr2:
         angle_deviation_threshold_deg = st.number_input(
             "Angle Deviation Threshold (deg)",
@@ -4769,8 +5583,8 @@ with tab8:
             min_value=1.0,
             step=0.001,
             format="%.5f",
+            key=f"hr_angle_threshold_{suffix}",
         )
-
     with col_hr3:
         distance_deviation_threshold_percent = st.number_input(
             "Distance Deviation Threshold (%)",
@@ -4778,491 +5592,401 @@ with tab8:
             min_value=1.0,
             step=0.001,
             format="%.5f",
+            key=f"hr_distance_threshold_{suffix}",
         )
 
     try:
         hr_result = detect_high_resistance_fault(
-            phasors=phasors,
-            line_param=line_param,
-            fault_type_result=fault_type_result,
+            phasors=ctx["phasors"],
+            line_param=ctx["line_param"],
+            fault_type_result=ctx["fault_type_result"],
             rf_threshold_ohm=rf_threshold_ohm,
             angle_deviation_threshold_deg=angle_deviation_threshold_deg,
             distance_deviation_threshold_percent=distance_deviation_threshold_percent,
         )
-
-        st.session_state["high_resistance_result"] = hr_result
+        st.session_state["high_resistance_result" if end_side == "local" else "remote_high_resistance_result"] = hr_result
 
         st.markdown("### Hasil Deteksi")
-
-        col_a, col_b, col_c, col_d = st.columns(4)
-
-        col_a.metric("Selected Loop", hr_result["selected_loop"])
-        col_b.metric(
-            "High Resistance",
-            "Suspected" if hr_result["high_resistance_suspected"] else "No",
-        )
-        col_c.metric("Rf Estimate", f'{hr_result["Rf_est_ohm"]:.3f} Ω')
-        col_d.metric("Analysis Confidence", f'{hr_result["analysis_confidence"]}/10')
+        col_a, col_b, col_c, col_d, col_e = st.columns(5)
+        col_a.metric("Location", ctx["label"])
+        col_b.metric("Selected Loop", hr_result["selected_loop"])
+        col_c.metric("High Resistance", "Suspected" if hr_result["high_resistance_suspected"] else "No")
+        col_d.metric("Rf Estimate", f'{hr_result["Rf_est_ohm"]:.3f} Ω')
+        col_e.metric("Analysis Confidence", f'{hr_result["analysis_confidence"]}/10')
 
         if hr_result["high_resistance_suspected"]:
-            st.warning(
-                "Indikasi gangguan high resistance terdeteksi. "
-                "Hasil fault location single-ended perlu diberi status UNCERTAIN."
-            )
+            st.warning("Indikasi gangguan high resistance terdeteksi. Hasil single-ended perlu diberi status UNCERTAIN.")
         else:
-            st.success(
-                "Belum ada indikasi kuat gangguan high resistance. "
-                f"HR evidence score: {hr_result['evidence_score']}/10."
-            )
+            st.success(f"Belum ada indikasi kuat gangguan high resistance. HR evidence score: {hr_result['evidence_score']}/10.")
 
         st.info(explain_high_resistance_result(hr_result))
-
-        if hr_result["warnings"]:
-            st.markdown("### Warning")
-            for warning in hr_result["warnings"]:
-                st.warning(warning)
+        for warning in hr_result.get("warnings", []):
+            st.warning(warning)
 
         st.markdown("### Detail Perhitungan")
-
-        hr_df = build_high_resistance_dataframe(hr_result)
-
         st.dataframe(
-            hr_df.style.format(
-                {
-                    "Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x
-                }
+            build_high_resistance_dataframe(hr_result).style.format(
+                {"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}
             ),
             use_container_width=True,
         )
 
         st.markdown("### Perbandingan Metode Estimasi Jarak")
-
         distance_df = pd.DataFrame(
             {
-                "Method": [
-                    "Reactance-based",
-                    "Magnitude-based",
-                    "Projection-based",
-                ],
-                "Distance km": [
-                    hr_result["distance_x_km"],
-                    hr_result["distance_mag_km"],
-                    hr_result["distance_projection_km"],
-                ],
-                "Distance %": [
-                    hr_result["distance_x_percent"],
-                    hr_result["distance_mag_percent"],
-                    hr_result["distance_projection_percent"],
-                ],
+                "Method": ["Reactance-based", "Magnitude-based", "Projection-based"],
+                "Distance km": [hr_result["distance_x_km"], hr_result["distance_mag_km"], hr_result["distance_projection_km"]],
+                "Distance %": [hr_result["distance_x_percent"], hr_result["distance_mag_percent"], hr_result["distance_projection_percent"]],
             }
         )
-
-        st.dataframe(
-            distance_df.style.format(
-                {
-                    "Distance km": "{:.3f}",
-                    "Distance %": "{:.2f}",
-                }
-            ),
-            use_container_width=True,
-        )
-
-        fig_dist = px.bar(
-            distance_df,
-            x="Method",
-            y="Distance km",
-            title="Perbandingan Estimasi Jarak Gangguan",
-            text_auto=".2f",
-        )
-
-        st.plotly_chart(fig_dist, use_container_width=True)
+        st.dataframe(distance_df.style.format({"Distance km": "{:.3f}", "Distance %": "{:.2f}"}), use_container_width=True)
+        st.plotly_chart(px.bar(distance_df, x="Method", y="Distance km", title=f"Perbandingan Estimasi Jarak Gangguan - {ctx['label']}", text_auto=".2f"), use_container_width=True)
 
         st.markdown("### R-X Position")
-
-        z1_total = line_param["Z1_total"]
+        z1_total = ctx["line_param"]["Z1_total"]
         z_app = hr_result["Zapp"]
-
-        rx_df = pd.DataFrame(
-            {
-                "Point": ["Origin", "Z1 Total", "Zapp"],
-                "R": [0.0, z1_total.real, z_app.real],
-                "X": [0.0, z1_total.imag, z_app.imag],
-            }
-        )
-
-        fig_rx = px.scatter(
-            rx_df,
-            x="R",
-            y="X",
-            text="Point",
-            title="Posisi Zapp terhadap Z1 Total pada Diagram R-X",
-        )
-
-        fig_rx.add_shape(
-            type="line",
-            x0=0,
-            y0=0,
-            x1=z1_total.real,
-            y1=z1_total.imag,
-        )
-
-        fig_rx.add_shape(
-            type="line",
-            x0=0,
-            y0=0,
-            x1=z_app.real,
-            y1=z_app.imag,
-            line=dict(dash="dash"),
-        )
-
+        rx_df = pd.DataFrame({"Point": ["Origin", "Z1 Total", "Zapp"], "R": [0.0, z1_total.real, z_app.real], "X": [0.0, z1_total.imag, z_app.imag]})
+        fig_rx = px.scatter(rx_df, x="R", y="X", text="Point", title=f"Posisi Zapp terhadap Z1 Total - {ctx['label']}")
+        fig_rx.add_shape(type="line", x0=0, y0=0, x1=z1_total.real, y1=z1_total.imag)
+        fig_rx.add_shape(type="line", x0=0, y0=0, x1=z_app.real, y1=z_app.imag, line=dict(dash="dash"))
         fig_rx.update_traces(textposition="top center")
-        fig_rx.update_layout(
-            xaxis_title="R (ohm)",
-            yaxis_title="X (ohm)",
-        )
-
+        fig_rx.update_layout(xaxis_title="R (ohm)", yaxis_title="X (ohm)")
         st.plotly_chart(fig_rx, use_container_width=True)
-
-        st.markdown("### Interpretasi")
-
-        if hr_result["high_resistance_suspected"]:
-            st.write(
-                "Zapp cenderung bergeser ke kanan pada diagram R-X. "
-                "Untuk kasus ini, estimasi jarak berbasis magnitude dapat terlihat lebih jauh "
-                "daripada estimasi berbasis reactance. Gunakan distance berbasis X atau "
-                "projection sebagai pembanding, dan beri label hasil sebagai uncertain."
-            )
-        else:
-            st.write(
-                "Zapp belum menunjukkan dominasi tahanan gangguan yang kuat. "
-                "Namun tetap validasi dengan waveform, arus ground, dan data inspeksi lapangan."
-            )
-
     except Exception as e:
         st.error("Analisis high resistance gagal.")
         st.exception(e)
 
 
-with tab9:
-    st.subheader("Single-Ended Fault Locator")
+def render_single_ended_analysis(end_side: str):
+    ctx = resolve_end_analysis_context(end_side, "Single-End")
+    if ctx is None:
+        return
 
-    st.write(
-        "Fitur ini menghitung estimasi jarak gangguan dari satu ujung relay distance "
-        "berdasarkan fasor, jenis gangguan, dan parameter saluran."
-    )
-
-    if "phasors" not in st.session_state:
-        st.warning("Silakan lakukan Step 5: Phasor Calculation terlebih dahulu.")
-        st.stop()
-
-    if "fault_type_result" not in st.session_state:
-        st.warning("Silakan lakukan Step 6: Fault Type Detection terlebih dahulu.")
-        st.stop()
-
-    if "line_param" not in st.session_state:
-        st.warning("Silakan lakukan Step 7: Line Parameter terlebih dahulu.")
-        st.stop()
-
-    phasors = st.session_state["phasors"]
-    fault_type_result = st.session_state["fault_type_result"]
-    line_param = st.session_state["line_param"]
+    suffix = end_side
+    result_key = "single_ended_result" if end_side == "local" else "remote_single_ended_result"
+    df_key = "single_ended_df" if end_side == "local" else "remote_single_ended_df"
+    context_key = "single_ended_fault_context" if end_side == "local" else "remote_single_ended_fault_context"
+    line_param = ctx["line_param"]
+    fault_type_result = ctx["fault_type_result"]
 
     st.markdown("### Input Perhitungan")
-
     col_se1, col_se2, col_se3, col_se4 = st.columns(4)
-
-    col_se1.metric("Fault Type", fault_type_result.get("fault_type", "-"))
-    col_se2.metric("Line Length", f'{line_param["length_km"]:.3f} km')
-    col_se3.metric("Z1/km", f'{line_param["Z1_per_km"].real:.4f} + j{line_param["Z1_per_km"].imag:.4f}')
-    col_se4.metric("K0", f'{line_param["K0"].real:.4f} + j{line_param["K0"].imag:.4f}')
+    col_se1.metric("End", ctx["label"])
+    col_se2.metric("Fault Type", fault_type_result.get("fault_type", "-"))
+    col_se3.metric("Line Length", f'{line_param["length_km"]:.3f} km')
+    col_se4.metric("Z1/km", f'{line_param["Z1_per_km"].real:.4f} + j{line_param["Z1_per_km"].imag:.4f}')
 
     st.markdown("### Metode Rekomendasi Jarak")
-
     single_ended_fault_context = st.selectbox(
         "Konteks gangguan single-ended",
-        [
-            "internal_line_fault",
-            "reverse_or_backfeed_external_fault",
-        ],
+        ["internal_line_fault", "reverse_or_backfeed_external_fault"],
         format_func=lambda value: {
             "internal_line_fault": "Gangguan internal pada saluran yang dianalisis",
             "reverse_or_backfeed_external_fault": "Backfeed/reverse: fault eksternal atau di belakang relay",
         }.get(value, value),
         index=0,
-        help=(
-            "Pilih backfeed/reverse jika jarak negatif atau melewati panjang line justru ingin dibaca "
-            "sebagai indikasi fault eksternal, bukan dipaksa memakai fallback internal-line."
-        ),
+        key=f"single_context_{suffix}",
     )
-
     recommended_method = st.selectbox(
         "Pilih metode jarak utama",
-        [
-            "reactance",
-            "projection",
-            "magnitude",
-        ],
+        ["reactance", "projection", "magnitude"],
         index=0,
-        help=(
-            "Reactance cocok untuk mengurangi pengaruh tahanan gangguan. "
-            "Projection memproyeksikan Zapp ke arah sudut Z1. "
-            "Magnitude sederhana, tetapi mudah bias untuk high resistance fault."
-        ),
+        key=f"single_method_{suffix}",
     )
 
-    if st.button("Calculate Single-Ended Fault Location"):
+    if st.button("Calculate Single-Ended Fault Location", key=f"calculate_single_{suffix}"):
         try:
             single_result = calculate_single_ended_fault_location(
-                phasors=phasors,
+                phasors=ctx["phasors"],
                 fault_type_result=fault_type_result,
                 line_param=line_param,
                 recommended_method=recommended_method,
-                prefault_phasors=st.session_state.get("prefault_phasors"),
+                prefault_phasors=ctx["prefault_phasors"],
                 fault_context=single_ended_fault_context,
             )
-
             single_df = build_single_ended_result_dataframe(single_result)
-
-            st.session_state["single_ended_result"] = single_result
-            st.session_state["single_ended_df"] = single_df
-            st.session_state["single_ended_fault_context"] = single_ended_fault_context
-
+            st.session_state[result_key] = single_result
+            st.session_state[df_key] = single_df
+            st.session_state[context_key] = single_ended_fault_context
             st.success("Single-ended fault location berhasil dihitung.")
-
         except Exception as e:
             st.error("Perhitungan single-ended gagal.")
             st.exception(e)
 
-    if "single_ended_result" in st.session_state:
-        single_result = st.session_state["single_ended_result"]
-        single_df = st.session_state["single_ended_df"]
+    if result_key not in st.session_state:
+        return
 
-        st.markdown("### Hasil Utama")
+    single_result = st.session_state[result_key]
+    single_df = st.session_state[df_key]
+    st.markdown("### Hasil Utama")
+    col_r1, col_r2, col_r3, col_r4, col_r5 = st.columns(5)
+    single_external_context = bool(single_result.get("external_context"))
+    col_r1.metric("End", ctx["label"])
+    col_r2.metric("Signed Distance" if single_external_context else "Recommended Distance", f'{single_result["recommended_distance_km"]:.3f} km')
+    col_r3.metric("Distance %", f'{single_result["recommended_distance_percent"]:.2f} %')
+    col_r4.metric("Zapp", f'{single_result["Zapp_R"]:.3f} + j{single_result["Zapp_X"]:.3f} Ω')
+    col_r5.metric("Status", single_result["status"])
 
-        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
-        single_external_context = bool(single_result.get("external_context"))
-        distance_label = "Signed Distance" if single_external_context else "Recommended Distance"
+    if single_result["status"] == "VALID":
+        st.success("Hasil single-ended berada dalam batas normal.")
+    elif single_result["status"] == "CHECK":
+        st.warning("Hasil single-ended perlu dicek ulang dengan waveform, SOE, dan data lapangan.")
+    else:
+        st.error("Hasil single-ended tidak pasti. Cek polaritas, line parameter, dan fault type.")
 
-        col_r1.metric(
-            distance_label,
-            f'{single_result["recommended_distance_km"]:.3f} km',
+    st.info(explain_single_ended_status(single_result["status"]))
+    if single_external_context:
+        st.info("Mode backfeed/reverse aktif: jarak single-ended ditampilkan sebagai koordinat signed dari terminal relay.")
+    for warning in single_result.get("warnings", []):
+        st.warning(warning)
+
+    st.markdown("### Detail Perhitungan")
+    st.dataframe(single_df.style.format({"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}), use_container_width=True)
+
+    st.markdown("### Perbandingan Metode Jarak")
+    distance_df = pd.DataFrame(
+        {
+            "Method": ["Magnitude", "Reactance", "Projection", "Signed/Recommended"],
+            "Distance km": [single_result["distance_mag_km"], single_result["distance_x_km"], single_result["distance_projection_km"], single_result["recommended_distance_km"]],
+            "Distance %": [single_result["distance_mag_percent"], single_result["distance_x_percent"], single_result["distance_projection_percent"], single_result["recommended_distance_percent"]],
+        }
+    )
+    st.dataframe(distance_df.style.format({"Distance km": "{:.3f}", "Distance %": "{:.2f}"}), use_container_width=True)
+    st.plotly_chart(px.bar(distance_df, x="Method", y="Distance km", text_auto=".2f", title=f"Perbandingan Estimasi Jarak Single-Ended - {ctx['label']}"), use_container_width=True)
+
+    st.markdown("### Diagram R-X")
+    z1_total = line_param["Z1_total"]
+    zapp = single_result["Zapp"]
+    z_recommended_line = single_result["recommended_distance_km"] * line_param["Z1_per_km"]
+    rx_df = pd.DataFrame(
+        {
+            "Point": ["Origin", "Z1 Total", "Zapp", "Projected Fault Point"],
+            "R": [0.0, z1_total.real, zapp.real, z_recommended_line.real],
+            "X": [0.0, z1_total.imag, zapp.imag, z_recommended_line.imag],
+        }
+    )
+    fig_rx = px.scatter(rx_df, x="R", y="X", text="Point", title=f"Single-Ended R-X Diagram - {ctx['label']}")
+    fig_rx.add_shape(type="line", x0=0, y0=0, x1=z1_total.real, y1=z1_total.imag)
+    fig_rx.add_shape(type="line", x0=0, y0=0, x1=zapp.real, y1=zapp.imag, line=dict(dash="dash"))
+    fig_rx.add_shape(type="line", x0=0, y0=0, x1=z_recommended_line.real, y1=z_recommended_line.imag, line=dict(dash="dot"))
+    fig_rx.update_traces(textposition="top center")
+    fig_rx.update_layout(xaxis_title="R (ohm)", yaxis_title="X (ohm)", yaxis=dict(scaleanchor="x", scaleratio=1))
+    st.plotly_chart(fig_rx, use_container_width=True)
+
+
+def render_simple_rx_locus(end_side: str):
+    ctx, context_message = get_rx_locus_context_from_session(end_side)
+    if context_message:
+        st.info(context_message)
+        return
+
+    label = ctx["label"]
+    transformer_data = st.session_state.get(
+        "remote_transformer_data" if end_side == "remote" else "local_transformer_data",
+        {},
+    )
+    secondary_scale = impedance_secondary_scale_from_transformer(transformer_data)
+    loop_options = ["AG", "BG", "CG", "AB", "BC", "CA"]
+
+    st.markdown(f"### R-X Locus Trajectory - {label}")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        loop_name = st.selectbox(
+            "Loop impedance",
+            loop_options,
+            index=loop_options.index(ctx["default_loop"]) if ctx["default_loop"] in loop_options else 0,
+            key=f"rx_locus_loop_{end_side}",
         )
+    with col2:
+        pre_cycles = st.number_input("Pre-fault cycles", value=2.0, min_value=0.0, max_value=20.0, step=0.5, key=f"rx_locus_pre_{end_side}")
+    with col3:
+        post_cycles = st.number_input("Post-fault cycles", value=8.0, min_value=1.0, max_value=80.0, step=0.5, key=f"rx_locus_post_{end_side}")
+    with col4:
+        density = st.selectbox("Point density", ["Every sample", "1/4 cycle", "1/2 cycle", "1 cycle"], key=f"rx_locus_density_{end_side}")
 
-        col_r2.metric(
-            "Distance %",
-            f'{single_result["recommended_distance_percent"]:.2f} %',
+    st.markdown("### Relay Zone Overlay")
+    locus_zone_settings = []
+    show_zone_overlay = st.toggle(
+        "Tampilkan zona proteksi distance relay",
+        value=True,
+        key=f"rx_locus_show_zone_{end_side}",
+    )
+    if show_zone_overlay:
+        zone_setting_base = st.selectbox(
+            "Zone setting base",
+            ["primary", "secondary"],
+            index=0,
+            format_func=lambda value: {
+                "primary": "Spreadsheet zone values are primary ohm",
+                "secondary": "Spreadsheet zone values are relay secondary ohm",
+            }[value],
+            key=f"rx_locus_zone_setting_base_{end_side}",
+            help="Jika nilai X reach dan R reach di spreadsheet adalah ohm relay secondary, pilih secondary agar dikonversi ke primary ohm memakai CT/VT Signal Assignment.",
         )
+        if zone_setting_base == "secondary" and secondary_scale is None:
+            st.warning("Rasio CT/VT dari Signal Assignment belum tersedia, zona secondary belum bisa dikonversi ke primary.")
+        elif zone_setting_base == "secondary":
+            st.caption(f"Konversi zona secondary -> primary memakai faktor 1/{secondary_scale:.9f}.")
 
-        col_r3.metric(
-            "Zapp",
-            f'{single_result["Zapp_R"]:.3f} + j{single_result["Zapp_X"]:.3f} Ω',
-        )
+        try:
+            distance_settings_df = read_google_spreadsheet_table_cached(
+                st.session_state.get("database_spreadsheet_url", ""),
+                st.session_state.get("distance_settings_sheet_name", "distance_settings"),
+            )
+            distance_settings_df = make_streamlit_safe_columns(distance_settings_df)
+            distance_columns = detect_locus_distance_setting_columns(distance_settings_df)
+            substation_col = distance_columns.get("substation")
+            bay_col = distance_columns.get("bay")
 
-        col_r4.metric(
-            "Status",
-            single_result["status"],
-        )
+            substation_options = sorted_nonempty_values(distance_settings_df, substation_col)
+            substation_labels = ["Semua GI/Substation"] + substation_options
+            default_substation = label.replace("GI ", "").strip().upper()
+            default_index = 0
+            for idx, option in enumerate(substation_labels):
+                if default_substation and option.upper().replace(" ", "") == default_substation.replace(" ", ""):
+                    default_index = idx
+                    break
 
-        if single_result["status"] == "VALID":
-            st.success("Hasil single-ended berada dalam batas normal.")
-        elif single_result["status"] == "CHECK":
-            if single_external_context and single_result.get("is_reverse_or_external_position"):
-                st.warning(
-                    "Hasil single-ended menunjukkan posisi signed di luar saluran yang dianalisis. "
-                    "Pada mode backfeed/reverse, ini dibaca sebagai indikasi fault eksternal dan perlu "
-                    "divalidasi dengan arah elemen proteksi, SOE, dan rekaman line terkait."
+            col_set1, col_set2, col_set3 = st.columns([1.4, 1.6, 1.2])
+            with col_set1:
+                selected_substation = st.selectbox(
+                    "GI / Substation",
+                    substation_labels,
+                    index=default_index,
+                    key=f"rx_locus_substation_{end_side}",
                 )
+
+            filtered_settings_df = distance_settings_df
+            if selected_substation != "Semua GI/Substation" and substation_col:
+                filtered_settings_df = filtered_settings_df[
+                    filtered_settings_df[substation_col].astype(str).str.strip() == selected_substation
+                ].reset_index(drop=True)
+
+            bay_labels = ["Semua Bay"] + sorted_nonempty_values(filtered_settings_df, bay_col)
+            with col_set2:
+                selected_bay = st.selectbox("Bay", bay_labels, key=f"rx_locus_bay_{end_side}")
+            if selected_bay != "Semua Bay" and bay_col:
+                filtered_settings_df = filtered_settings_df[
+                    filtered_settings_df[bay_col].astype(str).str.strip() == selected_bay
+                ].reset_index(drop=True)
+
+            with col_set3:
+                extra_filter = st.text_input("Cari tambahan", value="", key=f"rx_locus_filter_{end_side}").strip()
+            if extra_filter:
+                mask = filtered_settings_df.apply(
+                    lambda row: extra_filter.lower() in " ".join(str(value).lower() for value in row.values),
+                    axis=1,
+                )
+                filtered_settings_df = filtered_settings_df[mask].reset_index(drop=True)
+
+            if filtered_settings_df.empty:
+                st.warning("Tidak ada baris distance_settings yang cocok dengan filter.")
             else:
-                st.warning("Hasil single-ended perlu dicek ulang dengan waveform, SOE, dan data lapangan.")
-        else:
-            st.error("Hasil single-ended tidak pasti. Cek polaritas, line parameter, dan fault type.")
+                row_labels = build_locus_setting_row_labels(filtered_settings_df, distance_columns)
+                selected_label = st.selectbox(
+                    "Pilih setting relay distance",
+                    row_labels,
+                    key=f"rx_locus_setting_row_{end_side}",
+                )
+                selected_row = filtered_settings_df.iloc[row_labels.index(selected_label)]
+                locus_zone_settings = extract_locus_zone_settings(selected_row, distance_columns, loop_name)
+                if zone_setting_base == "secondary":
+                    locus_zone_settings = scale_locus_zone_settings(
+                        locus_zone_settings,
+                        1.0 / secondary_scale if secondary_scale else 1.0,
+                    )
 
-        st.info(explain_single_ended_status(single_result["status"]))
+                if locus_zone_settings:
+                    st.dataframe(
+                        pd.DataFrame(locus_zone_settings).style.format(
+                            {
+                                "x_reach_ohm": "{:.3f}",
+                                "r_reach_ohm": "{:.3f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
+                else:
+                    st.warning("Baris setting terpilih belum memiliki X reach dan R reach yang cukup untuk Z1/Z2/Z3.")
+        except Exception as e:
+            st.warning("Setting distance relay belum dapat dibaca dari spreadsheet.")
+            st.caption("Pastikan sheet `distance_settings` tersedia pada Database Spreadsheet URL di tab Setup DB.")
+            st.exception(e)
 
-        if single_external_context:
-            st.info(
-                "Mode backfeed/reverse aktif: jarak single-ended ditampilkan sebagai koordinat signed "
-                "dari terminal relay. Nilai negatif berarti indikasi di belakang relay; nilai di atas "
-                "100% berarti indikasi di luar ujung remote line yang dianalisis."
-            )
+    plot_focus_mode = st.selectbox(
+        "Plot focus",
+        ["relay_zones", "all_trajectory"],
+        format_func=lambda value: {
+            "relay_zones": "Fokus zona proteksi",
+            "all_trajectory": "Tampilkan seluruh trajectory",
+        }[value],
+        index=0,
+        key=f"rx_locus_focus_{end_side}",
+    )
 
-        if single_result.get("used_superimposed_fallback"):
-            st.info(
-                "Mode resistive/load-flow aktif: jarak single-ended konvensional keluar batas, "
-                "sehingga aplikasi memakai estimasi superimposed reactance dari perubahan fasor "
-                "pre-fault ke fault."
-            )
+    fig_locus, trajectory_df, meta, build_warning = build_rx_locus_figure_from_session(end_side)
+    if build_warning:
+        st.warning(build_warning)
+    if fig_locus is None:
+        return
+    summary_key_suffix = "local" if end_side == "local" else "remote"
+    st.session_state[f"rx_locus_summary_fig_{summary_key_suffix}"] = fig_locus
+    st.session_state[f"rx_locus_summary_meta_{summary_key_suffix}"] = meta
 
-        if single_result.get("phase_current_depressed"):
-            st.info(
-                "Arus fasa fault turun dibanding pre-fault. Pada saluran panjang dengan ekspor daya, "
-                "ini dapat terjadi karena arus beban dan arus gangguan saling mengurangi secara fasor. "
-                "Prioritaskan validasi two-ended, remote-ended, dan komponen netral/zero-sequence."
-            )
-
-        if single_result["warnings"]:
-            st.markdown("### Warning")
-            for warning in single_result["warnings"]:
-                st.warning(warning)
-
-        st.markdown("### Detail Perhitungan")
-
+    st.plotly_chart(fig_locus, use_container_width=True)
+    with st.expander("Trajectory Data", expanded=False):
         st.dataframe(
-            single_df.style.format(
+            trajectory_df.style.format(
                 {
-                    "Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x
+                    "time_s": "{:.6f}",
+                    "relative_time_s": "{:.6f}",
+                    "R_ohm": "{:.6f}",
+                    "X_ohm": "{:.6f}",
+                    "Z_mag_ohm": "{:.6f}",
+                    "Z_angle_deg": "{:.3f}",
                 }
             ),
             use_container_width=True,
+            height=260,
         )
 
-        st.markdown("### Perbandingan Metode Jarak")
 
-        distance_df = pd.DataFrame(
-            {
-                "Method": [
-                    "Magnitude",
-                    "Reactance",
-                    "Projection",
-                    "Signed/Recommended",
-                ],
-                "Distance km": [
-                    single_result["distance_mag_km"],
-                    single_result["distance_x_km"],
-                    single_result["distance_projection_km"],
-                    single_result["recommended_distance_km"],
-                ],
-                "Distance %": [
-                    single_result["distance_mag_percent"],
-                    single_result["distance_x_percent"],
-                    single_result["distance_projection_percent"],
-                    single_result["recommended_distance_percent"],
-                ],
-            }
-        )
+with tab8:
+    st.subheader("High Resistance Fault Detection")
+    local_hr_label, remote_hr_label = infer_gi_names_from_line_name(
+        st.session_state.get("line_param", {}).get("line_name", "")
+    )
+    hr_local_tab, hr_remote_tab = st.tabs([local_hr_label, remote_hr_label])
+    with hr_local_tab:
+        render_high_resistance_check("local")
+    with hr_remote_tab:
+        render_high_resistance_check("remote")
 
-        st.dataframe(
-            distance_df.style.format(
-                {
-                    "Distance km": "{:.3f}",
-                    "Distance %": "{:.2f}",
-                }
-            ),
-            use_container_width=True,
-        )
 
-        fig_dist = px.bar(
-            distance_df,
-            x="Method",
-            y="Distance km",
-            text_auto=".2f",
-            title="Perbandingan Estimasi Jarak Single-Ended",
-        )
+with tab9:
+    st.subheader("Single-Ended Fault Locator")
+    st.write(
+        "Fitur ini menghitung estimasi jarak gangguan dari satu ujung relay distance "
+        "berdasarkan fasor, jenis gangguan, dan parameter saluran."
+    )
+    se_local_tab, se_remote_tab = st.tabs(["Local End", "Remote End"])
+    with se_local_tab:
+        render_single_ended_analysis("local")
+    with se_remote_tab:
+        render_single_ended_analysis("remote")
 
-        st.plotly_chart(fig_dist, use_container_width=True)
 
-        st.markdown("### Diagram R-X")
-
-        z1_total = line_param["Z1_total"]
-        zapp = single_result["Zapp"]
-        recommended_distance = single_result["recommended_distance_km"]
-        z_recommended_line = recommended_distance * line_param["Z1_per_km"]
-
-        rx_df = pd.DataFrame(
-            {
-                "Point": [
-                    "Origin",
-                    "Z1 Total",
-                    "Zapp",
-                    "Projected Fault Point",
-                ],
-                "R": [
-                    0.0,
-                    z1_total.real,
-                    zapp.real,
-                    z_recommended_line.real,
-                ],
-                "X": [
-                    0.0,
-                    z1_total.imag,
-                    zapp.imag,
-                    z_recommended_line.imag,
-                ],
-            }
-        )
-
-        fig_rx = px.scatter(
-            rx_df,
-            x="R",
-            y="X",
-            text="Point",
-            title="Single-Ended R-X Diagram",
-        )
-
-        fig_rx.add_shape(
-            type="line",
-            x0=0,
-            y0=0,
-            x1=z1_total.real,
-            y1=z1_total.imag,
-        )
-
-        fig_rx.add_shape(
-            type="line",
-            x0=0,
-            y0=0,
-            x1=zapp.real,
-            y1=zapp.imag,
-            line=dict(dash="dash"),
-        )
-
-        fig_rx.add_shape(
-            type="line",
-            x0=0,
-            y0=0,
-            x1=z_recommended_line.real,
-            y1=z_recommended_line.imag,
-            line=dict(dash="dot"),
-        )
-
-        fig_rx.update_traces(textposition="top center")
-
-        fig_rx.update_layout(
-            xaxis_title="R (ohm)",
-            yaxis_title="X (ohm)",
-            yaxis=dict(scaleanchor="x", scaleratio=1),
-        )
-
-        st.plotly_chart(fig_rx, use_container_width=True)
-
-        st.markdown("### Interpretasi")
-
-        st.write(
-            f"Loop yang digunakan adalah **{single_result['selected_loop']}**. "
-            f"Impedansi terlihat relay adalah **{single_result['Zapp_R']:.4f} + "
-            f"j{single_result['Zapp_X']:.4f} Ω**. "
-            f"Jarak rekomendasi dari ujung relay adalah **{single_result['recommended_distance_km']:.3f} km** "
-            f"atau **{single_result['recommended_distance_percent']:.2f}%** dari panjang saluran."
-        )
-
-        if single_external_context and single_result.get("is_reverse_or_external_position"):
-            if single_result["recommended_distance_km"] < 0:
-                st.write(
-                    "Interpretasi backfeed/reverse: nilai signed negatif menunjukkan estimasi berada "
-                    "di belakang terminal relay, sehingga tidak boleh dibaca sebagai lokasi internal "
-                    "pada saluran yang dianalisis."
-                )
-            elif single_result["recommended_distance_km"] > line_param["length_km"]:
-                st.write(
-                    "Interpretasi backfeed/reverse: nilai signed melebihi panjang saluran menunjukkan "
-                    "estimasi berada di luar ujung remote saluran yang dianalisis."
-                )
-
-        if abs(single_result["Rf_est_ohm"]) > 10:
-            st.warning(
-                f"Estimasi tahanan gangguan adalah {single_result['Rf_est_ohm']:.3f} Ω. "
-                "Nilai ini cukup besar sehingga hasil single-ended dapat bergeser, terutama pada gangguan high resistance."
-            )
+with tab11:
+    st.subheader("R-X Locus")
+    st.write(
+        "Halaman ini menggambar trajectory apparent impedance terhadap waktu untuk GI lokal atau GI remote. "
+        "Setiap titik berasal dari fasor sliding DFT satu siklus pada cursor waktu berbeda."
+    )
+    rx_local_tab, rx_remote_tab = st.tabs(["Local End", "Remote End"])
+    with rx_local_tab:
+        render_simple_rx_locus("local")
+    with rx_remote_tab:
+        render_simple_rx_locus("remote")
 
 
 with tab10:
@@ -5293,789 +6017,33 @@ with tab10:
     col_l2.metric("Local I1 RMS", f'{local_phasors["I1"]["magnitude"]:.3f}')
     col_l3.metric("Line Length", f'{line_param["length_km"]:.3f} km')
 
-    st.markdown("### Remote End Fault Record")
-
-    if remote_cfg_file is None or remote_dat_file is None:
-        st.info(
-            "Upload pasangan file .cfg dan .dat dari relay ujung remote pada panel kiri "
-            "untuk menjalankan double-ended calculation."
-        )
-        st.stop()
-
-    if not validate_uploaded_extension(remote_cfg_file, ".cfg", "File remote CFG"):
-        st.stop()
-
-    if not validate_uploaded_extension(remote_dat_file, ".dat", "File remote DAT"):
-        st.stop()
-
-    st.success("Remote end COMTRADE sudah dipilih dari panel upload.")
-
-    remote_cfg_bytes = remote_cfg_file.getvalue()
-    remote_dat_bytes = remote_dat_file.getvalue()
-
-    try:
-        remote_df, remote_metadata = read_comtrade_cached(
-            remote_cfg_bytes,
-            remote_dat_bytes,
-            remote_cfg_file.name,
-            remote_dat_file.name,
-        )
-
-        remote_auto_assignment = detect_voltage_current_channels(
-            remote_df,
-            remote_metadata,
-        )
-
-        remote_auto_transformer_data = get_auto_transformer_data(remote_metadata)
-        remote_auto_recorded_side = detect_recorded_side(remote_metadata)
-
-        st.session_state["remote_auto_assignment"] = remote_auto_assignment
-        st.session_state["remote_auto_transformer_data"] = remote_auto_transformer_data
-        st.session_state["remote_auto_recorded_side"] = remote_auto_recorded_side
-        st.session_state["remote_metadata"] = remote_metadata
-
-        st.success("Remote end COMTRADE berhasil dibaca dan signal assignment otomatis dibuat.")
-
-    except Exception as e:
-        st.error("Remote end COMTRADE gagal dibaca.")
-        st.exception(e)
-        st.stop()
-
-    st.markdown("### Remote End Signal Assignment")
-
-    st.markdown("### Remote Auto-Read Metadata")
-
-    col_ram1, col_ram2, col_ram3, col_ram4 = st.columns(4)
-
-    col_ram1.metric(
-        "Remote CFG Start Time",
-        str(remote_metadata.get("cfg_start_time") or "-"),
-    )
-
-    col_ram2.metric(
-        "Remote CFG Trigger Time",
-        str(remote_metadata.get("cfg_trigger_time") or "-"),
-    )
-
-    col_ram3.metric(
-        "Remote VT Ratio from CFG",
-        str(remote_metadata.get("vt_ratio_from_cfg") or "-"),
-    )
-
-    col_ram4.metric(
-        "Remote CT Ratio from CFG",
-        str(remote_metadata.get("ct_ratio_from_cfg") or "-"),
-    )
-
-    with st.expander("Remote Auto Signal Assignment Preview"):
-        remote_auto_summary_df = build_auto_assignment_summary(
-            st.session_state["remote_auto_assignment"],
-            st.session_state["remote_auto_transformer_data"],
-            remote_metadata,
-        )
-
-        st.dataframe(remote_auto_summary_df, use_container_width=True)
-
-    with st.expander("Remote Analog Metadata dari .cfg"):
-        remote_analog_meta_df = pd.DataFrame(
-            remote_metadata.get("analog_metadata", [])
-        )
-        st.dataframe(remote_analog_meta_df, use_container_width=True)
-
-    remote_channel_options = [col for col in remote_df.columns if col != "time"]
-    remote_ground_options = ["None"] + remote_channel_options
-
-    remote_auto_assignment = st.session_state.get("remote_auto_assignment", {})
-    remote_auto_transformer_data = st.session_state.get(
-        "remote_auto_transformer_data",
-        {},
-    )
-    remote_auto_recorded_side = st.session_state.get(
-        "remote_auto_recorded_side",
-        "secondary",
-    )
-
-
-    def get_remote_channel_index(channel_name, options, default_index=0):
-        if channel_name in options:
-            return options.index(channel_name)
-        return default_index
-
-
-    def get_remote_ground_index(channel_name, options):
-        if channel_name in options:
-            return options.index(channel_name)
-        return 0
-
-    col_rv1, col_rv2, col_rv3 = st.columns(3)
-
-    with col_rv1:
-        remote_va_channel = st.selectbox(
-            "Remote Va / VL1",
-            remote_channel_options,
-            index=get_remote_channel_index(
-                remote_auto_assignment.get("Va"),
-                remote_channel_options,
-                0,
-            ),
-            key="remote_va_channel",
-        )
-
-    with col_rv2:
-        remote_vb_channel = st.selectbox(
-            "Remote Vb / VL2",
-            remote_channel_options,
-            index=get_remote_channel_index(
-                remote_auto_assignment.get("Vb"),
-                remote_channel_options,
-                1 if len(remote_channel_options) > 1 else 0,
-            ),
-            key="remote_vb_channel",
-        )
-
-    with col_rv3:
-        remote_vc_channel = st.selectbox(
-            "Remote Vc / VL3",
-            remote_channel_options,
-            index=get_remote_channel_index(
-                remote_auto_assignment.get("Vc"),
-                remote_channel_options,
-                2 if len(remote_channel_options) > 2 else 0,
-            ),
-            key="remote_vc_channel",
-        )
-
-    col_ri1, col_ri2, col_ri3 = st.columns(3)
-
-    default_remote_ia_index = 3 if len(remote_channel_options) > 3 else 0
-    default_remote_ib_index = 4 if len(remote_channel_options) > 4 else 0
-    default_remote_ic_index = 5 if len(remote_channel_options) > 5 else 0
-
-    with col_ri1:
-        remote_ia_channel = st.selectbox(
-            "Remote Ia / IL1",
-            remote_channel_options,
-            index=get_remote_channel_index(
-                remote_auto_assignment.get("Ia"),
-                remote_channel_options,
-                default_remote_ia_index,
-            ),
-            key="remote_ia_channel",
-        )
-
-    with col_ri2:
-        remote_ib_channel = st.selectbox(
-            "Remote Ib / IL2",
-            remote_channel_options,
-            index=get_remote_channel_index(
-                remote_auto_assignment.get("Ib"),
-                remote_channel_options,
-                default_remote_ib_index,
-            ),
-            key="remote_ib_channel",
-        )
-
-    with col_ri3:
-        remote_ic_channel = st.selectbox(
-            "Remote Ic / IL3",
-            remote_channel_options,
-            index=get_remote_channel_index(
-                remote_auto_assignment.get("Ic"),
-                remote_channel_options,
-                default_remote_ic_index,
-            ),
-            key="remote_ic_channel",
-        )
-
-    remote_ie_channel = st.selectbox(
-        "Remote IE / IN / 3I0 jika tersedia",
-        remote_ground_options,
-        index=get_remote_ground_index(
-            remote_auto_assignment.get("IE"),
-            remote_ground_options,
-        ),
-        key="remote_ie_channel",
-    )
-
-    if remote_ie_channel != "None":
-        st.success(f"Remote channel arus netral/ground terdeteksi dan dipakai: {remote_ie_channel}")
-    else:
-        st.info("Remote IE/IN/3I0 tidak dipilih. Aplikasi akan menghitung IE residual dari Ia + Ib + Ic.")
-
-    st.markdown("### Remote End Transformer Data")
-
-    remote_recorded_side_options = ["secondary", "primary"]
-
-    remote_recorded_side_default_index = (
-        remote_recorded_side_options.index(remote_auto_recorded_side)
-        if remote_auto_recorded_side in remote_recorded_side_options
-        else 0
-    )
-
-    remote_recorded_side = st.radio(
-        "Nilai remote COMTRADE direkam sebagai:",
-        remote_recorded_side_options,
-        index=remote_recorded_side_default_index,
-        horizontal=True,
-        key="remote_recorded_side",
-    )
-
-    col_rct1, col_rct2, col_rvt1, col_rvt2 = st.columns(4)
-
-    with col_rct1:
-        remote_ct_primary = st.number_input(
-            "Remote CT Primary (A)",
-            value=float(remote_auto_transformer_data.get("ct_primary", 800.0)),
-            min_value=0.001,
-            step=0.001,
-            format="%.5f",
-            key="remote_ct_primary",
-        )
-
-    with col_rct2:
-        remote_ct_secondary = st.number_input(
-            "Remote CT Secondary (A)",
-            value=float(remote_auto_transformer_data.get("ct_secondary", 1.0)),
-            min_value=0.001,
-            step=0.001,
-            format="%.5f",
-            key="remote_ct_secondary",
-        )
-
-    with col_rvt1:
-        remote_vt_primary = st.number_input(
-            "Remote VT Primary (V)",
-            value=float(remote_auto_transformer_data.get("vt_primary", 150000.0)),
-            min_value=0.001,
-            step=0.001,
-            format="%.5f",
-            key="remote_vt_primary",
-        )
-
-    with col_rvt2:
-        remote_vt_secondary = st.number_input(
-            "Remote VT Secondary (V)",
-            value=float(remote_auto_transformer_data.get("vt_secondary", 100.0)),
-            min_value=0.001,
-            step=0.001,
-            format="%.5f",
-            key="remote_vt_secondary",
-        )
-
-    st.caption(
-        f"Remote auto ratio source: "
-        f"CT = {remote_auto_transformer_data.get('ct_ratio_source', '-')}, "
-        f"VT = {remote_auto_transformer_data.get('vt_ratio_source', '-')}. "
-        "Tetap validasi manual karena tidak semua file CFG menyimpan primary/secondary dengan benar."
-    )
-
-    remote_assigned_df = apply_signal_assignment(
-        df=remote_df,
-        va_channel=remote_va_channel,
-        vb_channel=remote_vb_channel,
-        vc_channel=remote_vc_channel,
-        ia_channel=remote_ia_channel,
-        ib_channel=remote_ib_channel,
-        ic_channel=remote_ic_channel,
-        ie_channel=remote_ie_channel,
-        recorded_side=remote_recorded_side,
-        ct_primary=remote_ct_primary,
-        ct_secondary=remote_ct_secondary,
-        vt_primary=remote_vt_primary,
-        vt_secondary=remote_vt_secondary,
-    )
-
-    st.session_state["remote_assigned_df"] = remote_assigned_df
-    st.session_state["remote_transformer_data"] = {
-        "recorded_side": remote_recorded_side,
-        "ct_primary": remote_ct_primary,
-        "ct_secondary": remote_ct_secondary,
-        "vt_primary": remote_vt_primary,
-        "vt_secondary": remote_vt_secondary,
-        "nominal_phase_voltage_rms": remote_vt_primary / math.sqrt(3.0),
-        "nominal_current_rms": remote_ct_primary,
-    }
-    st.session_state["remote_ie_selected_channel"] = remote_ie_channel if remote_ie_channel != "None" else None
-    st.session_state["remote_ie_source"] = (
-        "measured" if remote_ie_channel != "None" else "calculated_from_3_phase_currents"
-    )
-
-    with st.expander("Preview Remote Assigned Data"):
-        st.dataframe(remote_assigned_df.head(20), use_container_width=True)
-
-    st.markdown("### Remote Assigned Waveform Validation")
-
-    remote_waveform_group = st.selectbox(
-        "Pilih kelompok sinyal remote",
-        list(signal_groups.keys()),
-        key="remote_assigned_waveform_group",
-    )
-    remote_waveform_channels = [
-        channel
-        for channel in signal_groups[remote_waveform_group]
-        if channel in remote_assigned_df.columns
-    ]
-    remote_waveform_display_mode = st.radio(
-        "Mode tampilan waveform remote",
-        ["Instantaneous / peak", "RMS 1 siklus"],
-        horizontal=True,
-        key="remote_assigned_waveform_display_mode",
-    )
-
-    remote_waveform_frequency = float(remote_metadata["frequency"]) if remote_metadata["frequency"] else 50.0
-    remote_rms_summary_df = build_waveform_rms_summary(
-        remote_assigned_df,
-        remote_waveform_channels,
-        frequency=remote_waveform_frequency,
-    )
-
-    if not remote_rms_summary_df.empty:
-        with st.expander("Remote RMS vs Peak Awal Rekaman", expanded=False):
-            st.dataframe(
-                remote_rms_summary_df.style.format(
-                    {
-                        "RMS Awal Rekaman": "{:.3f}",
-                        "Peak Absolut Awal": "{:.3f}",
-                        "Peak/RMS": "{:.3f}",
-                    }
-                ),
-                use_container_width=True,
-            )
-
-    if remote_waveform_channels:
-        remote_assigned_fig, remote_waveform_caption = build_assigned_waveform_plot(
-            remote_assigned_df,
-            remote_waveform_channels,
-            f"Remote Waveform {remote_waveform_group} - {remote_waveform_display_mode}",
-            remote_waveform_display_mode,
-            frequency=remote_waveform_frequency,
-        )
-        st.caption(remote_waveform_caption)
-        st.plotly_chart(remote_assigned_fig, use_container_width=True)
-
-    st.markdown("### Remote Fault Detection & Phasor")
-    remote_transformer_data = st.session_state.get("remote_transformer_data", {})
-
-    col_rf1, col_rf2, col_rf3 = st.columns(3)
-
-    with col_rf1:
-        remote_frequency = st.number_input(
-            "Remote Frequency (Hz)",
-            value=float(remote_metadata["frequency"]) if remote_metadata["frequency"] else 50.0,
-            min_value=40.0,
-            max_value=70.0,
-            step=0.001,
-            format="%.5f",
-            key="remote_frequency",
-        )
-
-    remote_auto_fault_detection_settings = calculate_auto_fault_detection_parameters(
-        remote_assigned_df,
-        frequency=remote_frequency,
-        pre_fault_cycles=2,
-        nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
-        nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
-    )
-    use_remote_auto_fault_detection = st.checkbox(
-        "Gunakan deteksi otomatis adaptif remote nominal + pre-fault",
-        value=True,
-        key="use_remote_auto_fault_detection",
-        help=(
-            "Remote memakai pre-fault RMS bila normal. Jika pre-fault remote terlihat sudah abnormal, "
-            "referensi nominal dari VT/CT dipakai sebagai pembanding tambahan."
-        ),
-    )
-
-    if use_remote_auto_fault_detection:
-        st.session_state["remote_current_multiplier"] = remote_auto_fault_detection_settings["current_threshold_multiplier"]
-        st.session_state["remote_voltage_threshold"] = remote_auto_fault_detection_settings["voltage_drop_threshold"]
-
-    with col_rf2:
-        remote_current_multiplier = st.number_input(
-            "Remote Current Fault Multiplier",
-            value=float(remote_auto_fault_detection_settings["current_threshold_multiplier"]),
-            min_value=1.01,
-            max_value=10.0,
-            step=0.001,
-            format="%.5f",
-            key="remote_current_multiplier",
-            disabled=use_remote_auto_fault_detection,
-        )
-
-    with col_rf3:
-        remote_voltage_threshold = st.number_input(
-            "Remote Voltage Drop Threshold",
-            value=float(remote_auto_fault_detection_settings["voltage_drop_threshold"]),
-            min_value=0.1,
-            max_value=1.0,
-            step=0.0001,
-            format="%.5f",
-            key="remote_voltage_threshold",
-            disabled=use_remote_auto_fault_detection,
-        )
-
-    if use_remote_auto_fault_detection:
-        remote_current_multiplier = remote_auto_fault_detection_settings["current_threshold_multiplier"]
-        remote_voltage_threshold = remote_auto_fault_detection_settings["voltage_drop_threshold"]
-
-    with st.expander("Remote Detail Parameter Deteksi Otomatis"):
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {"Parameter": key, "Value": value}
-                    for key, value in remote_auto_fault_detection_settings.items()
-                ]
-            ).style.format(
-                {"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}
-            ),
-            use_container_width=True,
-        )
-
-    remote_detection = detect_fault_inception(
-        remote_assigned_df,
-        frequency=remote_frequency,
-        current_threshold_multiplier=remote_current_multiplier,
-        voltage_drop_threshold=remote_voltage_threshold,
-        min_prefault_cycles=2,
-        adaptive_threshold_sigma=(
-            remote_auto_fault_detection_settings["adaptive_threshold_sigma"]
-            if use_remote_auto_fault_detection
-            else None
-        ),
-        refine_fault_bar=use_remote_auto_fault_detection,
-        method=(
-            remote_auto_fault_detection_settings["fault_detection_method"]
-            if use_remote_auto_fault_detection
-            else "legacy_rms"
-        ),
-        superimposed_threshold_sigma=remote_auto_fault_detection_settings["superimposed_threshold_sigma"],
-        nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
-        nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
-    )
-
-    st.session_state["remote_fault_detection"] = remote_detection
-
-    if not remote_detection["detected"]:
+    missing_remote_inputs = []
+    if "remote_assigned_df" not in st.session_state:
+        missing_remote_inputs.append("Remote End > Signals")
+    if "remote_fault_window" not in st.session_state:
+        missing_remote_inputs.append("Remote End > Fault Cursor")
+    if "remote_phasors" not in st.session_state:
+        missing_remote_inputs.append("Remote End > Phasor")
+
+    if missing_remote_inputs:
         st.warning(
-            "Remote fault inception tidak terdeteksi otomatis. "
-            "Gunakan slider manual untuk menentukan waktu fault remote."
+            "Lengkapi dulu " + ", ".join(missing_remote_inputs) +
+            " sebelum menjalankan double-ended calculation."
         )
+        st.stop()
 
-        min_remote_time = float(remote_assigned_df["time"].min())
-        max_remote_time = float(remote_assigned_df["time"].max())
-
-        manual_remote_fault_time = st.slider(
-            "Pilih waktu awal gangguan remote manual (s)",
-            min_value=min_remote_time,
-            max_value=max_remote_time,
-            value=min_remote_time,
-            step=(max_remote_time - min_remote_time) / 1000,
-            key="manual_remote_fault_time",
+    remote_assigned_df = st.session_state["remote_assigned_df"]
+    remote_metadata = st.session_state.get("remote_metadata", {})
+    remote_phasors = st.session_state["remote_phasors"]
+    remote_fault_window = st.session_state["remote_fault_window"]
+    remote_detection = st.session_state.get("remote_fault_detection", {})
+    remote_frequency = float(st.session_state.get("remote_frequency_hz", remote_metadata.get("frequency") or 50.0))
+    remote_samples_per_cycle = int(
+        st.session_state.get(
+            "remote_samples_per_cycle",
+            remote_detection.get("samples_per_cycle") or max(1, round(estimate_sampling_rate(remote_assigned_df) / remote_frequency)),
         )
-
-        remote_fault_index = int(
-            (remote_assigned_df["time"] - manual_remote_fault_time).abs().idxmin()
-        )
-
-        remote_samples_per_cycle = int(round(
-            estimate_sampling_rate(remote_assigned_df) / remote_frequency
-        ))
-
-    else:
-        st.success("Remote fault inception berhasil terdeteksi otomatis.")
-        remote_fault_index = remote_detection["fault_index"]
-        remote_samples_per_cycle = remote_detection["samples_per_cycle"]
-
-    remote_fault_window = build_fault_window(
-        remote_assigned_df,
-        fault_index=remote_fault_index,
-        samples_per_cycle=remote_samples_per_cycle,
-        pre_fault_cycles=2,
-        post_fault_cycles=4,
     )
-
-    st.session_state["remote_fault_window"] = remote_fault_window
-
-    col_rw1, col_rw2, col_rw3 = st.columns(3)
-
-    col_rw1.metric("Remote Fault Time", f'{remote_fault_window["fault_time"]:.6f} s')
-    col_rw2.metric("Remote DFT Time", f'{remote_fault_window["dft_time"]:.6f} s')
-    col_rw3.metric("Remote Samples/Cycle", remote_samples_per_cycle)
-
-    st.markdown("#### Remote Fault Detection & Cursor")
-
-    col_rdc1, col_rdc2, col_rdc3, col_rdc4 = st.columns(4)
-
-    col_rdc1.metric(
-        "Detection",
-        "AUTO" if remote_detection["detected"] else "MANUAL",
-    )
-    col_rdc2.metric("Left Cursor", f'{remote_fault_window["left_time"]:.6f} s')
-    col_rdc3.metric("DFT Cursor", f'{remote_fault_window["dft_time"]:.6f} s')
-    col_rdc4.metric("Right Cursor", f'{remote_fault_window["right_time"]:.6f} s')
-
-    remote_plot_channels = [
-        channel
-        for channel in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
-        if channel in remote_assigned_df.columns
-    ]
-    remote_default_channels = [
-        channel for channel in ["Ia", "Ib", "Ic"] if channel in remote_plot_channels
-    ]
-    remote_selected_plot = st.multiselect(
-        "Pilih sinyal remote untuk validasi fault window",
-        remote_plot_channels,
-        default=remote_default_channels or remote_plot_channels[:3],
-        key="remote_fault_window_plot_channels",
-    )
-
-    if remote_selected_plot:
-        remote_fault_fig = build_fault_window_plot(
-            remote_assigned_df,
-            remote_fault_window,
-            remote_selected_plot,
-            "Remote Fault Detection dan Cursor Window",
-        )
-        st.plotly_chart(remote_fault_fig, use_container_width=True)
-
-    remote_cursor_df = pd.DataFrame(
-        [
-            {"Parameter": "Detected Automatically", "Value": remote_detection["detected"]},
-            {"Parameter": "Fault Index", "Value": remote_fault_window["fault_index"]},
-            {"Parameter": "Fault Time s", "Value": remote_fault_window["fault_time"]},
-            {"Parameter": "Left Cursor Index", "Value": remote_fault_window["left_index"]},
-            {"Parameter": "Left Cursor Time s", "Value": remote_fault_window["left_time"]},
-            {"Parameter": "DFT Cursor Index", "Value": remote_fault_window["dft_index"]},
-            {"Parameter": "DFT Cursor Time s", "Value": remote_fault_window["dft_time"]},
-            {"Parameter": "Right Cursor Index", "Value": remote_fault_window["right_index"]},
-            {"Parameter": "Right Cursor Time s", "Value": remote_fault_window["right_time"]},
-            {"Parameter": "Samples per Cycle", "Value": remote_samples_per_cycle},
-            {"Parameter": "Frequency Hz", "Value": remote_frequency},
-        ]
-    )
-
-    with st.expander("Remote Fault Detection & Cursor Detail"):
-        st.dataframe(
-            remote_cursor_df.style.format(
-                {
-                    "Value": lambda x: f"{x:.6f}"
-                    if isinstance(x, (int, float)) and not isinstance(x, bool)
-                    else x
-                }
-            ),
-            use_container_width=True,
-        )
-
-        remote_detection_detail_df = pd.DataFrame(
-            [
-                {
-                    "Parameter": key,
-                    "Value": value,
-                }
-                for key, value in remote_detection.items()
-                if isinstance(value, (str, int, float, bool))
-            ]
-        )
-
-        st.dataframe(
-            remote_detection_detail_df.style.format(
-                {
-                    "Value": lambda x: f"{x:.6f}"
-                    if isinstance(x, (int, float)) and not isinstance(x, bool)
-                    else x
-                }
-            ),
-            use_container_width=True,
-        )
-
-    remote_phasors = calculate_all_phasors(
-        df=remote_assigned_df,
-        cursor_index=remote_fault_window["dft_index"],
-        samples_per_cycle=remote_samples_per_cycle,
-    )
-
-    remote_phasors = add_sequence_components_to_phasor_dict(remote_phasors)
-
-    st.session_state["remote_phasors"] = remote_phasors
-    st.session_state["two_ended_remote_phasors_for_calculation"] = remote_phasors
-    st.session_state["two_ended_remote_dft_index_for_calculation"] = remote_fault_window["dft_index"]
-    st.session_state["two_ended_remote_sync_shift_s"] = 0.0
-    st.session_state["two_ended_remote_sync_score"] = 0.0
-    st.session_state["two_ended_remote_sync_reference"] = "fault_cursor"
-
-    try:
-        remote_prefault_phasors = calculate_all_phasors(
-            df=remote_assigned_df,
-            cursor_index=remote_fault_window["fault_index"],
-            samples_per_cycle=remote_samples_per_cycle,
-        )
-        remote_prefault_phasors = add_sequence_components_to_phasor_dict(remote_prefault_phasors)
-        st.session_state["remote_prefault_phasors"] = remote_prefault_phasors
-        st.caption(
-            "Remote pre-fault phasor tersedia untuk deteksi delta/superimposed."
-        )
-    except Exception as remote_prefault_error:
-        remote_prefault_phasors = None
-        st.session_state.pop("remote_prefault_phasors", None)
-        st.caption(
-            "Remote pre-fault phasor tidak dapat dihitung: "
-            f"{remote_prefault_error}"
-        )
-
-    st.markdown("#### Remote Fault Type Detection")
-
-    remote_auto_fault_settings = calculate_auto_fault_type_thresholds(
-        remote_phasors,
-        st.session_state.get("remote_prefault_phasors"),
-    )
-    use_remote_auto_fault_type_thresholds = st.toggle(
-        "Gunakan threshold otomatis remote dari kondisi pre-fault",
-        value=True,
-        key="use_remote_auto_fault_type_thresholds",
-        help=(
-            "Aplikasi menghitung baseline normal remote dari window pre-fault setelah scaling CT/VT. "
-            "Remote Current Fault Multiplier tetap hanya dipakai untuk mencari fault cursor."
-        ),
-    )
-
-    st.caption(
-        "Mode otomatis membuat klasifikasi remote mengikuti kondisi normal rekaman. "
-        "Parameter manual di bawah hanya dipakai jika mode otomatis remote dimatikan."
-    )
-
-    col_rftp1, col_rftp2, col_rftp3 = st.columns(3)
-
-    with col_rftp1:
-        remote_fault_type_voltage_drop_threshold = st.number_input(
-            "Remote Fault Type Voltage Drop Threshold",
-            value=0.80,
-            min_value=0.10,
-            max_value=1.00,
-            step=0.0001,
-            format="%.5f",
-            key="remote_fault_type_voltage_drop_threshold",
-            help="Fasa remote dianggap drop jika Vphase <= threshold x Vmax.",
-        )
-
-    with col_rftp2:
-        remote_fault_type_current_rise_threshold = st.number_input(
-            "Remote Fault Type Current Rise Threshold",
-            value=1.50,
-            min_value=1.05,
-            max_value=10.00,
-            step=0.0001,
-            format="%.5f",
-            key="remote_fault_type_current_rise_threshold",
-            help="Fasa remote dianggap faulted jika Iphase >= threshold x Imin.",
-        )
-
-    with col_rftp3:
-        remote_fault_type_ground_current_threshold = st.number_input(
-            "Remote Fault Type Ground Current Threshold",
-            value=0.20,
-            min_value=0.01,
-            max_value=1.00,
-            step=0.0001,
-            format="%.5f",
-            key="remote_fault_type_ground_current_threshold",
-            help="Ground fault remote jika IE/Imax atau I0/Iavg melebihi threshold.",
-        )
-
-    with st.expander("Remote Advanced Resistive Fault / Delta Detection"):
-        col_rftd1, col_rftd2 = st.columns(2)
-
-        with col_rftd1:
-            remote_delta_current_threshold = st.number_input(
-                "Remote Delta Current Dominance Threshold",
-                value=0.45,
-                min_value=0.05,
-                max_value=1.00,
-                step=0.0001,
-                format="%.5f",
-                key="remote_delta_current_threshold",
-                help="Membantu klasifikasi fasa fault saat perubahan fasor besar tetapi magnitude arus fasa tidak naik normal.",
-            )
-
-        with col_rftd2:
-            remote_delta_voltage_threshold = st.number_input(
-                "Remote Delta Voltage Threshold",
-                value=0.01,
-                min_value=0.0001,
-                max_value=0.20,
-                step=0.0001,
-                format="%.5f",
-                key="remote_delta_voltage_threshold",
-                help="Ambang perubahan tegangan remote terhadap pre-fault untuk sag kecil pada high resistance fault.",
-            )
-
-    if use_remote_auto_fault_type_thresholds:
-        remote_fault_type_voltage_drop_threshold = remote_auto_fault_settings["voltage_drop_threshold"]
-        remote_fault_type_current_rise_threshold = remote_auto_fault_settings["current_rise_threshold"]
-        remote_fault_type_ground_current_threshold = remote_auto_fault_settings["ground_current_threshold"]
-        remote_delta_current_threshold = remote_auto_fault_settings["delta_current_threshold"]
-        remote_delta_voltage_threshold = remote_auto_fault_settings["delta_voltage_threshold"]
-
-    remote_fault_type_result = detect_fault_type(
-        phasors=remote_phasors,
-        prefault_phasors=st.session_state.get("remote_prefault_phasors"),
-        voltage_drop_threshold=remote_fault_type_voltage_drop_threshold,
-        current_rise_threshold=remote_fault_type_current_rise_threshold,
-        ground_current_threshold=remote_fault_type_ground_current_threshold,
-        delta_current_threshold=remote_delta_current_threshold,
-        delta_voltage_threshold=remote_delta_voltage_threshold,
-    )
-    remote_fault_type_result["auto_thresholds"] = remote_auto_fault_settings
-    remote_fault_type_result["threshold_mode"] = (
-        "auto_prefault" if use_remote_auto_fault_type_thresholds else "manual"
-    )
-    remote_fault_type_df = build_fault_type_metrics_dataframe(remote_fault_type_result)
-
-    st.session_state["remote_fault_type_result"] = remote_fault_type_result
-    st.session_state["remote_fault_type_df"] = remote_fault_type_df
-
-    col_rft1, col_rft2, col_rft3, col_rft4 = st.columns(4)
-
-    col_rft1.metric("Remote Fault Type", remote_fault_type_result["fault_type"])
-    col_rft2.metric(
-        "Ground Involved",
-        "Yes" if remote_fault_type_result["ground_involved"] else "No",
-    )
-    col_rft3.metric("Confidence", f'{remote_fault_type_result["confidence"]}/10')
-    col_rft4.metric(
-        "Faulted Phases",
-        ", ".join(remote_fault_type_result["faulted_phases"])
-        if remote_fault_type_result["faulted_phases"]
-        else "-",
-    )
-
-    st.info(explain_fault_type_result(remote_fault_type_result, context="Rekaman remote"))
-
-    with st.expander("Remote Auto Threshold Detail"):
-        st.dataframe(
-            build_auto_fault_type_threshold_dataframe(remote_auto_fault_settings).style.format(
-                {"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}
-            ),
-            use_container_width=True,
-        )
-
-    with st.expander("Remote Fault Type Detection Detail"):
-        st.dataframe(remote_fault_type_df, use_container_width=True)
-
-    remote_phasor_df = build_phasor_dataframe(remote_phasors)
-
-    with st.expander("Remote Phasor Table"):
-        st.dataframe(
-            remote_phasor_df.style.format(
-                {
-                    "Magnitude RMS": "{:.4f}",
-                    "Angle Deg": "{:.2f}",
-                    "Real": "{:.4f}",
-                    "Imag": "{:.4f}",
-                }
-            ),
-            use_container_width=True,
-        )
-
     st.markdown("### Local vs Remote Phasor Diagram")
     phasor_plot_group = st.radio(
         "Pilih kelompok fasor untuk perbandingan",
@@ -7712,4 +7680,345 @@ with tab10:
                     st.success("Hasil time-based berada di dalam panjang saluran dan selisih waktu masih realistis.")
 
 
+with summary_container:
+    st.subheader("Summary / Report Ringkas")
+    st.caption(
+        "Halaman ini merangkum rekaman gangguan, hasil utama, dan grafik pendukung. "
+        "Summary dirender setelah workflow selesai sehingga hasil Single-End/Double-End terbaru ikut terbaca."
+    )
 
+    local_name = str(metadata.get("station_name") or "Local End")
+    remote_loaded = "remote_metadata" in st.session_state or (remote_cfg_file is not None and remote_dat_file is not None)
+    remote_status = "Uploaded" if remote_loaded else "Not uploaded"
+    remote_metadata_summary = st.session_state.get("remote_metadata", {})
+    remote_name = str(remote_metadata_summary.get("station_name") or "Remote End")
+
+    col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+    col_sum1.metric("Local Record", local_name)
+    col_sum2.metric("Remote Record", remote_name if remote_loaded else remote_status)
+    col_sum3.metric("Samples", metadata.get("total_samples", "-"))
+    col_sum4.metric("Frequency", f"{metadata.get('frequency') or '-'} Hz")
+
+    ie_local_text = (
+        f"measured ({st.session_state.get('local_ie_channel')})"
+        if st.session_state.get("local_ie_source") == "measured"
+        else "calculated from Ia+Ib+Ic"
+    )
+    ie_remote_text = (
+        f"measured ({st.session_state.get('remote_ie_selected_channel')})"
+        if st.session_state.get("remote_ie_source") == "measured"
+        else "calculated from Ia+Ib+Ic"
+    )
+    st.caption(f"IE source: Local = {ie_local_text}; Remote = {ie_remote_text}.")
+
+    st.markdown("### Calculation Status")
+    status_rows = [
+        {
+            "Step": "Signal Assignment",
+            "Status": "Done" if "assigned_df" in st.session_state else "Pending",
+            "Main Result": "Local waveform mapped" if "assigned_df" in st.session_state else "-",
+        },
+        {
+            "Step": "Fault Cursor",
+            "Status": "Done" if "fault_window" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["fault_window"]["fault_time"]:.6f} s'
+                if "fault_window" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Phasor",
+            "Status": "Done" if "phasors" in st.session_state else "Pending",
+            "Main Result": (
+                f'V1 {st.session_state["phasors"]["V1"]["magnitude"]:.3f}, '
+                f'I1 {st.session_state["phasors"]["I1"]["magnitude"]:.3f}'
+                if "phasors" in st.session_state and "V1" in st.session_state["phasors"]
+                else "-"
+            ),
+        },
+        {
+            "Step": "Fault Type",
+            "Status": "Done" if "fault_type_result" in st.session_state else "Pending",
+            "Main Result": (
+                st.session_state["fault_type_result"].get("fault_type", "-")
+                if "fault_type_result" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Line Parameter",
+            "Status": "Done" if "line_param" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["line_param"].get("line_name", "-")} | '
+                f'{st.session_state["line_param"]["length_km"]:.3f} km'
+                if "line_param" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Single-End",
+            "Status": "Done" if "single_ended_result" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["single_ended_result"]["recommended_distance_km"]:.3f} km '
+                f'({st.session_state["single_ended_result"]["status"]})'
+                if "single_ended_result" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Double-End",
+            "Status": "Done" if "two_ended_result" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["two_ended_result"].get("distance_from_original_local_km", st.session_state["two_ended_result"].get("distance_km", 0.0)):.3f} km | '
+                f'Q {st.session_state.get("two_ended_quality", {}).get("quality_score", "-")}/10'
+                if "two_ended_result" in st.session_state
+                else "-"
+            ),
+        },
+    ]
+    st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+
+    st.markdown("### Key Results")
+    key_col1, key_col2, key_col3, key_col4 = st.columns(4)
+    fault_type_summary = st.session_state.get("fault_type_result", {})
+    remote_fault_type_summary = st.session_state.get("remote_fault_type_result", {})
+    single_summary = st.session_state.get("single_ended_result")
+    two_summary = st.session_state.get("two_ended_result")
+    two_quality_summary = st.session_state.get("two_ended_quality", {})
+
+    key_col1.metric("Fault Type", fault_type_summary.get("fault_type", "-"))
+    key_col2.metric(
+        "Single-End",
+        f'{single_summary["recommended_distance_km"]:.3f} km' if single_summary else "-",
+    )
+    key_col3.metric(
+        "Double-End",
+        f'{two_summary.get("distance_from_original_local_km", two_summary.get("distance_km", 0.0)):.3f} km' if two_summary else "-",
+    )
+    key_col4.metric(
+        "DE Quality",
+        f'{two_quality_summary.get("quality_score", "-")}/10'
+        if two_quality_summary
+        else "-",
+    )
+
+    summary_operating_status = st.session_state.get("two_ended_operating_status")
+    if summary_operating_status:
+        st.markdown("### Status Diagnostik DE")
+        status_text = ", ".join(summary_operating_status.get("statuses", []))
+        if summary_operating_status.get("can_use_de_distance"):
+            st.success(f"Status: {status_text}")
+        else:
+            st.warning(f"Status: {status_text}")
+        for note in summary_operating_status.get("notes", []):
+            st.info(note)
+        st.caption(summary_operating_status.get("recommendation", ""))
+    st.markdown("### Perbandingan Pre-fault dan Fault")
+    local_comparison_df = build_prefault_fault_comparison_dataframe(
+        st.session_state.get("phasors"),
+        st.session_state.get("prefault_phasors"),
+        st.session_state.get("two_ended_local_gi_label", "Local"),
+    )
+    if not local_comparison_df.empty:
+        st.markdown("#### Rekaman GI Lokal")
+        st.dataframe(
+            local_comparison_df.style.format(
+                {
+                    "Pre-fault RMS": "{:.3f}",
+                    "Fault RMS": "{:.3f}",
+                    "Delta RMS": "{:.3f}",
+                    "Delta %": "{:.2f}",
+                    "Fault Angle deg": "{:.2f}",
+                },
+                na_rep="-",
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.info("Tabel pre-fault/fault GI lokal belum tersedia. Jalankan Fault Cursor dan Phasor lokal dahulu.")
+
+    remote_comparison_df = build_prefault_fault_comparison_dataframe(
+        st.session_state.get("remote_phasors"),
+        st.session_state.get("remote_prefault_phasors"),
+        st.session_state.get("two_ended_remote_gi_label", "Remote"),
+    )
+    if not remote_comparison_df.empty:
+        st.markdown("#### Rekaman GI Remote")
+        st.dataframe(
+            remote_comparison_df.style.format(
+                {
+                    "Pre-fault RMS": "{:.3f}",
+                    "Fault RMS": "{:.3f}",
+                    "Delta RMS": "{:.3f}",
+                    "Delta %": "{:.2f}",
+                    "Fault Angle deg": "{:.2f}",
+                },
+                na_rep="-",
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.info("Tabel pre-fault/fault GI remote belum tersedia. Jalankan Double-End sampai remote phasor terbaca.")
+
+    st.markdown("### Waveform Fokus Fault Detection")
+    summary_fault_type, summary_voltage_channel, summary_current_channel = choose_summary_fault_signals(
+        fault_type_summary,
+        remote_fault_type_summary,
+    )
+    local_assigned_df = st.session_state.get("assigned_df")
+    remote_assigned_df = st.session_state.get("remote_assigned_df")
+    local_fault_window = st.session_state.get("fault_window")
+    remote_fault_window = st.session_state.get("remote_fault_window")
+    summary_remote_shift_s = float(st.session_state.get("two_ended_remote_sync_shift_s", 0.0) or 0.0)
+    if abs(summary_remote_shift_s) > 1e-9:
+        st.caption(
+            "Waveform Summary memakai shift sinkronisasi remote dari tab Double-End: "
+            f"{summary_remote_shift_s:+.6f} s."
+        )
+
+    if (
+        (local_assigned_df is not None and "IE" in local_assigned_df.columns)
+        or (remote_assigned_df is not None and "IE" in remote_assigned_df.columns)
+    ):
+        neutral_channel = "IE"
+    else:
+        neutral_channel = "I0"
+
+    waveform_specs = [
+        (
+            summary_voltage_channel,
+            f"Waveform Tegangan Fasa Terganggu ({summary_voltage_channel})",
+        ),
+        (
+            summary_current_channel,
+            f"Waveform Arus Fasa Terganggu ({summary_current_channel})",
+        ),
+        (
+            neutral_channel,
+            f"Waveform Arus Netral ({neutral_channel})",
+        ),
+    ]
+
+    show_summary_waveforms = st.toggle(
+        "Tampilkan waveform fokus di Summary",
+        value=False,
+        key="show_summary_waveforms",
+        help="Matikan default agar Summary tetap ringan di hosting. Aktifkan saat ingin membuat report atau validasi visual.",
+    )
+
+    if show_summary_waveforms:
+        for channel_name, waveform_title in waveform_specs:
+            if (
+                (
+                    local_assigned_df is not None
+                    and local_fault_window is not None
+                    and channel_name in local_assigned_df.columns
+                )
+                or (
+                    remote_assigned_df is not None
+                    and remote_fault_window is not None
+                    and channel_name in remote_assigned_df.columns
+                )
+            ):
+                st.plotly_chart(
+                    build_summary_focus_waveform(
+                        local_assigned_df,
+                        remote_assigned_df,
+                        local_fault_window,
+                        remote_fault_window,
+                        channel_name,
+                        waveform_title,
+                        remote_time_shift_s=summary_remote_shift_s,
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info(f"Channel {channel_name} belum tersedia untuk grafik {waveform_title}.")
+
+    st.markdown("### Estimasi Penyebab Gangguan")
+    estimated_cause, estimated_cause_note = estimate_summary_disturbance_cause(
+        fault_type_summary,
+        st.session_state.get("high_resistance_result"),
+    )
+    cause_options = [
+        "Auto estimate",
+        "Petir",
+        "Pohon",
+        "Benda asing",
+        "Power swing",
+        "Belum diketahui",
+    ]
+    cause_choice = st.selectbox(
+        "Penyebab gangguan untuk report",
+        cause_options,
+        key="summary_disturbance_cause_choice",
+    )
+    displayed_cause = estimated_cause if cause_choice == "Auto estimate" else cause_choice
+    st.metric("Penyebab Gangguan", displayed_cause)
+    st.caption(estimated_cause_note)
+
+    st.markdown("### Grafik SE dan DE")
+    summary_location_fig = build_summary_line_position_from_session()
+    if summary_location_fig is not None:
+        st.plotly_chart(
+            summary_location_fig,
+            use_container_width=True,
+            key="summary_two_ended_line_position_fig",
+        )
+    else:
+        st.info(
+            "Grafik SE/DE akan muncul setelah Single-End atau Double-End selesai menghitung."
+        )
+    if "high_resistance_result" in st.session_state:
+        st.info(explain_high_resistance_result(st.session_state["high_resistance_result"]))
+
+    st.markdown("### R-X Locus Trajectory")
+    summary_rx_local_label, summary_rx_remote_label = infer_gi_names_from_line_name(
+        st.session_state.get("line_param", {}).get("line_name", "")
+    )
+    summary_rx_local_tab, summary_rx_remote_tab = st.tabs(
+        [summary_rx_local_label, summary_rx_remote_label]
+    )
+
+    def show_summary_rx_locus(end_suffix: str, fallback_label: str):
+        fig, _, meta, build_warning = build_rx_locus_figure_from_session(end_suffix)
+        if fig is None:
+            st.info(
+                build_warning
+                or f"Locus {fallback_label} akan muncul setelah data {fallback_label} lengkap."
+            )
+            return
+
+        label = meta.get("label", fallback_label)
+        loop = meta.get("loop", "-")
+        point_count = meta.get("point_count", 0)
+        zone_count = meta.get("zone_count", 0)
+        if build_warning:
+            st.warning(build_warning)
+        st.caption(
+            f"{label} | Loop {loop} | {point_count} titik trajectory | "
+            f"{zone_count} zona proteksi"
+        )
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=f"summary_rx_locus_{end_suffix}",
+        )
+
+    with summary_rx_local_tab:
+        show_summary_rx_locus("local", summary_rx_local_label)
+
+    with summary_rx_remote_tab:
+        show_summary_rx_locus("remote", summary_rx_remote_label)
+
+    if two_quality_summary and two_quality_summary.get("warnings"):
+        st.markdown("### Double-End Warnings")
+        for warning in two_quality_summary["warnings"]:
+            st.warning(warning)
+
+    st.markdown("### Report Hint")
+    st.write(
+        "Untuk hasil cetak ringkas, buka tab ini lalu gunakan menu browser/Streamlit Print. "
+        "Untuk analisis detail, lanjutkan ke tab workflow di sebelah kanan."
+    )
