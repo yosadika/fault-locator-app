@@ -236,7 +236,12 @@ def calculate_single_ended_fault_location(
     line_param: dict,
     recommended_method: str = "reactance",
     prefault_phasors: dict | None = None,
+    fault_context: str = "internal_line_fault",
 ):
+    external_context = fault_context in [
+        "reverse_or_backfeed_external_fault",
+        "backfeed_or_reverse_external_fault",
+    ]
     fault_type = normalize_fault_type(fault_type_result.get("fault_type", "UNKNOWN"))
 
     z1_per_km = line_param["Z1_per_km"]
@@ -321,10 +326,20 @@ def calculate_single_ended_fault_location(
     warnings = []
 
     if recommended_distance_km < 0:
-        warnings.append("Jarak bernilai negatif. Cek polaritas CT/CVT, arah arus, atau pemilihan loop.")
+        if external_context:
+            warnings.append(
+                "Jarak signed bernilai negatif. Pada mode backfeed/reverse, ini dapat menunjukkan fault berada di belakang terminal relay, bukan otomatis kesalahan polaritas."
+            )
+        else:
+            warnings.append("Jarak bernilai negatif. Cek polaritas CT/CVT, arah arus, atau pemilihan loop.")
 
     if recommended_distance_km > line_length_km:
-        warnings.append("Jarak melebihi panjang saluran. Cek line parameter, fault type, atau kemungkinan external fault.")
+        if external_context:
+            warnings.append(
+                "Jarak signed melebihi panjang saluran. Pada mode backfeed/reverse, ini dapat menunjukkan fault eksternal di luar ujung remote line yang dianalisis."
+            )
+        else:
+            warnings.append("Jarak melebihi panjang saluran. Cek line parameter, fault type, atau kemungkinan external fault.")
 
     if abs(distance_mag_km - distance_x_km) / max(line_length_km, 1e-9) * 100 > 15:
         warnings.append("Distance magnitude dan reactance berbeda signifikan. Ada indikasi gangguan resistif atau data tidak ideal.")
@@ -348,6 +363,8 @@ def calculate_single_ended_fault_location(
     used_superimposed_fallback = False
     conventional_out_of_range = recommended_distance_km < 0 or recommended_distance_km > line_length_km
     if (
+        not external_context
+        and
         conventional_out_of_range
         and superimposed_distance_x_km is not None
         and 0 <= superimposed_distance_x_km <= line_length_km
@@ -371,11 +388,13 @@ def calculate_single_ended_fault_location(
     if warnings:
         status = "CHECK"
 
-    if recommended_distance_km < 0 or recommended_distance_km > line_length_km:
+    if not external_context and (recommended_distance_km < 0 or recommended_distance_km > line_length_km):
         status = "UNCERTAIN"
 
     result = {
         "method": "single_ended",
+        "fault_context": fault_context,
+        "external_context": external_context,
         "fault_type": fault_type,
         "selected_loop": loop["selected_loop"],
         "loop_voltage": loop["loop_voltage"],
@@ -407,6 +426,9 @@ def calculate_single_ended_fault_location(
         "phase_current_depressed": phase_current_depressed,
         "recommended_distance_km": recommended_distance_km,
         "recommended_distance_percent": recommended_distance_percent,
+        "signed_distance_km": recommended_distance_km,
+        "signed_distance_percent": recommended_distance_percent,
+        "is_reverse_or_external_position": external_context and conventional_out_of_range,
         "Rf_est_ohm": rf_est_ohm,
         "residual_Z": residual_z,
         "residual_R": residual_z.real,
@@ -421,6 +443,7 @@ def calculate_single_ended_fault_location(
 def build_single_ended_result_dataframe(result: dict):
     rows = [
         {"Parameter": "Fault Type", "Value": result["fault_type"]},
+        {"Parameter": "Fault Context", "Value": result.get("fault_context", "internal_line_fault")},
         {"Parameter": "Selected Loop", "Value": result["selected_loop"]},
         {"Parameter": "Status", "Value": result["status"]},
         {"Parameter": "Loop Voltage Magnitude", "Value": result["loop_voltage_mag"]},
@@ -448,6 +471,7 @@ def build_single_ended_result_dataframe(result: dict):
         {"Parameter": "Fault Phase Current Depressed", "Value": result["phase_current_depressed"]},
         {"Parameter": "Recommended Distance km", "Value": result["recommended_distance_km"]},
         {"Parameter": "Recommended Distance %", "Value": result["recommended_distance_percent"]},
+        {"Parameter": "Reverse/External Position", "Value": result.get("is_reverse_or_external_position", False)},
         {"Parameter": "Estimated Fault Resistance ohm", "Value": result["Rf_est_ohm"]},
         {"Parameter": "Residual R ohm", "Value": result["residual_R"]},
         {"Parameter": "Residual X ohm", "Value": result["residual_X"]},

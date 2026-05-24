@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import tempfile
 import os
 import math
@@ -1290,11 +1290,16 @@ def build_summary_location_plot(
         )
 
     if remote_single_result:
-        remote_distance_from_remote = float(remote_single_result.get("recommended_distance_km", 0.0))
+        remote_position = build_remote_single_signed_position(
+            line_length_km=line_length,
+            remote_single_result=remote_single_result,
+            scenario=st.session_state.get("two_ended_fault_scenario", "normal_internal_line_fault"),
+            two_result=two_result,
+        )
         points.append(
             {
                 "label": f"SE {remote_gi_label}",
-                "distance": line_length - remote_distance_from_remote,
+                "distance": remote_position["distance_from_local_km"],
                 "score": 7.5,
                 "symbol": "circle-open",
                 "color": "#e67300",
@@ -1323,21 +1328,144 @@ def build_summary_location_plot(
             }
         )
 
+    if not points:
+        return None
+
+    point_distances = [float(point["distance"]) for point in points]
+    external_padding = max(0.05 * line_length, 1.0)
+    x_min = min(0.0, min(point_distances) - external_padding)
+    x_max = max(line_length, max(point_distances) + external_padding)
+
+    marker_rows = []
+    for point in points:
+        distance = float(point["distance"])
+        score = max(0.0, min(10.0, float(point["score"])))
+        track = "Double-ended" if str(point["label"]).startswith("DE ") else "Single-ended"
+        marker_rows.append(
+            {
+                "Point": point["label"],
+                "Distance km": distance,
+                "Distance %": 100.0 * distance / line_length,
+                "Score": score,
+                "Track": track,
+                "Color": point["color"],
+                "Symbol": point["symbol"],
+                "Legend Name": point["label"],
+            }
+        )
+
+    sorted_marker_rows = sorted(marker_rows, key=lambda item: float(item["Distance km"]))
+    min_gap_km = max(0.02 * line_length, 0.75)
+    grouped_marker_rows = []
+
+    for row in sorted_marker_rows:
+        if (
+            not grouped_marker_rows
+            or abs(
+                float(row["Distance km"])
+                - float(grouped_marker_rows[-1][-1]["Distance km"])
+            )
+            >= min_gap_km
+        ):
+            grouped_marker_rows.append([row])
+        else:
+            grouped_marker_rows[-1].append(row)
+
+    label_layout = {}
+    double_slots = [
+        (-64, -160),
+        (-64, 160),
+        (-100, -160),
+        (-100, 160),
+    ]
+    single_slots = [
+        (96, -190),
+        (96, 190),
+        (150, -190),
+        (150, 190),
+    ]
+
+    for group in grouped_marker_rows:
+        double_rows = [row for row in group if row["Track"] == "Double-ended"]
+        single_rows = [row for row in group if row["Track"] == "Single-ended"]
+
+        if len(group) == 1:
+            row = group[0]
+            label_layout[id(row)] = (
+                (-64, 0) if row["Track"] == "Double-ended" else (108, 0)
+            )
+        else:
+            for index, row in enumerate(double_rows):
+                label_layout[id(row)] = double_slots[index % len(double_slots)]
+
+            for index, row in enumerate(single_rows):
+                label_layout[id(row)] = single_slots[index % len(single_slots)]
+
+    for row in marker_rows:
+        row["Label"] = (
+            f"<b>{row['Point']}</b><br>"
+            f"{row['Distance km']:.2f} km ({row['Distance %']:.1f}%)<br>"
+            f"{row['Score']:.1f}/10"
+        )
+        row["Annotation Ay"], row["Annotation Ax"] = label_layout.get(
+            id(row),
+            (-64, 0) if row["Track"] == "Double-ended" else (108, 0),
+        )
+
+    marker_df = pd.DataFrame(marker_rows)
+    x_profile = [
+        x_min + i * (x_max - x_min) / 300.0
+        for i in range(301)
+    ]
+
+    theme_base = st.get_option("theme.base")
+    theme_background = st.get_option("theme.backgroundColor")
+    if theme_base is None and theme_background:
+        bg = str(theme_background).lstrip("#")
+        if len(bg) >= 6:
+            r = int(bg[0:2], 16)
+            g = int(bg[2:4], 16)
+            b = int(bg[4:6], 16)
+            is_dark_theme = (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
+        else:
+            is_dark_theme = False
+    else:
+        is_dark_theme = theme_base == "dark"
+
+    plot_template = "plotly_dark" if is_dark_theme else "plotly_white"
+    plot_bg = "#0b1220" if is_dark_theme else "#ffffff"
+    text_color = "#f8fafc" if is_dark_theme else "#111827"
+    muted_text_color = "#cbd5e1" if is_dark_theme else "#475569"
+    axis_title_color = "#f8fafc" if is_dark_theme else "#0f172a"
+    annotation_bg = "rgba(15,23,42,0.92)" if is_dark_theme else "rgba(255,255,255,0.96)"
+    annotation_border = "#94a3b8" if is_dark_theme else "#cbd5e1"
+    terminal_color = "#f8fafc" if is_dark_theme else "#111827"
+
     fig = make_subplots(
         rows=2,
         cols=1,
         shared_xaxes=True,
+        row_heights=[0.18, 0.82],
         vertical_spacing=0.08,
-        row_heights=[0.26, 0.74],
+    )
+
+    fig.add_shape(
+        type="line",
+        x0=0,
+        x1=line_length,
+        y0=0.5,
+        y1=0.5,
+        line=dict(color=muted_text_color, width=2),
+        row=1,
+        col=1,
     )
 
     fig.add_trace(
         go.Scatter(
             x=[0, line_length],
-            y=[0, 0],
-            mode="lines+markers",
-            marker=dict(symbol="square", size=10, color="#111827"),
-            line=dict(color="#64748b", width=2.2),
+            y=[0.5, 0.5],
+            mode="markers",
+            marker=dict(size=12, color=[terminal_color, terminal_color], symbol="square"),
             hoverinfo="skip",
             showlegend=False,
         ),
@@ -1346,68 +1474,75 @@ def build_summary_location_plot(
     )
     fig.add_annotation(
         x=0,
-        y=0,
+        y=0.5,
         text=local_gi_label,
         showarrow=False,
-        yshift=18,
         xanchor="left",
+        yanchor="bottom",
+        xshift=8,
+        yshift=12,
+        font=dict(color=text_color, size=13),
         row=1,
         col=1,
     )
     fig.add_annotation(
         x=line_length,
-        y=0,
+        y=0.5,
         text=remote_gi_label,
         showarrow=False,
-        yshift=18,
         xanchor="right",
+        yanchor="bottom",
+        xshift=-8,
+        yshift=12,
+        font=dict(color=text_color, size=13),
         row=1,
         col=1,
     )
 
-    x_profile = [i * line_length / 300.0 for i in range(301)]
-
-    for point in points:
-        distance = max(0.0, min(line_length, point["distance"]))
-        score = max(0.0, min(10.0, float(point["score"])))
-        percent = 100.0 * distance / line_length
-        curve_width = max(line_length * (0.09 if point["symbol"].startswith("diamond") else 0.06), 2.5)
-        curve_y = [
-            score / (1.0 + abs(x - distance) / curve_width)
-            for x in x_profile
-        ]
-
+    for _, row in marker_df.sort_values(["Distance km", "Track"]).iterrows():
         fig.add_trace(
             go.Scatter(
-                x=[distance],
-                y=[0],
+                x=[row["Distance km"]],
+                y=[0.5],
                 mode="markers",
-                name=point["label"],
-                legendgroup=point["label"],
                 marker=dict(
-                    symbol=point["symbol"],
                     size=13,
-                    color=point["color"],
-                    line=dict(width=2, color="#111827"),
+                    color=row["Color"],
+                    symbol=row["Symbol"],
+                    line=dict(width=2, color=terminal_color),
                 ),
+                name=row["Legend Name"],
+                legendgroup=row["Point"],
+                showlegend=True,
                 hovertemplate=(
-                    f"{point['label']}<br>{distance:.2f} km ({percent:.1f}%)<br>"
-                    f"Score {score:.1f}/10<extra></extra>"
+                    f"{row['Point']}<br>"
+                    f"{row['Distance km']:.2f} km ({row['Distance %']:.1f}%)<br>"
+                    f"Score {row['Score']:.1f}/10"
+                    "<extra></extra>"
                 ),
             ),
             row=1,
             col=1,
         )
 
+    for _, row in marker_df.iterrows():
+        center = float(row["Distance km"])
+        score = float(row["Score"])
+        curve_width = max(line_length * (0.09 if row["Track"] == "Double-ended" else 0.06), 2.5)
+        curve_y = [
+            score / (1.0 + abs(x - center) / curve_width)
+            for x in x_profile
+        ]
+
         fig.add_trace(
             go.Scatter(
                 x=x_profile,
                 y=curve_y,
                 mode="lines",
-                line=dict(color=point["color"], width=1.5),
+                line=dict(color=row["Color"], width=1.5),
                 opacity=0.9,
                 hoverinfo="skip",
-                legendgroup=point["label"],
+                legendgroup=row["Point"],
                 showlegend=False,
             ),
             row=2,
@@ -1415,22 +1550,24 @@ def build_summary_location_plot(
         )
         fig.add_trace(
             go.Scatter(
-                x=[distance],
+                x=[row["Distance km"]],
                 y=[score],
-                mode="markers+text",
-                text=[f'{point["label"]}<br>{distance:.2f} km ({percent:.1f}%)'],
-                textposition="top center",
+                mode="markers",
                 marker=dict(
-                    symbol=point["symbol"],
-                    size=15,
-                    color=point["color"],
-                    line=dict(width=2, color="#111827"),
+                    size=16,
+                    color=row["Color"],
+                    symbol=row["Symbol"],
+                    line=dict(width=2, color=terminal_color),
                 ),
-                legendgroup=point["label"],
+                name=row["Legend Name"],
                 showlegend=False,
+                legendgroup=row["Point"],
+                customdata=[[row["Point"], row["Distance km"], row["Distance %"], row["Score"]]],
                 hovertemplate=(
-                    f"{point['label']}<br>{distance:.2f} km ({percent:.1f}%)<br>"
-                    f"Score {score:.1f}/10<extra></extra>"
+                    "%{customdata[0]}<br>"
+                    "%{customdata[1]:.2f} km (%{customdata[2]:.1f}%)<br>"
+                    "Score %{customdata[3]:.1f}/10"
+                    "<extra></extra>"
                 ),
             ),
             row=2,
@@ -1438,34 +1575,101 @@ def build_summary_location_plot(
         )
         fig.add_shape(
             type="line",
-            x0=distance,
-            x1=distance,
+            x0=row["Distance km"],
+            x1=row["Distance km"],
             y0=0,
             y1=score,
-            line=dict(color=point["color"], width=1.2),
+            line=dict(color=row["Color"], width=1.4),
+            row=2,
+            col=1,
+        )
+
+        fig.add_annotation(
+            x=row["Distance km"],
+            y=score,
+            text=row["Label"],
+            showarrow=True,
+            arrowhead=2,
+            arrowsize=0.8,
+            arrowwidth=1.4,
+            arrowcolor=row["Color"],
+            ax=row["Annotation Ax"],
+            ay=row["Annotation Ay"],
+            bgcolor=annotation_bg,
+            bordercolor=annotation_border,
+            borderwidth=1,
+            borderpad=4,
+            font=dict(color=text_color, size=11),
             row=2,
             col=1,
         )
 
     fig.update_layout(
         title=f"Grafik SE dan DE - {line_param.get('line_name', '')}",
-        height=640,
-        margin=dict(l=55, r=35, t=85, b=70),
-        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1),
+        template=plot_template,
+        paper_bgcolor=plot_bg,
+        plot_bgcolor=plot_bg,
+        font=dict(color=text_color),
+        height=800,
+        margin=dict(l=58, r=34, t=118, b=92),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.12,
+            xanchor="right",
+            x=1,
+            bgcolor="rgba(15,23,42,0.85)" if is_dark_theme else "rgba(255,255,255,0.90)",
+            bordercolor="#475569" if is_dark_theme else "#cbd5e1",
+            borderwidth=1,
+            font=dict(color=text_color),
+        ),
     )
-    fig.update_xaxes(range=[0, line_length], autorange=False, showgrid=False, row=1, col=1)
-    fig.update_yaxes(range=[-0.7, 0.9], autorange=False, showgrid=False, showticklabels=False, row=1, col=1)
     fig.update_xaxes(
-        title=f"Distance from {local_gi_label} (km)",
-        range=[0, line_length],
+        range=[x_min, x_max],
         autorange=False,
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        color=text_color,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(
+        range=[0.0, 1.0],
+        autorange=False,
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        color=text_color,
+        row=1,
+        col=1,
+    )
+    fig.update_xaxes(
+        title=dict(
+            text=f"Distance from {local_gi_label} (km)",
+            font=dict(color=axis_title_color),
+        ),
+        range=[x_min, x_max],
+        autorange=False,
+        zeroline=False,
+        color=text_color,
+        tickfont=dict(color=muted_text_color),
+        gridcolor="rgba(148,163,184,0.22)" if is_dark_theme else "rgba(148,163,184,0.35)",
         row=2,
         col=1,
     )
     fig.update_yaxes(
-        title="Quality / Confidence (0-10)",
-        range=[-0.3, 11.4],
-        autorange=False,
+        title=dict(
+            text="Quality / Confidence (0-10)",
+            font=dict(color=axis_title_color),
+        ),
+        range=[-0.4, 11.4],
+        showgrid=True,
+        gridcolor="rgba(148,163,184,0.14)" if is_dark_theme else "rgba(148,163,184,0.22)",
+        zeroline=False,
+        color=text_color,
+        tickfont=dict(color=muted_text_color),
         row=2,
         col=1,
     )
@@ -1476,19 +1680,149 @@ def build_summary_location_plot(
 def build_summary_line_position_from_session():
     line_param = st.session_state.get("line_param")
     two_result = st.session_state.get("two_ended_result")
+    single_result = st.session_state.get("two_ended_local_single_result") or st.session_state.get("single_ended_result")
+    remote_single_result = st.session_state.get("two_ended_remote_single_result")
 
-    if not line_param or not two_result:
+    if not line_param or not (single_result or remote_single_result or two_result):
         return None
+
+    fallback_local, fallback_remote = infer_gi_names_from_line_name(
+        str(line_param.get("line_name") or "")
+    )
 
     return build_summary_location_plot(
         line_param=line_param,
-        local_gi_label=st.session_state.get("two_ended_local_gi_label", "GI Local"),
-        remote_gi_label=st.session_state.get("two_ended_remote_gi_label", "GI Remote"),
-        single_result=st.session_state.get("two_ended_local_single_result") or st.session_state.get("single_ended_result"),
-        remote_single_result=st.session_state.get("two_ended_remote_single_result"),
+        local_gi_label=st.session_state.get("two_ended_local_gi_label", fallback_local),
+        remote_gi_label=st.session_state.get("two_ended_remote_gi_label", fallback_remote),
+        single_result=single_result,
+        remote_single_result=remote_single_result,
         two_result=two_result,
         reverse_two_result=st.session_state.get("two_ended_reverse_result"),
     )
+
+
+def is_reverse_or_backfeed_scenario(scenario: str, two_result: dict | None = None):
+    if scenario in ["reverse_or_backfeed_external_fault", "sotf_parallel_or_adjacent_line"]:
+        return True
+
+    remote_direction = str(
+        (two_result or {}).get(
+            "uploaded_remote_current_direction",
+            (two_result or {}).get("remote_current_direction", ""),
+        )
+    )
+    return remote_direction == "opposite_to_line"
+
+
+def build_remote_single_signed_position(
+    line_length_km: float,
+    remote_single_result: dict,
+    scenario: str,
+    two_result: dict | None = None,
+):
+    remote_distance = float(remote_single_result["recommended_distance_km"])
+
+    if is_reverse_or_backfeed_scenario(scenario, two_result):
+        signed_distance_from_remote = -abs(remote_distance)
+    else:
+        signed_distance_from_remote = remote_distance
+
+    distance_from_local = line_length_km - signed_distance_from_remote
+
+    return {
+        "signed_distance_from_remote_km": signed_distance_from_remote,
+        "distance_from_local_km": distance_from_local,
+        "distance_from_local_percent": distance_from_local / line_length_km * 100.0,
+        "is_reverse_external": signed_distance_from_remote < 0,
+    }
+
+
+def classify_two_ended_operating_status(
+    two_result,
+    two_quality,
+    line_param,
+    local_single_result=None,
+    remote_single_result=None,
+    scenario="normal_internal_line_fault",
+):
+    """
+    Memberi status konteks proteksi untuk membedakan gangguan internal saluran
+    dari kasus reverse/backfeed/external fault pada line paralel atau line tetangga.
+    """
+
+    statuses = []
+    notes = []
+    recommendation = "Hasil DE dapat dipakai sebagai estimasi utama gangguan internal saluran yang direkam."
+    can_use_de_distance = True
+
+    L = float((line_param or {}).get("length_km", 0.0) or 0.0)
+    distance = float((two_result or {}).get("distance_from_original_local_km", (two_result or {}).get("distance_km", 0.0)) or 0.0)
+    remote_direction = str(
+        (two_result or {}).get(
+            "uploaded_remote_current_direction",
+            (two_result or {}).get("remote_current_direction", "into_line"),
+        )
+    )
+    quality_score = float((two_quality or {}).get("quality_score", 0.0) or 0.0)
+
+    if scenario in ["reverse_or_backfeed_external_fault", "sotf_parallel_or_adjacent_line"]:
+        statuses.extend(
+            [
+                "BACKFEED_OR_REVERSE_FAULT_SUSPECTED",
+                "EXTERNAL_TO_IMPORTED_LINE_SUSPECTED",
+                "DE_NOT_APPLICABLE_FOR_IMPORTED_LINE",
+            ]
+        )
+        can_use_de_distance = False
+        notes.append(
+            "Mode backfeed/reverse aktif: rekaman yang dianalisis mungkin berasal dari line sehat/berbeban, sedangkan fault berada pada line paralel, line tetangga, atau peralatan di belakang terminal remote."
+        )
+
+    if remote_direction == "opposite_to_line":
+        statuses.append("REMOTE_REVERSE_FAULT")
+        notes.append(
+            "Arah arus remote yang paling konsisten adalah opposite_to_line. Ini cocok dengan relay remote yang melihat fault pada zona reverse/belakang terminal."
+        )
+        if scenario != "normal_internal_line_fault":
+            can_use_de_distance = False
+
+    if L > 0 and (distance < -0.002 * L or distance > L * 1.002):
+        statuses.append("DE_NOT_APPLICABLE_FOR_IMPORTED_LINE")
+        can_use_de_distance = False
+        notes.append(
+            "Jarak DE berada di luar panjang saluran, sehingga pola ini lebih cocok diperlakukan sebagai external/reverse event atau kesalahan referensi rekaman."
+        )
+
+    if quality_score < 6.0 and scenario != "normal_internal_line_fault":
+        statuses.append("DE_NOT_APPLICABLE_FOR_IMPORTED_LINE")
+        can_use_de_distance = False
+
+    if not statuses:
+        statuses.append("NORMAL_INTERNAL_LINE_FAULT")
+
+    # Buang duplikasi dengan tetap menjaga urutan kemunculan.
+    statuses = list(dict.fromkeys(statuses))
+
+    if not can_use_de_distance:
+        recommendation = (
+            "Jangan jadikan jarak DE dari rekaman ini sebagai jarak gangguan utama. "
+            "Gunakan hasil single-ended local/remote sebagai pembanding arah dan besaran, "
+            "lalu validasi dengan rekaman line yang benar-benar terganggu, event CB, SOE, dan proteksi reverse remote. Jika event ini terjadi saat energize, catat sebagai kemungkinan SOTF."
+        )
+    elif "REMOTE_REVERSE_FAULT" in statuses:
+        recommendation = (
+            "Ada indikasi remote reverse. Pakai hasil DE secara hati-hati dan cek apakah rekaman berasal dari saluran yang sama dengan saluran fault."
+        )
+
+    return {
+        "primary_status": statuses[0],
+        "statuses": statuses,
+        "can_use_de_distance": can_use_de_distance,
+        "recommendation": recommendation,
+        "notes": notes,
+        "remote_current_direction": remote_direction,
+        "scenario": scenario,
+    }
 
 def get_index_at_time(df, time_value: float):
     return int((df["time"] - time_value).abs().idxmin())
@@ -2101,6 +2435,17 @@ with summary_container:
         else "-",
     )
 
+    summary_operating_status = st.session_state.get("two_ended_operating_status")
+    if summary_operating_status:
+        st.markdown("### Status Diagnostik DE")
+        status_text = ", ".join(summary_operating_status.get("statuses", []))
+        if summary_operating_status.get("can_use_de_distance"):
+            st.success(f"Status: {status_text}")
+        else:
+            st.warning(f"Status: {status_text}")
+        for note in summary_operating_status.get("notes", []):
+            st.info(note)
+        st.caption(summary_operating_status.get("recommendation", ""))
     st.markdown("### Perbandingan Pre-fault dan Fault")
     local_comparison_df = build_prefault_fault_comparison_dataframe(
         st.session_state.get("phasors"),
@@ -4633,6 +4978,23 @@ with tab9:
 
     st.markdown("### Metode Rekomendasi Jarak")
 
+    single_ended_fault_context = st.selectbox(
+        "Konteks gangguan single-ended",
+        [
+            "internal_line_fault",
+            "reverse_or_backfeed_external_fault",
+        ],
+        format_func=lambda value: {
+            "internal_line_fault": "Gangguan internal pada saluran yang dianalisis",
+            "reverse_or_backfeed_external_fault": "Backfeed/reverse: fault eksternal atau di belakang relay",
+        }.get(value, value),
+        index=0,
+        help=(
+            "Pilih backfeed/reverse jika jarak negatif atau melewati panjang line justru ingin dibaca "
+            "sebagai indikasi fault eksternal, bukan dipaksa memakai fallback internal-line."
+        ),
+    )
+
     recommended_method = st.selectbox(
         "Pilih metode jarak utama",
         [
@@ -4656,12 +5018,14 @@ with tab9:
                 line_param=line_param,
                 recommended_method=recommended_method,
                 prefault_phasors=st.session_state.get("prefault_phasors"),
+                fault_context=single_ended_fault_context,
             )
 
             single_df = build_single_ended_result_dataframe(single_result)
 
             st.session_state["single_ended_result"] = single_result
             st.session_state["single_ended_df"] = single_df
+            st.session_state["single_ended_fault_context"] = single_ended_fault_context
 
             st.success("Single-ended fault location berhasil dihitung.")
 
@@ -4676,9 +5040,11 @@ with tab9:
         st.markdown("### Hasil Utama")
 
         col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+        single_external_context = bool(single_result.get("external_context"))
+        distance_label = "Signed Distance" if single_external_context else "Recommended Distance"
 
         col_r1.metric(
-            "Recommended Distance",
+            distance_label,
             f'{single_result["recommended_distance_km"]:.3f} km',
         )
 
@@ -4700,11 +5066,25 @@ with tab9:
         if single_result["status"] == "VALID":
             st.success("Hasil single-ended berada dalam batas normal.")
         elif single_result["status"] == "CHECK":
-            st.warning("Hasil single-ended perlu dicek ulang dengan waveform, SOE, dan data lapangan.")
+            if single_external_context and single_result.get("is_reverse_or_external_position"):
+                st.warning(
+                    "Hasil single-ended menunjukkan posisi signed di luar saluran yang dianalisis. "
+                    "Pada mode backfeed/reverse, ini dibaca sebagai indikasi fault eksternal dan perlu "
+                    "divalidasi dengan arah elemen proteksi, SOE, dan rekaman line terkait."
+                )
+            else:
+                st.warning("Hasil single-ended perlu dicek ulang dengan waveform, SOE, dan data lapangan.")
         else:
             st.error("Hasil single-ended tidak pasti. Cek polaritas, line parameter, dan fault type.")
 
         st.info(explain_single_ended_status(single_result["status"]))
+
+        if single_external_context:
+            st.info(
+                "Mode backfeed/reverse aktif: jarak single-ended ditampilkan sebagai koordinat signed "
+                "dari terminal relay. Nilai negatif berarti indikasi di belakang relay; nilai di atas "
+                "100% berarti indikasi di luar ujung remote line yang dianalisis."
+            )
 
         if single_result.get("used_superimposed_fallback"):
             st.info(
@@ -4744,7 +5124,7 @@ with tab9:
                     "Magnitude",
                     "Reactance",
                     "Projection",
-                    "Recommended",
+                    "Signed/Recommended",
                 ],
                 "Distance km": [
                     single_result["distance_mag_km"],
@@ -4864,6 +5244,19 @@ with tab9:
             f"Jarak rekomendasi dari ujung relay adalah **{single_result['recommended_distance_km']:.3f} km** "
             f"atau **{single_result['recommended_distance_percent']:.2f}%** dari panjang saluran."
         )
+
+        if single_external_context and single_result.get("is_reverse_or_external_position"):
+            if single_result["recommended_distance_km"] < 0:
+                st.write(
+                    "Interpretasi backfeed/reverse: nilai signed negatif menunjukkan estimasi berada "
+                    "di belakang terminal relay, sehingga tidak boleh dibaca sebagai lokasi internal "
+                    "pada saluran yang dianalisis."
+                )
+            elif single_result["recommended_distance_km"] > line_param["length_km"]:
+                st.write(
+                    "Interpretasi backfeed/reverse: nilai signed melebihi panjang saluran menunjukkan "
+                    "estimasi berada di luar ujung remote saluran yang dianalisis."
+                )
 
         if abs(single_result["Rf_est_ohm"]) > 10:
             st.warning(
@@ -6148,6 +6541,24 @@ with tab10:
         ),
     )
 
+    two_ended_fault_scenario = st.selectbox(
+        "Konteks rekaman dan gangguan",
+        [
+            "normal_internal_line_fault",
+            "reverse_or_backfeed_external_fault",
+        ],
+        format_func=lambda value: {
+            "normal_internal_line_fault": "Gangguan internal pada saluran yang direkam",
+            "reverse_or_backfeed_external_fault": "Backfeed/reverse: fault eksternal atau di belakang remote",
+            "sotf_parallel_or_adjacent_line": "Backfeed/reverse: fault eksternal atau di belakang remote",
+        }.get(value, value),
+        index=0,
+        help=(
+            "Pilih mode ini jika rekaman berasal dari line sehat/paralel, sedangkan gangguan diduga "
+            "berada di line lain, area reverse, atau di belakang terminal remote. SOTF adalah salah satu "
+            "kemungkinan penyebab, bukan syarat untuk memakai mode ini."
+        ),
+    )
     with st.expander("Advanced DE auto-sync experiment", expanded=False):
         st.caption(
             "Fitur ini memindai beberapa posisi DFT remote dan memilih kandidat yang terlihat paling konsisten. "
@@ -6335,6 +6746,13 @@ with tab10:
                     delta_current_threshold=remote_auto_fault_settings_for_de["delta_current_threshold"],
                     delta_voltage_threshold=remote_auto_fault_settings_for_de["delta_voltage_threshold"],
                 )
+                remote_single_raw_result = calculate_single_ended_fault_location(
+                    phasors=adapted_remote_phasors,
+                    fault_type_result=remote_fault_type_result,
+                    line_param=line_param,
+                    recommended_method="reactance",
+                    prefault_phasors=remote_prefault_for_fault_type,
+                )
                 remote_single_phasors = adapted_remote_phasors
                 remote_single_prefault_phasors = remote_prefault_for_fault_type
 
@@ -6364,6 +6782,7 @@ with tab10:
 
                 st.session_state["two_ended_local_single_result"] = local_single_result
                 st.session_state["two_ended_remote_single_result"] = remote_single_result
+                st.session_state["two_ended_remote_single_raw_result"] = remote_single_raw_result
                 st.session_state["two_ended_local_single_df"] = local_single_df
                 st.session_state["two_ended_remote_single_df"] = remote_single_df
                 st.session_state["two_ended_local_fault_type_result"] = local_fault_type_result
@@ -6374,6 +6793,7 @@ with tab10:
                 for key in [
                     "two_ended_local_single_result",
                     "two_ended_remote_single_result",
+                    "two_ended_remote_single_raw_result",
                     "two_ended_local_single_df",
                     "two_ended_remote_single_df",
                     "two_ended_local_fault_type_result",
@@ -6389,8 +6809,16 @@ with tab10:
             st.session_state["two_ended_single_ended_error"] = single_ended_compare_error
             st.session_state["two_ended_local_gi_label"] = local_gi_label
             st.session_state["two_ended_remote_gi_label"] = remote_gi_label
+            st.session_state["two_ended_fault_scenario"] = two_ended_fault_scenario
+            st.session_state["two_ended_operating_status"] = classify_two_ended_operating_status(
+                two_result=two_result,
+                two_quality=two_quality,
+                line_param=line_param,
+                local_single_result=st.session_state.get("two_ended_local_single_result"),
+                remote_single_result=st.session_state.get("two_ended_remote_single_result"),
+                scenario=two_ended_fault_scenario,
+            )
             st.session_state.pop("two_ended_line_position_fig", None)
-
             st.success("Two-ended fault location berhasil dihitung.")
 
             if single_ended_compare_error:
@@ -6444,6 +6872,17 @@ with tab10:
 
         st.info(explain_two_ended_quality(two_quality))
 
+        operating_status = st.session_state.get("two_ended_operating_status")
+        if operating_status:
+            st.markdown("### Status Diagnostik Rekaman")
+            status_text = ", ".join(operating_status.get("statuses", []))
+            if operating_status.get("can_use_de_distance"):
+                st.success(f"Status: {status_text}")
+            else:
+                st.warning(f"Status: {status_text}")
+            for note in operating_status.get("notes", []):
+                st.info(note)
+            st.caption(operating_status.get("recommendation", ""))
         if two_comparison_df is not None:
             st.markdown("### Perbandingan Double-Ended Dua Arah")
             st.dataframe(
@@ -6516,10 +6955,15 @@ with tab10:
             st.markdown("### Single-Ended Comparison")
 
             L = line_param["length_km"]
-            remote_single_from_local_km = (
-                L - remote_single_result["recommended_distance_km"]
+            remote_single_position = build_remote_single_signed_position(
+                line_length_km=L,
+                remote_single_result=remote_single_result,
+                scenario=st.session_state.get("two_ended_fault_scenario", two_ended_fault_scenario),
+                two_result=two_result,
             )
-            remote_single_from_local_percent = remote_single_from_local_km / L * 100.0
+            remote_single_signed_km = remote_single_position["signed_distance_from_remote_km"]
+            remote_single_from_local_km = remote_single_position["distance_from_local_km"]
+            remote_single_from_local_percent = remote_single_position["distance_from_local_percent"]
 
             col_se1, col_se2, col_se3, col_se4 = st.columns(4)
 
@@ -6529,7 +6973,7 @@ with tab10:
             )
             col_se2.metric(
                 f"{remote_gi_label} SE",
-                f'{remote_single_result["recommended_distance_km"]:.3f} km',
+                f"{remote_single_signed_km:.3f} km",
             )
             col_se3.metric(
                 f"{remote_gi_label} SE from {local_gi_label}",
@@ -6540,11 +6984,19 @@ with tab10:
                 f"{remote_single_from_local_percent:.2f} %",
             )
 
-            st.caption(
-                f"Single-ended {remote_gi_label} ditampilkan sebagai jarak dari sisi remote dan "
-                f"konversinya ke referensi {local_gi_label}. Jika arah arus remote dipilih "
-                "`opposite_to_line`, arus fasor remote dibalik untuk perhitungan single-ended."
-            )
+            if remote_single_position["is_reverse_external"]:
+                st.caption(
+                    f"Mode backfeed/reverse atau remote reverse aktif: single-ended {remote_gi_label} "
+                    f"ditampilkan sebagai jarak signed negatif dari sisi remote. Konversi ke referensi "
+                    f"{local_gi_label} menjadi L - (-d), sehingga posisi berada di luar ujung remote "
+                    "pada line yang dianalisis."
+                )
+            else:
+                st.caption(
+                    f"Single-ended {remote_gi_label} ditampilkan sebagai jarak dari sisi remote dan "
+                    f"konversinya ke referensi {local_gi_label}. Jika arah arus remote dipilih "
+                    "`opposite_to_line`, arus fasor remote dibalik untuk perhitungan single-ended."
+                )
 
             st.info(
                 "Single-ended comparison adalah pembanding tambahan, bukan hasil utama double-ended. "
@@ -6570,7 +7022,7 @@ with tab10:
                         "End": remote_gi_label,
                         "Fault Type": remote_fault_type_result.get("fault_type", "-"),
                         "Selected Loop": remote_single_result["selected_loop"],
-                        "Distance from Own End km": remote_single_result["recommended_distance_km"],
+                        "Distance from Own End km": remote_single_signed_km,
                         f"Distance from {local_gi_label} km": remote_single_from_local_km,
                         f"Distance from {local_gi_label} %": remote_single_from_local_percent,
                         "Zapp R ohm": remote_single_result["Zapp_R"],
@@ -6692,10 +7144,16 @@ with tab10:
             )
 
         if "two_ended_remote_single_result" in st.session_state:
+            remote_marker_position = build_remote_single_signed_position(
+                line_length_km=L,
+                remote_single_result=st.session_state["two_ended_remote_single_result"],
+                scenario=st.session_state.get("two_ended_fault_scenario", two_ended_fault_scenario),
+                two_result=two_result,
+            )
             marker_rows.append(
                 {
                     "Point": f"Single-ended {remote_gi_label}",
-                    "Distance km": L - st.session_state["two_ended_remote_single_result"]["recommended_distance_km"],
+                    "Distance km": remote_marker_position["distance_from_local_km"],
                     "Score": max(
                         0.0,
                         {
@@ -6784,8 +7242,13 @@ with tab10:
                 for index, row in enumerate(single_rows):
                     label_layout[id(row)] = single_slots[index % len(single_slots)]
 
+        raw_marker_distances = [float(row["Distance km"]) for row in marker_rows]
+        external_padding_km = max(0.05 * L, 1.0)
+        x_min_km = min(0.0, min(raw_marker_distances) - external_padding_km)
+        x_max_km = max(L, max(raw_marker_distances) + external_padding_km)
+
         for row in marker_rows:
-            row["Distance km"] = max(0.0, min(L, float(row["Distance km"])))
+            row["Distance km"] = float(row["Distance km"])
             row["Distance %"] = row["Distance km"] / L * 100.0
             row["Score"] = max(0.0, min(10.0, float(row["Score"])))
             short_name = (
@@ -6908,7 +7371,10 @@ with tab10:
                 col=1,
             )
 
-        x_profile = [i * L / 300.0 for i in range(301)]
+        x_profile = [
+            x_min_km + i * (x_max_km - x_min_km) / 300.0
+            for i in range(301)
+        ]
 
         for _, row in marker_df.iterrows():
             center = float(row["Distance km"])
@@ -6998,7 +7464,7 @@ with tab10:
             plot_bgcolor=plot_bg,
             font=dict(color=text_color),
             xaxis=dict(
-                range=[0, L],
+                range=[x_min_km, x_max_km],
                 autorange=False,
                 showgrid=False,
                 zeroline=False,
@@ -7017,7 +7483,7 @@ with tab10:
                     text=f"Distance from {local_gi_label} (km)",
                     font=dict(color=axis_title_color),
                 ),
-                range=[0, L],
+                range=[x_min_km, x_max_km],
                 autorange=False,
                 zeroline=False,
                 color=text_color,
@@ -7244,3 +7710,6 @@ with tab10:
                         st.warning(warning)
                 else:
                     st.success("Hasil time-based berada di dalam panjang saluran dan selisih waktu masih realistis.")
+
+
+
