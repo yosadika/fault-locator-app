@@ -5,11 +5,14 @@ import math
 import cmath
 import re
 from datetime import datetime
+from urllib.parse import quote
+import folium
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from streamlit_folium import st_folium
 
 from comtrade_reader import read_comtrade
 from signal_assignment import apply_signal_assignment
@@ -59,6 +62,8 @@ from conductor_impedance_importer import (
     read_conductor_impedance_database,
     read_google_spreadsheet_table,
     get_google_spreadsheet_sheet_names,
+    extract_google_spreadsheet_id,
+    make_unique_columns,
     detect_impedance_columns,
     extract_impedance_from_row,
     build_row_label,
@@ -70,6 +75,11 @@ from single_ended import (
 
 
 MAX_PLOT_POINTS = 6000
+DEFAULT_TOWER_SCHEDULE_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "<TOWER_SCHEDULE_SPREADSHEET_ID>/edit?usp=sharing"
+)
+DEFAULT_TOWER_SCHEDULE_SHEET = "tower_schedule"
 
 
 @st.cache_data(show_spinner="Membaca file COMTRADE...")
@@ -99,6 +109,18 @@ def read_comtrade_cached(cfg_bytes: bytes, dat_bytes: bytes, cfg_name: str = "",
 @st.cache_data(ttl=1800, show_spinner="Membaca Google Spreadsheet...")
 def read_google_spreadsheet_table_cached(url_or_id: str, sheet_name: str):
     return read_google_spreadsheet_table(url_or_id, sheet_name)
+
+
+@st.cache_data(ttl=1800, show_spinner="Membaca Tower Schedule...")
+def read_google_spreadsheet_query_cached(url_or_id: str, sheet_name: str, query: str):
+    spreadsheet_id = extract_google_spreadsheet_id(url_or_id)
+    csv_url = (
+        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/gviz/tq"
+        f"?tqx=out:csv&sheet={quote(str(sheet_name))}&tq={quote(str(query))}"
+    )
+    df = pd.read_csv(csv_url)
+    df.columns = make_unique_columns(df.columns)
+    return df
 
 
 @st.cache_data(ttl=1800, show_spinner="Membaca daftar sheet...")
@@ -198,22 +220,54 @@ def install_print_friendly_tables():
 
     original_dataframe = st.dataframe
 
+    def _one_based_index(df):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        try:
+            is_default_zero_index = list(df.index) == list(range(len(df.index)))
+        except Exception:
+            is_default_zero_index = False
+        if not is_default_zero_index:
+            return df
+
+        adjusted_df = df.copy()
+        adjusted_df.index = range(1, len(adjusted_df.index) + 1)
+        adjusted_df.index.name = df.index.name or "No"
+        return adjusted_df
+
+    def _one_based_display_data(data):
+        if type(data).__name__ == "Styler" and hasattr(data, "data"):
+            source_df = data.data
+            adjusted_df = _one_based_index(source_df)
+            if adjusted_df is not source_df:
+                data.data.index = adjusted_df.index
+            return data
+
+        if isinstance(data, pd.DataFrame):
+            return _one_based_index(data)
+
+        return data
+
     def _table_source(data):
         if type(data).__name__ == "Styler" and hasattr(data, "data"):
+            data = _one_based_display_data(data)
             return data.data, data.to_html()
 
         if isinstance(data, pd.DataFrame):
-            return data, data.to_html(index=False, escape=True)
+            display_df = _one_based_index(data)
+            return display_df, display_df.to_html(index=True, escape=True)
 
         try:
             df = pd.DataFrame(data)
-            return df, df.to_html(index=False, escape=True)
+            display_df = _one_based_index(df)
+            return display_df, display_df.to_html(index=True, escape=True)
         except Exception:
             return None, None
 
     def printable_dataframe(data=None, *args, **kwargs):
-        result = original_dataframe(data, *args, **kwargs)
-        source_df, table_html = _table_source(data)
+        display_data = _one_based_display_data(data)
+        result = original_dataframe(display_data, *args, **kwargs)
+        source_df, table_html = _table_source(display_data)
 
         if source_df is not None and table_html:
             column_count = max(1, len(source_df.columns))
@@ -1260,6 +1314,18 @@ def estimate_summary_disturbance_cause(fault_type_result, high_resistance_result
     )
 
 
+def single_ended_plot_score(single_result):
+    if not single_result:
+        return 0.0
+    base_score = {
+        "VALID": 9.0,
+        "CHECK": 6.0,
+        "UNCERTAIN": 3.0,
+    }.get(str(single_result.get("status", "")).upper(), 5.0)
+    warning_count = len(single_result.get("warnings", []) or [])
+    return max(0.0, min(10.0, base_score - 0.4 * warning_count))
+
+
 def build_summary_location_plot(
     line_param,
     local_gi_label,
@@ -1283,7 +1349,7 @@ def build_summary_location_plot(
             {
                 "label": f"SE {local_gi_label}",
                 "distance": float(single_result.get("recommended_distance_km", 0.0)),
-                "score": 7.5,
+                "score": single_ended_plot_score(single_result),
                 "symbol": "circle",
                 "color": "#009e73",
             }
@@ -1300,7 +1366,7 @@ def build_summary_location_plot(
             {
                 "label": f"SE {remote_gi_label}",
                 "distance": remote_position["distance_from_local_km"],
-                "score": 7.5,
+                "score": single_ended_plot_score(remote_single_result),
                 "symbol": "circle-open",
                 "color": "#e67300",
             }
@@ -1685,6 +1751,13 @@ def build_summary_line_position_from_session():
 
     if not line_param or not (single_result or remote_single_result or two_result):
         return None
+
+    if two_result and two_result.get("line_length_km_used"):
+        line_param = override_line_param_length(
+            line_param,
+            float(two_result["line_length_km_used"]),
+            str(two_result.get("line_length_source", "Two-Ended calculation")),
+        )
 
     fallback_local, fallback_remote = infer_gi_names_from_line_name(
         str(line_param.get("line_name") or "")
@@ -2105,6 +2178,696 @@ def build_two_ended_comparison_dataframe(
     return pd.DataFrame(rows)
 
 
+def override_line_param_length(line_param: dict, length_km: float, source_label: str):
+    effective = dict(line_param)
+    effective["length_km"] = float(length_km)
+    effective["Z1_total"] = effective["Z1_per_km"] * float(length_km)
+    effective["Z0_total"] = effective["Z0_per_km"] * float(length_km)
+    effective["length_source"] = source_label
+    return effective
+
+
+def select_effective_line_param_for_calculation(line_param: dict, key_prefix: str):
+    tower_length_km = st.session_state.get("tower_schedule_selected_length_km")
+    tower_length_source = st.session_state.get("tower_schedule_selected_length_source", "Tower Schedule")
+    length_source_options = ["line_parameter"]
+    if tower_length_km is not None:
+        length_source_options.append("tower_schedule")
+
+    current_source = st.session_state.get(f"{key_prefix}_line_length_source", "line_parameter")
+    if current_source not in length_source_options:
+        current_source = "line_parameter"
+
+    selected_source = st.selectbox(
+        "Sumber panjang line untuk perhitungan",
+        length_source_options,
+        index=length_source_options.index(current_source),
+        format_func=lambda value: {
+            "line_parameter": f"Line Parameter ({line_param['length_km']:.6f} km)",
+            "tower_schedule": (
+                f"Tower Schedule ({float(tower_length_km):.6f} km - {tower_length_source})"
+                if tower_length_km is not None
+                else "Tower Schedule belum tersedia"
+            ),
+        }[value],
+        key=f"{key_prefix}_line_length_source",
+        help=(
+            "Pilih Tower Schedule jika panjang saluran dari tabel tower lebih akurat. "
+            "Data Tower Schedule harus dimuat dan difilter dahulu."
+        ),
+    )
+
+    if selected_source == "tower_schedule" and tower_length_km is not None:
+        effective_line_param = override_line_param_length(
+            line_param,
+            float(tower_length_km),
+            f"Tower Schedule - {tower_length_source}",
+        )
+        st.info(
+            f"Perhitungan memakai panjang Tower Schedule: {effective_line_param['length_km']:.6f} km. "
+            "Z1_total/Z0_total dihitung ulang dari impedansi per km."
+        )
+        return effective_line_param
+
+    effective_line_param = dict(line_param)
+    effective_line_param["length_source"] = "Line Parameter"
+    if tower_length_km is None:
+        st.caption(
+            "Panjang Tower Schedule belum tersedia. Load dan filter data di tab Tower Schedule "
+            "jika ingin memakai panjang saluran dari tower."
+        )
+    return effective_line_param
+
+
+def map_display_value(value, decimals=None, suffix=""):
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "-"
+    if decimals is not None:
+        numeric_value = pd.to_numeric(str(value).replace(",", "."), errors="coerce")
+        if pd.notna(numeric_value):
+            return f"{float(numeric_value):.{decimals}f}{suffix}"
+    return f"{value}{suffix}"
+
+
+def map_detail_table(rows, title=None, compact=True):
+    title_html = (
+        f"<div style='font-weight:700; margin-bottom:6px;'>{title}</div>"
+        if title
+        else ""
+    )
+    value_cell_style = (
+        "padding:1px 0; font-weight:600; white-space:nowrap;"
+        if compact
+        else "padding:2px 0; font-weight:600; white-space:normal; overflow-wrap:anywhere;"
+    )
+    body_html = "".join(
+        "<tr>"
+        f"<td style='padding:2px 14px 2px 0; color:#475569; white-space:nowrap; vertical-align:top;'>{label}</td>"
+        f"<td style='{value_cell_style}'>{value}</td>"
+        "</tr>"
+        for label, value in rows
+    )
+    return (
+        "<div style='font-size:12px; line-height:1.35; min-width:260px; max-width:420px;'>"
+        f"{title_html}"
+        "<table style='border-collapse:collapse; width:100%; table-layout:auto;'>"
+        f"{body_html}"
+        "</table>"
+        "</div>"
+    )
+
+
+def compact_tower_span_label(span_value):
+    text = str(span_value or "").strip()
+    if not text:
+        return "-"
+    hash_match = re.search(r"#\s*([A-Za-z0-9_-]+)", text)
+    if hash_match:
+        return f"#{hash_match.group(1)}"
+    parts = text.split()
+    return parts[-1] if parts else text
+
+
+def google_maps_action_links(lat, lon, label="Location"):
+    if lat is None or lon is None:
+        return "-"
+    lat_float = float(lat)
+    lon_float = float(lon)
+    label_query = quote(f"{label} {lat_float:.7f},{lon_float:.7f}")
+    coord_query = f"{lat_float:.7f},{lon_float:.7f}"
+    open_url = f"https://www.google.com/maps/search/?api=1&query={coord_query}&query_place_id={label_query}"
+    direction_url = f"https://www.google.com/maps/dir/?api=1&destination={coord_query}&travelmode=driving"
+    return (
+        f"<a href='{open_url}' target='_blank' rel='noopener noreferrer'>Open Maps</a>"
+        " &nbsp;|&nbsp; "
+        f"<a href='{direction_url}' target='_blank' rel='noopener noreferrer'>Directions</a>"
+    )
+
+
+def prepare_tower_map_dataframe(tower_df: pd.DataFrame):
+    if tower_df is None or tower_df.empty or "LATITUDE" not in tower_df.columns or "LONGITUDE" not in tower_df.columns:
+        return pd.DataFrame()
+    map_df = tower_df.copy()
+    map_df["lat"] = pd.to_numeric(map_df["LATITUDE"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    map_df["lon"] = pd.to_numeric(map_df["LONGITUDE"].astype(str).str.replace(",", ".", regex=False), errors="coerce")
+    if "JARAK km" not in map_df.columns and "JARAK" in map_df.columns:
+        map_df["JARAK km"] = pd.to_numeric(map_df["JARAK"].astype(str).str.replace(",", ".", regex=False), errors="coerce") / 1000.0
+    if "KUMULATIF km" not in map_df.columns and "KUMULATIF" in map_df.columns:
+        map_df["KUMULATIF km"] = pd.to_numeric(map_df["KUMULATIF"].astype(str).str.replace(",", ".", regex=False), errors="coerce") / 1000.0
+    map_df = map_df.dropna(subset=["lat", "lon"])
+    if "KUMULATIF km" in map_df.columns:
+        map_df["_cum_km"] = pd.to_numeric(map_df["KUMULATIF km"], errors="coerce")
+    elif "JARAK km" in map_df.columns:
+        map_df["_cum_km"] = pd.to_numeric(map_df["JARAK km"], errors="coerce").fillna(0.0).cumsum()
+    else:
+        map_df["_cum_km"] = np.nan
+    return map_df.reset_index(drop=True)
+
+
+def get_fault_location_map_options():
+    options = []
+    two_result = st.session_state.get("two_ended_result")
+    if two_result:
+        options.append(
+            {
+                "key": "de",
+                "label": "Double-End",
+                "distance_km": float(two_result.get("distance_from_original_local_km", two_result.get("distance_km", 0.0)) or 0.0),
+                "quality": st.session_state.get("two_ended_quality", {}).get("quality_score"),
+            }
+        )
+    single_result = st.session_state.get("single_ended_result")
+    if single_result:
+        options.append(
+            {
+                "key": "se_local",
+                "label": "Single-End GI Lokal",
+                "distance_km": float(single_result.get("recommended_distance_km", 0.0) or 0.0),
+                "status": single_result.get("status"),
+            }
+        )
+    remote_single_result = st.session_state.get("remote_single_ended_result")
+    line_length_km = st.session_state.get("tower_schedule_selected_length_km")
+    if line_length_km is None and "line_param" in st.session_state:
+        line_length_km = st.session_state["line_param"].get("length_km")
+    if remote_single_result and line_length_km is not None:
+        options.append(
+            {
+                "key": "se_remote",
+                "label": "Single-End GI Remote",
+                "distance_km": float(line_length_km) - float(remote_single_result.get("recommended_distance_km", 0.0) or 0.0),
+                "status": remote_single_result.get("status"),
+            }
+        )
+    return options
+
+
+def interpolate_tower_path_location(map_df: pd.DataFrame, distance_km: float):
+    if map_df.empty or "_cum_km" not in map_df.columns:
+        return None, "Data kumulatif tower belum tersedia."
+    path_df = map_df.dropna(subset=["lat", "lon", "_cum_km"]).sort_values("_cum_km").reset_index(drop=True)
+    if path_df.empty:
+        return None, "Data kumulatif tower belum dapat dibaca."
+    if len(path_df) == 1:
+        row = path_df.iloc[0]
+        return (float(row["lat"]), float(row["lon"]), float(row["_cum_km"])), "Hanya satu titik tower tersedia; lokasi fault ditempatkan pada titik tersebut."
+
+    target = float(distance_km)
+    if target <= float(path_df.iloc[0]["_cum_km"]):
+        row = path_df.iloc[0]
+        return (float(row["lat"]), float(row["lon"]), float(row["_cum_km"])), "Jarak fault berada sebelum tower pertama pada data terfilter."
+    if target >= float(path_df.iloc[-1]["_cum_km"]):
+        row = path_df.iloc[-1]
+        return (float(row["lat"]), float(row["lon"]), float(row["_cum_km"])), "Jarak fault melebihi tower terakhir pada data terfilter."
+
+    for idx in range(1, len(path_df)):
+        prev_row = path_df.iloc[idx - 1]
+        next_row = path_df.iloc[idx]
+        prev_cum = float(prev_row["_cum_km"])
+        next_cum = float(next_row["_cum_km"])
+        if prev_cum <= target <= next_cum:
+            if abs(next_cum - prev_cum) < 1e-9:
+                ratio = 0.0
+            else:
+                ratio = (target - prev_cum) / (next_cum - prev_cum)
+            lat = float(prev_row["lat"]) + ratio * (float(next_row["lat"]) - float(prev_row["lat"]))
+            lon = float(prev_row["lon"]) + ratio * (float(next_row["lon"]) - float(prev_row["lon"]))
+            return (lat, lon, target), None
+    return None, "Lokasi fault belum dapat diinterpolasi pada jalur tower."
+
+
+def get_fault_tower_segment(map_df: pd.DataFrame, distance_km: float):
+    if map_df.empty or "_cum_km" not in map_df.columns:
+        return None
+    path_df = map_df.dropna(subset=["lat", "lon", "_cum_km"]).sort_values("_cum_km").reset_index(drop=True)
+    if len(path_df) < 2:
+        return None
+
+    target = float(distance_km)
+    for idx in range(1, len(path_df)):
+        prev_row = path_df.iloc[idx - 1]
+        next_row = path_df.iloc[idx]
+        prev_cum = float(prev_row["_cum_km"])
+        next_cum = float(next_row["_cum_km"])
+        if prev_cum <= target <= next_cum:
+            ratio = 0.0 if abs(next_cum - prev_cum) < 1e-9 else (target - prev_cum) / (next_cum - prev_cum)
+            return {
+                "prev": prev_row,
+                "next": next_row,
+                "ratio": ratio,
+                "span_distance_km": abs(next_cum - prev_cum),
+            }
+    return None
+
+
+def build_nearby_fault_tower_table(map_df: pd.DataFrame, distance_km: float, window: int = 5):
+    if map_df.empty or "_cum_km" not in map_df.columns:
+        return pd.DataFrame()
+
+    path_df = map_df.dropna(subset=["_cum_km"]).sort_values("_cum_km").reset_index(drop=True)
+    if path_df.empty:
+        return pd.DataFrame()
+
+    target = float(distance_km)
+    prev_idx = 0
+    next_idx = 0
+    if target <= float(path_df.iloc[0]["_cum_km"]):
+        prev_idx = next_idx = 0
+    elif target >= float(path_df.iloc[-1]["_cum_km"]):
+        prev_idx = next_idx = len(path_df) - 1
+    else:
+        for idx in range(1, len(path_df)):
+            if float(path_df.iloc[idx - 1]["_cum_km"]) <= target <= float(path_df.iloc[idx]["_cum_km"]):
+                prev_idx = idx - 1
+                next_idx = idx
+                break
+
+    start_idx = max(prev_idx - window, 0)
+    end_idx = min(next_idx + window, len(path_df) - 1)
+    nearby_df = path_df.iloc[start_idx : end_idx + 1].copy()
+    nearby_df.insert(0, "Distance from Fault km", nearby_df["_cum_km"].astype(float) - target)
+    nearby_df.insert(0, "Fault Context", "Nearby tower")
+    if prev_idx == next_idx:
+        nearby_df.loc[nearby_df.index == prev_idx, "Fault Context"] = "Closest tower"
+    else:
+        nearby_df.loc[nearby_df.index == prev_idx, "Fault Context"] = "Before fault span"
+        nearby_df.loc[nearby_df.index == next_idx, "Fault Context"] = "After fault span"
+
+    helper_columns = ["Fault Context", "Distance from Fault km"]
+    original_columns = [
+        col
+        for col in nearby_df.columns
+        if col not in helper_columns and not str(col).startswith("_") and col not in ["lat", "lon"]
+    ]
+    return nearby_df[helper_columns + original_columns].reset_index(drop=True)
+
+
+def render_tower_map(
+    tower_df: pd.DataFrame,
+    key_prefix: str,
+    include_fault_layer: bool = True,
+    default_show_fault: bool = True,
+    height: int = 560,
+    focus_on_fault: bool = False,
+):
+    map_df = prepare_tower_map_dataframe(tower_df)
+    if map_df.empty:
+        st.info("Latitude/Longitude tersedia tetapi belum dapat dibaca sebagai koordinat numerik.")
+        return
+
+    fault_options = get_fault_location_map_options()
+    selected_fault_option = None
+    show_fault_location = False
+
+    with st.expander("Map Settings", expanded=not focus_on_fault):
+        map_opt_col1, map_opt_col2, map_opt_col3, map_opt_col4 = st.columns([1.2, 1, 1, 1.2])
+        with map_opt_col1:
+            tower_map_style = st.selectbox(
+                "Map style",
+                ["satellite", "street"],
+                index=0,
+                format_func=lambda value: {"satellite": "Satelit", "street": "Street map"}[value],
+                key=f"{key_prefix}_map_style",
+            )
+        with map_opt_col2:
+            tower_marker_size = st.slider(
+                "Ukuran marker tower",
+                min_value=2,
+                max_value=10,
+                value=10,
+                step=1,
+                key=f"{key_prefix}_marker_size",
+            )
+        with map_opt_col3:
+            show_tower_path = st.checkbox("Tampilkan jalur", value=True, key=f"{key_prefix}_show_path")
+            show_tower_labels = st.checkbox("Tampilkan label tower", value=True, key=f"{key_prefix}_show_tower_labels")
+        with map_opt_col4:
+            if include_fault_layer and fault_options:
+                show_fault_location = st.checkbox(
+                    "Tampilkan fault",
+                    value=default_show_fault,
+                    key=f"{key_prefix}_show_fault",
+                )
+                option_keys = [option["key"] for option in fault_options]
+                default_key = "de" if "de" in option_keys else option_keys[0]
+                selected_fault_key = st.selectbox(
+                    "Sumber fault",
+                    option_keys,
+                    index=option_keys.index(st.session_state.get(f"{key_prefix}_fault_source", default_key))
+                    if st.session_state.get(f"{key_prefix}_fault_source", default_key) in option_keys
+                    else option_keys.index(default_key),
+                    format_func=lambda value: next(option["label"] for option in fault_options if option["key"] == value),
+                    key=f"{key_prefix}_fault_source",
+                )
+                selected_fault_option = next(option for option in fault_options if option["key"] == selected_fault_key)
+
+    lat_min, lat_max = map_df["lat"].min(), map_df["lat"].max()
+    lon_min, lon_max = map_df["lon"].min(), map_df["lon"].max()
+    coord_span = max(float(lat_max - lat_min), float(lon_max - lon_min), 0.001)
+    if coord_span < 0.02:
+        map_zoom = 13
+    elif coord_span < 0.08:
+        map_zoom = 11
+    elif coord_span < 0.2:
+        map_zoom = 10
+    elif coord_span < 0.6:
+        map_zoom = 8
+    else:
+        map_zoom = 6
+
+    tower_map = folium.Map(
+        location=[float(map_df["lat"].mean()), float(map_df["lon"].mean())],
+        zoom_start=map_zoom,
+        tiles=None,
+        control_scale=True,
+    )
+    folium.TileLayer(
+        tiles=("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+        attr="Esri World Imagery",
+        name="Satelit",
+        overlay=False,
+        control=True,
+        show=tower_map_style == "satellite",
+    ).add_to(tower_map)
+    folium.TileLayer("OpenStreetMap", name="Street map", overlay=False, control=True, show=tower_map_style == "street").add_to(tower_map)
+
+    tower_points = list(zip(map_df["lat"].astype(float), map_df["lon"].astype(float)))
+    if show_tower_path:
+        folium.PolyLine(locations=tower_points, color="#2563eb", weight=3, opacity=0.85, tooltip="Tower path").add_to(tower_map)
+
+    tower_group = folium.FeatureGroup(name="Tower", show=True)
+    for _, tower_row in map_df.iterrows():
+        span_value = tower_row.get("SPAN", "-")
+        cumulative_value = map_display_value(tower_row.get("KUMULATIF km", tower_row.get("KUMULATIF", "-")), decimals=2, suffix=" km")
+        jarak_value = map_display_value(tower_row.get("JARAK km", tower_row.get("JARAK", "-")), decimals=2, suffix=" km")
+        latitude_value = tower_row.get("LATITUDE", "-")
+        longitude_value = tower_row.get("LONGITUDE", "-")
+        tower_lat = float(tower_row["lat"])
+        tower_lon = float(tower_row["lon"])
+        ultg_value = tower_row.get("ULTG", "-")
+        segment_value = tower_row.get("SEGMENT", "-")
+        type_string_value = tower_row.get("TYPE STRING", "-")
+        jumlah_string_value = tower_row.get("JUMLAH STRING", "-")
+        tooltip_html = map_detail_table(
+            [
+                ("Jarak", jarak_value),
+                ("Kumulatif", cumulative_value),
+                ("Segment", segment_value),
+                ("ULTG", ultg_value),
+                ("Type", type_string_value),
+                ("String", jumlah_string_value),
+            ],
+            title=span_value,
+        )
+        popup_html = map_detail_table(
+            [
+                ("SPAN", span_value),
+                ("JARAK", jarak_value),
+                ("KUMULATIF", cumulative_value),
+                ("ULTG", ultg_value),
+                ("SEGMENT", segment_value),
+                ("TYPE STRING", type_string_value),
+                ("JUMLAH STRING", jumlah_string_value),
+                ("LATITUDE", latitude_value),
+                ("LONGITUDE", longitude_value),
+                ("Maps", google_maps_action_links(tower_lat, tower_lon, span_value)),
+            ],
+            compact=False,
+        )
+        folium.CircleMarker(
+            location=[tower_lat, tower_lon],
+            radius=tower_marker_size,
+            color="#0f172a",
+            weight=1,
+            fill=True,
+            fill_color="#f97316",
+            fill_opacity=0.9,
+            tooltip=folium.Tooltip(tooltip_html, sticky=True),
+            popup=folium.Popup(popup_html, max_width=520),
+        ).add_to(tower_group)
+        if show_tower_labels:
+            tower_label = compact_tower_span_label(span_value)
+            tower_label_html = (
+                "<div style='"
+                "background:rgba(255,255,255,0.84);"
+                "border:1px solid rgba(15,23,42,0.28);"
+                "border-radius:4px;"
+                "padding:1px 4px;"
+                "font-size:10px;"
+                "font-weight:700;"
+                "color:#0f172a;"
+                "white-space:nowrap;"
+                "box-shadow:0 1px 2px rgba(15,23,42,0.18);"
+                "'>"
+                f"{tower_label}"
+                "</div>"
+            )
+            folium.Marker(
+                location=[tower_lat, tower_lon],
+                icon=folium.DivIcon(
+                    icon_size=(54, 16),
+                    icon_anchor=(-8, 8),
+                    html=tower_label_html,
+                ),
+            ).add_to(tower_group)
+    tower_group.add_to(tower_map)
+
+    fault_location = None
+    fault_warning = None
+    if include_fault_layer and selected_fault_option and show_fault_location:
+        fault_location, fault_warning = interpolate_tower_path_location(map_df, selected_fault_option["distance_km"])
+        if fault_location:
+            fault_lat, fault_lon, plotted_distance = fault_location
+            fault_segment = get_fault_tower_segment(map_df, selected_fault_option["distance_km"])
+            fault_rows = [
+                ("Sumber", selected_fault_option["label"]),
+                ("Distance", map_display_value(selected_fault_option["distance_km"], decimals=3, suffix=" km")),
+                ("Plotted", map_display_value(plotted_distance, decimals=3, suffix=" km")),
+            ]
+            if fault_segment:
+                prev_span = fault_segment["prev"].get("SPAN", "Tower A")
+                next_span = fault_segment["next"].get("SPAN", "Tower B")
+                prev_cum = float(fault_segment["prev"].get("_cum_km", 0.0))
+                next_cum = float(fault_segment["next"].get("_cum_km", 0.0))
+                from_tower_a_km = selected_fault_option["distance_km"] - prev_cum
+                to_tower_b_km = next_cum - selected_fault_option["distance_km"]
+                if abs(from_tower_a_km) <= abs(to_tower_b_km):
+                    nearest_tower_row = fault_segment["prev"]
+                    nearest_tower_span = prev_span
+                    nearest_tower_distance = from_tower_a_km
+                else:
+                    nearest_tower_row = fault_segment["next"]
+                    nearest_tower_span = next_span
+                    nearest_tower_distance = to_tower_b_km
+                fault_rows.extend(
+                    [
+                        ("Between", f"{prev_span} - {next_span}"),
+                        ("From tower A", map_display_value(from_tower_a_km, decimals=3, suffix=" km")),
+                        ("To tower B", map_display_value(to_tower_b_km, decimals=3, suffix=" km")),
+                        ("Nearest tower", nearest_tower_span),
+                        ("Nearest dist", map_display_value(nearest_tower_distance, decimals=3, suffix=" km")),
+                        ("Span length", map_display_value(fault_segment["span_distance_km"], decimals=3, suffix=" km")),
+                        ("Span ratio", map_display_value(fault_segment["ratio"] * 100.0, decimals=1, suffix=" %")),
+                    ]
+                )
+            if selected_fault_option.get("quality") is not None:
+                fault_rows.append(("Quality", f"{selected_fault_option['quality']}/10"))
+            if selected_fault_option.get("status"):
+                fault_rows.append(("Status", selected_fault_option["status"]))
+            fault_rows.extend(
+                [
+                    ("LATITUDE", map_display_value(fault_lat, decimals=7)),
+                    ("LONGITUDE", map_display_value(fault_lon, decimals=7)),
+                    ("Maps", google_maps_action_links(fault_lat, fault_lon, f"Fault {selected_fault_option['label']}")),
+                ]
+            )
+            if fault_segment:
+                fault_rows.append(
+                    (
+                        "Nearest Maps",
+                        google_maps_action_links(
+                            float(nearest_tower_row["lat"]),
+                            float(nearest_tower_row["lon"]),
+                            str(nearest_tower_span),
+                        ),
+                    )
+                )
+            fault_popup = map_detail_table(fault_rows, title="Fault Location", compact=False)
+            fault_group = folium.FeatureGroup(name="Fault Location", show=True)
+            if fault_segment:
+                prev_row = fault_segment["prev"]
+                next_row = fault_segment["next"]
+                folium.PolyLine(
+                    locations=[
+                        [float(prev_row["lat"]), float(prev_row["lon"])],
+                        [float(next_row["lat"]), float(next_row["lon"])],
+                    ],
+                    color="#dc2626",
+                    weight=6,
+                    opacity=0.9,
+                    tooltip="Fault span between two towers",
+                ).add_to(fault_group)
+            fault_crosshair_html = (
+                "<div style='"
+                "width:22px;height:22px;"
+                "position:relative;"
+                "'>"
+                "<div style='position:absolute;left:10px;top:0;width:2px;height:22px;background:#dc2626;'></div>"
+                "<div style='position:absolute;left:0;top:10px;width:22px;height:2px;background:#dc2626;'></div>"
+                "<div style='position:absolute;left:6px;top:6px;width:10px;height:10px;"
+                "border:2px solid #ffffff;background:#dc2626;border-radius:50%;"
+                "box-shadow:0 0 0 2px #dc2626;'></div>"
+                "</div>"
+            )
+            folium.Marker(
+                location=[fault_lat, fault_lon],
+                icon=folium.DivIcon(
+                    icon_size=(22, 22),
+                    icon_anchor=(11, 11),
+                    html=fault_crosshair_html,
+                ),
+                tooltip=folium.Tooltip(f"Exact Fault Point - {selected_fault_option['label']}", sticky=True),
+                popup=folium.Popup(fault_popup, max_width=560),
+            ).add_to(fault_group)
+            fault_label_html = (
+                "<div style='"
+                "background:rgba(255,255,255,0.92);"
+                "border:1px solid #dc2626;"
+                "border-radius:6px;"
+                "box-shadow:0 1px 4px rgba(15,23,42,0.25);"
+                "padding:5px 7px;"
+                "font-size:12px;"
+                "line-height:1.25;"
+                "color:#111827;"
+                "white-space:nowrap;"
+                "'>"
+                "<div style='font-weight:700;color:#b91c1c;'>Fault Location</div>"
+                f"<div>{selected_fault_option['label']}</div>"
+                f"<div>{map_display_value(selected_fault_option['distance_km'], decimals=3, suffix=' km')}</div>"
+                + (
+                    f"<div style='color:#475569;'>{map_display_value(fault_segment['ratio'] * 100.0, decimals=1, suffix=' %')} span</div>"
+                    if fault_segment
+                    else ""
+                )
+                + "</div>"
+            )
+            folium.Marker(
+                location=[fault_lat, fault_lon],
+                icon=folium.DivIcon(
+                    icon_size=(210, 70),
+                    icon_anchor=(-16, 12),
+                    html=fault_label_html,
+                ),
+            ).add_to(fault_group)
+            fault_group.add_to(tower_map)
+        if fault_warning:
+            st.warning(fault_warning)
+
+    folium.LayerControl(collapsed=False).add_to(tower_map)
+    folium_center_override = None
+    folium_zoom_override = None
+    if focus_on_fault and fault_location and selected_fault_option:
+        fault_lat, fault_lon, _ = fault_location
+        focus_segment = get_fault_tower_segment(map_df, selected_fault_option["distance_km"])
+        if focus_segment:
+            focus_lat_values = [
+                float(focus_segment["prev"]["lat"]),
+                float(focus_segment["next"]["lat"]),
+                fault_lat,
+            ]
+            focus_lon_values = [
+                float(focus_segment["prev"]["lon"]),
+                float(focus_segment["next"]["lon"]),
+                fault_lon,
+            ]
+            focus_lat_min = min(focus_lat_values)
+            focus_lat_max = max(focus_lat_values)
+            focus_lon_min = min(focus_lon_values)
+            focus_lon_max = max(focus_lon_values)
+        else:
+            focus_lat_min = focus_lat_max = fault_lat
+            focus_lon_min = focus_lon_max = fault_lon
+
+        lat_pad = max((focus_lat_max - focus_lat_min) * 0.45, 0.0008)
+        lon_pad = max((focus_lon_max - focus_lon_min) * 0.45, 0.0008)
+        tower_map.fit_bounds(
+            [
+                [focus_lat_min - lat_pad, focus_lon_min - lon_pad],
+                [focus_lat_max + lat_pad, focus_lon_max + lon_pad],
+            ]
+        )
+        folium_center_override = (float(fault_lat), float(fault_lon))
+        focus_span = max(
+            float((focus_lat_max - focus_lat_min) + (2 * lat_pad)),
+            float((focus_lon_max - focus_lon_min) + (2 * lon_pad)),
+            0.001,
+        )
+        if focus_span < 0.01:
+            folium_zoom_override = 15
+        elif focus_span < 0.03:
+            folium_zoom_override = 14
+        elif focus_span < 0.08:
+            folium_zoom_override = 13
+        elif focus_span < 0.2:
+            folium_zoom_override = 11
+        elif focus_span < 0.6:
+            folium_zoom_override = 9
+        else:
+            folium_zoom_override = 7
+    else:
+        if fault_location:
+            fault_lat, fault_lon, _ = fault_location
+            lat_min = min(float(lat_min), fault_lat)
+            lat_max = max(float(lat_max), fault_lat)
+            lon_min = min(float(lon_min), fault_lon)
+            lon_max = max(float(lon_max), fault_lon)
+        tower_map.fit_bounds([[float(lat_min), float(lon_min)], [float(lat_max), float(lon_max)]])
+    folium_key_parts = [key_prefix, "folium"]
+    if selected_fault_option:
+        folium_key_parts.append(selected_fault_option["key"])
+        folium_key_parts.append(f"{float(selected_fault_option['distance_km']):.3f}")
+    st_folium(
+        tower_map,
+        key="_".join(folium_key_parts).replace(".", "_"),
+        height=height,
+        use_container_width=True,
+        returned_objects=[],
+        center=folium_center_override,
+        zoom=folium_zoom_override,
+    )
+
+    if include_fault_layer and selected_fault_option and show_fault_location and fault_location:
+        nearby_tower_df = build_nearby_fault_tower_table(
+            map_df,
+            selected_fault_option["distance_km"],
+            window=5,
+        )
+        if not nearby_tower_df.empty:
+            with st.expander("Data tower sekitar titik gangguan (-5 / +5)", expanded=focus_on_fault):
+                st.caption(
+                    "Tabel ini menampilkan 5 tower sebelum dan 5 tower sesudah span lokasi gangguan "
+                    "berdasarkan urutan KUMULATIF km. Semua kolom yang tersedia dari spreadsheet tetap ditampilkan."
+                )
+                nearby_formatters = {
+                    "Distance from Fault km": "{:.3f}",
+                    "JARAK km": "{:.2f}",
+                    "KUMULATIF km": "{:.2f}",
+                }
+                nearby_formatters = {
+                    key: formatter
+                    for key, formatter in nearby_formatters.items()
+                    if key in nearby_tower_df.columns
+                }
+                if nearby_formatters:
+                    st.dataframe(
+                        nearby_tower_df.style.format(nearby_formatters, na_rep="-"),
+                        use_container_width=True,
+                        height=360,
+                    )
+                else:
+                    st.dataframe(nearby_tower_df, use_container_width=True, height=360)
+
+
 st.set_page_config(
     page_title="Transmission Fault Locator",
     layout="wide"
@@ -2115,6 +2878,13 @@ st.markdown(
     <style>
     .print-table-wrapper {
         display: none;
+    }
+
+    div[data-testid="stTabs"] [role="tablist"],
+    div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+        background: #ffffff !important;
+        border-bottom: none !important;
+        box-shadow: none !important;
     }
 
     @media print {
@@ -2140,6 +2910,10 @@ st.markdown(
         [data-testid="stFileUploader"],
         [data-testid="stDataFrame"],
         .stDataFrame,
+        div[data-testid="stTabs"] > div:first-child,
+        div[data-testid="stTabs"] > div[role="tablist"],
+        div[data-testid="stTabs"] div[role="tablist"],
+        div[data-testid="stTabs"] [data-baseweb="tab-list"],
         div[data-testid="stElementToolbar"] {
             display: none !important;
         }
@@ -2241,19 +3015,31 @@ if not validate_uploaded_extension(cfg_file, ".cfg", "File local CFG"):
 if not validate_uploaded_extension(dat_file, ".dat", "File local DAT"):
     st.stop()
 if cfg_file is None or dat_file is None:
-    tab_summary_empty = st.tabs(["Summary"])[0]
-    with tab_summary_empty:
+    summary_empty_container = st.container()
+    with summary_empty_container:
         st.subheader("Summary / Report Ringkas")
-        st.info(
-            "Summary belum tersedia karena belum ada rekaman gangguan local yang diimpor. "
-            "Upload pasangan file COMTRADE .cfg dan .dat pada panel kiri untuk mulai membuat report."
-        )
+        local_upload_status = "Uploaded" if cfg_file is not None or dat_file is not None else "Not uploaded"
+        remote_upload_status = "Uploaded" if remote_cfg_file is not None or remote_dat_file is not None else "Not uploaded"
+        col_empty_sum1, col_empty_sum2, col_empty_sum3 = st.columns(3)
+        col_empty_sum1.metric("Local Record", local_upload_status)
+        col_empty_sum2.metric("Remote Record", remote_upload_status)
+        col_empty_sum3.metric("Calculation", "Pending")
+        if cfg_file is not None and dat_file is None:
+            st.warning("File local CFG sudah diupload, tetapi file local DAT belum tersedia.")
+        elif cfg_file is None and dat_file is not None:
+            st.warning("File local DAT sudah diupload, tetapi file local CFG belum tersedia.")
+        elif remote_cfg_file is not None or remote_dat_file is not None:
+            st.info(
+                "Rekaman remote sudah terdeteksi. Upload pasangan file local jika ingin menjalankan workflow "
+                "fault locator utama."
+            )
+        else:
+            st.info("Upload pasangan file COMTRADE local .cfg dan .dat untuk mulai menghitung fault locator.")
         st.markdown("### Yang akan tampil setelah data tersedia")
         st.write(
             "Tabel pre-fault/fault GI local dan GI remote, waveform fokus fault, "
             "estimasi penyebab gangguan, serta grafik SE/DE."
         )
-    st.info("Silakan upload pasangan file .cfg dan .dat terlebih dahulu.")
     st.stop()
 
 local_cfg_bytes = cfg_file.getvalue()
@@ -2291,10 +3077,11 @@ st.caption(
     "-> isi Line -> hitung Single-End atau Double-End."
 )
 
-tab_summary, tab0, tab_local, tab_remote, tab7, tab8, tab9, tab10, tab11 = st.tabs(
+tab_summary, tab0, tab_tower, tab_local, tab_remote, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     [
         "Summary",
         "Setup DB",
+        "Tower Schedule",
         "Local End",
         "Remote End",
         "Line",
@@ -2621,7 +3408,7 @@ with tab_remote:
             )
             use_remote_auto_fault_detection = st.checkbox(
                 "Gunakan deteksi otomatis adaptif remote nominal + pre-fault",
-                value=True,
+                value=False,
                 key="use_remote_auto_fault_detection",
             )
             with col_rf2:
@@ -3504,6 +4291,359 @@ with tab0:
     preview_database_sheet("Line Data", "line_data")
     preview_database_sheet("Cable Data", "cable_data")
 
+    st.markdown("### Tower Schedule Database")
+    st.caption("Pengaturan sumber data Tower Schedule. Halaman Tower Schedule hanya memakai konfigurasi ini.")
+    tower_db_col1, tower_db_col2, tower_db_col3 = st.columns([3, 1.2, 0.8])
+    with tower_db_col1:
+        tower_schedule_url_setup = st.text_input(
+            "Tower Schedule Spreadsheet URL",
+            value=st.session_state.get("tower_schedule_url", DEFAULT_TOWER_SCHEDULE_URL),
+            key="tower_schedule_url_setup_input",
+        ).strip()
+    with tower_db_col2:
+        tower_schedule_sheet_setup = st.text_input(
+            "Tower Schedule Sheet",
+            value=st.session_state.get("tower_schedule_sheet_name", DEFAULT_TOWER_SCHEDULE_SHEET),
+            key="tower_schedule_sheet_setup_input",
+        ).strip()
+    with tower_db_col3:
+        st.write("")
+        st.write("")
+        if st.button("Clear Tower Cache", key="clear_tower_schedule_cache_setup"):
+            read_google_spreadsheet_query_cached.clear()
+            st.session_state.pop("tower_schedule_df", None)
+            st.session_state.pop("tower_schedule_last_query", None)
+            st.session_state["tower_schedule_loaded"] = False
+            st.success("Cache tower schedule dibersihkan.")
+
+    st.session_state["tower_schedule_url"] = tower_schedule_url_setup or DEFAULT_TOWER_SCHEDULE_URL
+    st.session_state["tower_schedule_sheet_name"] = tower_schedule_sheet_setup or DEFAULT_TOWER_SCHEDULE_SHEET
+
+
+with tab_tower:
+    st.subheader("Tower Schedule")
+
+    expected_tower_columns = [
+        "SPAN",
+        "JARAK",
+        "KUMULATIF",
+        "LATITUDE",
+        "LONGITUDE",
+        "SEGMENT",
+        "ULTG",
+        "TYPE STRING",
+        "JUMLAH STRING",
+    ]
+
+    st.caption(
+        "Data tower schedule dibaca dari spreadsheet terpisah. Kolom utama: "
+        "SPAN, JARAK, KUMULATIF, LATITUDE, LONGITUDE, SEGMENT, ULTG, TYPE STRING, JUMLAH STRING."
+    )
+
+    st.session_state.setdefault("tower_schedule_url", DEFAULT_TOWER_SCHEDULE_URL)
+    st.session_state.setdefault("tower_schedule_sheet_name", DEFAULT_TOWER_SCHEDULE_SHEET)
+    st.caption(
+        "Sumber data diatur di Setup DB. "
+        f"Sheet aktif: {st.session_state['tower_schedule_sheet_name']}."
+    )
+    col_tower_refresh, _ = st.columns([0.9, 5])
+    with col_tower_refresh:
+        st.write("")
+        st.write("")
+        if st.button("Reload", key="reload_tower_schedule"):
+            read_google_spreadsheet_query_cached.clear()
+            st.session_state.pop("tower_schedule_df", None)
+            st.session_state.pop("tower_schedule_last_query", None)
+            st.session_state["tower_schedule_loaded"] = False
+            st.info("Cache tower schedule dibersihkan. Isi filter awal lalu klik Load / Refresh Tower Schedule.")
+
+    tower_filter_options_df = pd.DataFrame()
+    try:
+        tower_filter_options_df = read_google_spreadsheet_query_cached(
+            st.session_state["tower_schedule_url"],
+            st.session_state["tower_schedule_sheet_name"],
+            "select F, G where F is not null or G is not null",
+        )
+        tower_filter_options_df = make_streamlit_safe_columns(tower_filter_options_df)
+        tower_filter_options_df.columns = [str(col).strip() for col in tower_filter_options_df.columns]
+    except Exception as e:
+        st.warning("Daftar ULTG/Segment belum dapat dibaca. Gunakan input manual atau cek akses spreadsheet.")
+        st.caption(str(e))
+
+    def _preload_options_from_df(df, column_name):
+        if df.empty or column_name not in df.columns:
+            return ["Semua"]
+        values = (
+            df[column_name]
+            .dropna()
+            .astype(str)
+            .map(str.strip)
+        )
+        values = [value for value in values if value and value.lower() not in ["nan", "none"]]
+        return ["Semua"] + sorted(set(values), key=lambda item: item.upper())
+
+    pre_ultg_options = _preload_options_from_df(tower_filter_options_df, "ULTG")
+
+    tower_has_loaded_data = "tower_schedule_df" in st.session_state
+    with st.expander("Filter Awal Load", expanded=not tower_has_loaded_data):
+        pre_filter_col1, pre_filter_col2, pre_filter_col3 = st.columns([1, 1, 1.2])
+        with pre_filter_col1:
+            selected_pre_ultg = st.selectbox(
+                "ULTG sebelum load",
+                pre_ultg_options,
+                index=(
+                    pre_ultg_options.index(st.session_state.get("tower_schedule_pre_ultg", "Semua"))
+                    if st.session_state.get("tower_schedule_pre_ultg", "Semua") in pre_ultg_options
+                    else 0
+                ),
+                key="tower_schedule_pre_ultg",
+                help="Isi persis sesuai nilai kolom ULTG agar Google Sheet hanya mengambil baris ULTG tersebut.",
+            )
+            tower_pre_ultg = "" if selected_pre_ultg == "Semua" else selected_pre_ultg
+
+        segment_options_df = tower_filter_options_df
+        if tower_pre_ultg and "ULTG" in tower_filter_options_df.columns:
+            ultg_normalized = tower_filter_options_df["ULTG"].astype(str).str.strip().str.upper()
+            segment_options_df = tower_filter_options_df[
+                ultg_normalized == tower_pre_ultg.strip().upper()
+            ]
+        pre_segment_options = _preload_options_from_df(segment_options_df, "SEGMENT")
+        if st.session_state.get("tower_schedule_pre_segment", "Semua") not in pre_segment_options:
+            st.session_state["tower_schedule_pre_segment"] = "Semua"
+
+        with pre_filter_col2:
+            selected_pre_segment = st.selectbox(
+                "Segment sebelum load",
+                pre_segment_options,
+                index=(
+                    pre_segment_options.index(st.session_state.get("tower_schedule_pre_segment", "Semua"))
+                    if st.session_state.get("tower_schedule_pre_segment", "Semua") in pre_segment_options
+                    else 0
+                ),
+                key="tower_schedule_pre_segment",
+                help="Isi persis sesuai nilai kolom SEGMENT agar Google Sheet hanya mengambil baris segment tersebut.",
+            )
+            tower_pre_segment = "" if selected_pre_segment == "Semua" else selected_pre_segment
+        with pre_filter_col3:
+            tower_load_all = st.checkbox(
+                "Load semua data",
+                value=False,
+                key="tower_schedule_load_all",
+                help="Matikan opsi ini agar load lebih ringan memakai filter awal ULTG/Segment.",
+            )
+
+        tower_load_requested = False
+        load_tower_schedule = st.button("Load / Refresh Tower Schedule", key="load_tower_schedule")
+        if load_tower_schedule:
+            if not tower_load_all and not tower_pre_ultg and not tower_pre_segment:
+                st.warning("Isi ULTG atau Segment terlebih dahulu, atau centang Load semua data.")
+            else:
+                read_google_spreadsheet_query_cached.clear()
+                st.session_state["tower_schedule_loaded"] = True
+                tower_load_requested = True
+
+    if not st.session_state.get("tower_schedule_loaded") and "tower_schedule_df" not in st.session_state:
+        st.info("Klik Load / Refresh Tower Schedule untuk membaca data tower dari spreadsheet.")
+    else:
+        try:
+            if tower_load_requested or st.session_state.get("tower_schedule_loaded") or "tower_schedule_df" not in st.session_state:
+                tower_where_clauses = []
+                if not tower_load_all and tower_pre_segment:
+                    tower_where_clauses.append(f"F = '{tower_pre_segment.replace(chr(39), chr(39) + chr(39))}'")
+                if not tower_load_all and tower_pre_ultg:
+                    tower_where_clauses.append(f"G = '{tower_pre_ultg.replace(chr(39), chr(39) + chr(39))}'")
+                tower_query = "select *"
+                if tower_where_clauses:
+                    tower_query += " where " + " and ".join(tower_where_clauses)
+
+                tower_df_raw = read_google_spreadsheet_query_cached(
+                    st.session_state["tower_schedule_url"],
+                    st.session_state["tower_schedule_sheet_name"],
+                    tower_query,
+                )
+                tower_df = make_streamlit_safe_columns(tower_df_raw)
+                tower_df.columns = [str(col).strip() for col in tower_df.columns]
+                st.session_state["tower_schedule_df"] = tower_df
+                st.session_state["tower_schedule_loaded"] = False
+                st.session_state["tower_schedule_last_query"] = tower_query
+            else:
+                tower_df = st.session_state["tower_schedule_df"].copy()
+            if st.session_state.get("tower_schedule_last_query"):
+                st.caption(f"Query: {st.session_state['tower_schedule_last_query']}")
+    
+            missing_tower_columns = [
+                col for col in expected_tower_columns
+                if col not in tower_df.columns
+            ]
+            if missing_tower_columns:
+                st.warning(
+                    "Kolom berikut belum ditemukan persis sesuai struktur: "
+                    + ", ".join(missing_tower_columns)
+                )
+    
+            filter_col1, filter_col2, filter_col3, filter_col4 = st.columns(4)
+    
+            def _tower_options(column_name):
+                if column_name not in tower_df.columns:
+                    return ["Semua"]
+                values = (
+                    tower_df[column_name]
+                    .dropna()
+                    .astype(str)
+                    .map(str.strip)
+                )
+                values = [value for value in values if value and value.lower() not in ["nan", "none"]]
+                return ["Semua"] + sorted(set(values), key=lambda item: item.upper())
+    
+            with filter_col1:
+                selected_segment = st.selectbox(
+                    "Segment",
+                    _tower_options("SEGMENT"),
+                    key="tower_schedule_segment_filter",
+                )
+            with filter_col2:
+                selected_ultg = st.selectbox(
+                    "ULTG",
+                    _tower_options("ULTG"),
+                    key="tower_schedule_ultg_filter",
+                )
+            with filter_col3:
+                selected_type_string = st.selectbox(
+                    "Type String",
+                    _tower_options("TYPE STRING"),
+                    key="tower_schedule_type_string_filter",
+                )
+            with filter_col4:
+                tower_search = st.text_input(
+                    "Cari span / teks",
+                    value="",
+                    key="tower_schedule_search",
+                ).strip()
+    
+            filtered_tower_df = tower_df.copy()
+            if selected_segment != "Semua" and "SEGMENT" in filtered_tower_df.columns:
+                filtered_tower_df = filtered_tower_df[
+                    filtered_tower_df["SEGMENT"].astype(str).str.strip() == selected_segment
+                ]
+            if selected_ultg != "Semua" and "ULTG" in filtered_tower_df.columns:
+                filtered_tower_df = filtered_tower_df[
+                    filtered_tower_df["ULTG"].astype(str).str.strip() == selected_ultg
+                ]
+            if selected_type_string != "Semua" and "TYPE STRING" in filtered_tower_df.columns:
+                filtered_tower_df = filtered_tower_df[
+                    filtered_tower_df["TYPE STRING"].astype(str).str.strip() == selected_type_string
+                ]
+            if tower_search:
+                search_mask = filtered_tower_df.apply(
+                    lambda row: tower_search.lower() in " ".join(str(value).lower() for value in row.values),
+                    axis=1,
+                )
+                filtered_tower_df = filtered_tower_df[search_mask]
+    
+            distance_col = "JARAK" if "JARAK" in filtered_tower_df.columns else None
+            cumulative_col = "KUMULATIF" if "KUMULATIF" in filtered_tower_df.columns else None
+            string_count_col = "JUMLAH STRING" if "JUMLAH STRING" in filtered_tower_df.columns else None
+            tower_length_m = None
+            tower_length_source = None
+    
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            metric_col1.metric("Rows", len(filtered_tower_df))
+            if distance_col:
+                distance_values = pd.to_numeric(
+                    filtered_tower_df[distance_col].astype(str).str.replace(",", ".", regex=False),
+                    errors="coerce",
+                )
+                total_distance_m = float(distance_values.sum(skipna=True))
+                metric_col2.metric("Total Jarak", f"{total_distance_m / 1000.0:.6f} km")
+                if np.isfinite(total_distance_m) and total_distance_m > 0:
+                    tower_length_m = total_distance_m
+                    tower_length_source = "sum JARAK"
+            else:
+                metric_col2.metric("Total Jarak", "-")
+            if cumulative_col:
+                cumulative_values = pd.to_numeric(
+                    filtered_tower_df[cumulative_col].astype(str).str.replace(",", ".", regex=False),
+                    errors="coerce",
+                )
+                cumulative_max_m = float(cumulative_values.max(skipna=True))
+                metric_col3.metric("Kumulatif Max", f"{cumulative_max_m / 1000.0:.6f} km")
+                if np.isfinite(cumulative_max_m) and cumulative_max_m > 0:
+                    tower_length_m = cumulative_max_m
+                    tower_length_source = "max KUMULATIF"
+            else:
+                metric_col3.metric("Kumulatif Max", "-")
+            if string_count_col:
+                string_values = pd.to_numeric(
+                    filtered_tower_df[string_count_col].astype(str).str.replace(",", ".", regex=False),
+                    errors="coerce",
+                )
+                metric_col4.metric("Jumlah String", f"{string_values.sum(skipna=True):.0f}")
+            else:
+                metric_col4.metric("Jumlah String", "-")
+
+            if tower_length_m is not None:
+                tower_length_km = float(tower_length_m) / 1000.0
+                st.session_state["tower_schedule_selected_length_km"] = tower_length_km
+                st.session_state["tower_schedule_selected_length_source"] = tower_length_source
+                st.session_state["tower_schedule_selected_rows"] = int(len(filtered_tower_df))
+                st.session_state["tower_schedule_selected_segment"] = selected_segment
+                st.session_state["tower_schedule_selected_ultg"] = selected_ultg
+                st.caption(
+                    f"Panjang line Tower Schedule untuk DE: {tower_length_km:.6f} km "
+                    f"({tower_length_source}, {len(filtered_tower_df)} baris terfilter)."
+                )
+            else:
+                st.session_state.pop("tower_schedule_selected_length_km", None)
+                st.session_state.pop("tower_schedule_selected_length_source", None)
+    
+            display_columns = [col for col in expected_tower_columns if col in filtered_tower_df.columns]
+            remaining_columns = [col for col in filtered_tower_df.columns if col not in display_columns]
+            display_tower_df = filtered_tower_df[display_columns + remaining_columns].reset_index(drop=True)
+            for meter_col in ["JARAK", "KUMULATIF"]:
+                if meter_col in display_tower_df.columns:
+                    km_col = f"{meter_col} km"
+                    display_tower_df[km_col] = pd.to_numeric(
+                        display_tower_df[meter_col].astype(str).str.replace(",", ".", regex=False),
+                        errors="coerce",
+                    ) / 1000.0
+            st.session_state["tower_schedule_filtered_df"] = display_tower_df.copy()
+    
+            st.markdown("### Tower Schedule Table")
+            tower_formatters = {
+                col: "{:.6f}"
+                for col in ["JARAK km", "KUMULATIF km"]
+                if col in display_tower_df.columns
+            }
+            if tower_formatters:
+                st.dataframe(
+                    display_tower_df.style.format(tower_formatters, na_rep="-"),
+                    use_container_width=True,
+                    height=420,
+                )
+            else:
+                st.dataframe(display_tower_df, use_container_width=True, height=420)
+    
+            if "LATITUDE" in display_tower_df.columns and "LONGITUDE" in display_tower_df.columns:
+                show_tower_map = st.toggle(
+                    "Tampilkan Tower Map",
+                    value=False,
+                    key="show_tower_schedule_map",
+                    help="Aktifkan hanya jika ingin melihat koordinat tower. Map dimatikan default agar halaman lebih ringan.",
+                )
+                if show_tower_map:
+                    st.markdown("### Tower Map")
+                    render_tower_map(
+                        display_tower_df,
+                        key_prefix="tower_schedule",
+                        include_fault_layer=True,
+                        default_show_fault=True,
+                        height=560,
+                    )
+        except Exception as e:
+            st.error("Gagal membaca tower schedule dari spreadsheet.")
+            st.caption("Pastikan link spreadsheet dapat diakses dan sheet `tower_schedule` tersedia.")
+            st.exception(e)
+    
 
 with tab1:
     st.subheader("Informasi Rekaman")
@@ -3879,6 +5019,370 @@ with tab2:
     st.json(mapping_summary)
 
 
+with summary_container:
+    st.subheader("Summary / Report Ringkas")
+    st.caption(
+        "Halaman ini merangkum rekaman gangguan, hasil utama, dan grafik pendukung. "
+        "Data yang belum dihitung akan ditampilkan sebagai Pending, bukan menyembunyikan report."
+    )
+
+    local_name = str(metadata.get("station_name") or "Local End")
+    remote_loaded = "remote_metadata" in st.session_state or (remote_cfg_file is not None and remote_dat_file is not None)
+    remote_status = "Uploaded" if remote_loaded else "Not uploaded"
+    remote_metadata_summary = st.session_state.get("remote_metadata", {})
+    remote_name = str(remote_metadata_summary.get("station_name") or "Remote End")
+
+    col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
+    col_sum1.metric("Local Record", local_name)
+    col_sum2.metric("Remote Record", remote_name if remote_loaded else remote_status)
+    col_sum3.metric("Samples", metadata.get("total_samples", "-"))
+    col_sum4.metric("Frequency", f"{metadata.get('frequency') or '-'} Hz")
+
+    ie_local_text = (
+        f"measured ({st.session_state.get('local_ie_channel')})"
+        if st.session_state.get("local_ie_source") == "measured"
+        else "calculated from Ia+Ib+Ic"
+    )
+    ie_remote_text = (
+        f"measured ({st.session_state.get('remote_ie_selected_channel')})"
+        if st.session_state.get("remote_ie_source") == "measured"
+        else "calculated from Ia+Ib+Ic"
+    )
+    st.caption(f"IE source: Local = {ie_local_text}; Remote = {ie_remote_text}.")
+
+    st.markdown("### Calculation Status")
+    status_rows = [
+        {
+            "Step": "Signal Assignment",
+            "Status": "Done" if "assigned_df" in st.session_state else "Pending",
+            "Main Result": "Local waveform mapped" if "assigned_df" in st.session_state else "-",
+        },
+        {
+            "Step": "Fault Cursor",
+            "Status": "Done" if "fault_window" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["fault_window"]["fault_time"]:.6f} s'
+                if "fault_window" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Phasor",
+            "Status": "Done" if "phasors" in st.session_state else "Pending",
+            "Main Result": (
+                f'V1 {st.session_state["phasors"]["V1"]["magnitude"]:.3f}, '
+                f'I1 {st.session_state["phasors"]["I1"]["magnitude"]:.3f}'
+                if "phasors" in st.session_state and "V1" in st.session_state["phasors"]
+                else "-"
+            ),
+        },
+        {
+            "Step": "Fault Type",
+            "Status": "Done" if "fault_type_result" in st.session_state else "Pending",
+            "Main Result": (
+                st.session_state["fault_type_result"].get("fault_type", "-")
+                if "fault_type_result" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Line Parameter",
+            "Status": "Done" if "line_param" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["line_param"].get("line_name", "-")} | '
+                f'{st.session_state["line_param"]["length_km"]:.3f} km'
+                if "line_param" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Single-End",
+            "Status": "Done" if "single_ended_result" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["single_ended_result"]["recommended_distance_km"]:.3f} km '
+                f'({st.session_state["single_ended_result"]["status"]})'
+                if "single_ended_result" in st.session_state
+                else "-"
+            ),
+        },
+        {
+            "Step": "Double-End",
+            "Status": "Done" if "two_ended_result" in st.session_state else "Pending",
+            "Main Result": (
+                f'{st.session_state["two_ended_result"].get("distance_from_original_local_km", st.session_state["two_ended_result"].get("distance_km", 0.0)):.3f} km | '
+                f'Q {st.session_state.get("two_ended_quality", {}).get("quality_score", "-")}/10'
+                if "two_ended_result" in st.session_state
+                else "-"
+            ),
+        },
+    ]
+    st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
+
+    st.markdown("### Key Results")
+    key_col1, key_col2, key_col3, key_col4 = st.columns(4)
+    fault_type_summary = st.session_state.get("fault_type_result", {})
+    remote_fault_type_summary = st.session_state.get("remote_fault_type_result", {})
+    single_summary = st.session_state.get("single_ended_result")
+    two_summary = st.session_state.get("two_ended_result")
+    two_quality_summary = st.session_state.get("two_ended_quality", {})
+
+    key_col1.metric("Fault Type", fault_type_summary.get("fault_type", "-"))
+    key_col2.metric(
+        "Single-End",
+        f'{single_summary["recommended_distance_km"]:.3f} km' if single_summary else "-",
+    )
+    key_col3.metric(
+        "Double-End",
+        f'{two_summary.get("distance_from_original_local_km", two_summary.get("distance_km", 0.0)):.3f} km' if two_summary else "-",
+    )
+    key_col4.metric(
+        "DE Quality",
+        f'{two_quality_summary.get("quality_score", "-")}/10'
+        if two_quality_summary
+        else "-",
+    )
+
+    summary_operating_status = st.session_state.get("two_ended_operating_status")
+    if summary_operating_status:
+        st.markdown("### Status Diagnostik DE")
+        status_text = ", ".join(summary_operating_status.get("statuses", []))
+        if summary_operating_status.get("can_use_de_distance"):
+            st.success(f"Status: {status_text}")
+        else:
+            st.warning(f"Status: {status_text}")
+        for note in summary_operating_status.get("notes", []):
+            st.info(note)
+        st.caption(summary_operating_status.get("recommendation", ""))
+    st.markdown("### Perbandingan Pre-fault dan Fault")
+    local_comparison_df = build_prefault_fault_comparison_dataframe(
+        st.session_state.get("phasors"),
+        st.session_state.get("prefault_phasors"),
+        st.session_state.get("two_ended_local_gi_label", "Local"),
+    )
+    if not local_comparison_df.empty:
+        st.markdown("#### Rekaman GI Lokal")
+        st.dataframe(
+            local_comparison_df.style.format(
+                {
+                    "Pre-fault RMS": "{:.3f}",
+                    "Fault RMS": "{:.3f}",
+                    "Delta RMS": "{:.3f}",
+                    "Delta %": "{:.2f}",
+                    "Fault Angle deg": "{:.2f}",
+                },
+                na_rep="-",
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.info("Tabel pre-fault/fault GI lokal belum tersedia. Jalankan Fault Cursor dan Phasor lokal dahulu.")
+
+    remote_comparison_df = build_prefault_fault_comparison_dataframe(
+        st.session_state.get("remote_phasors"),
+        st.session_state.get("remote_prefault_phasors"),
+        st.session_state.get("two_ended_remote_gi_label", "Remote"),
+    )
+    if not remote_comparison_df.empty:
+        st.markdown("#### Rekaman GI Remote")
+        st.dataframe(
+            remote_comparison_df.style.format(
+                {
+                    "Pre-fault RMS": "{:.3f}",
+                    "Fault RMS": "{:.3f}",
+                    "Delta RMS": "{:.3f}",
+                    "Delta %": "{:.2f}",
+                    "Fault Angle deg": "{:.2f}",
+                },
+                na_rep="-",
+            ),
+            use_container_width=True,
+        )
+    else:
+        st.info("Tabel pre-fault/fault GI remote belum tersedia. Jalankan Double-End sampai remote phasor terbaca.")
+
+    st.markdown("### Waveform Fokus Fault Detection")
+    summary_fault_type, summary_voltage_channel, summary_current_channel = choose_summary_fault_signals(
+        fault_type_summary,
+        remote_fault_type_summary,
+    )
+    local_assigned_df = st.session_state.get("assigned_df")
+    remote_assigned_df = st.session_state.get("remote_assigned_df")
+    local_fault_window = st.session_state.get("fault_window")
+    remote_fault_window = st.session_state.get("remote_fault_window")
+    summary_remote_shift_s = float(st.session_state.get("two_ended_remote_sync_shift_s", 0.0) or 0.0)
+    if abs(summary_remote_shift_s) > 1e-9:
+        st.caption(
+            "Waveform Summary memakai shift sinkronisasi remote dari tab Double-End: "
+            f"{summary_remote_shift_s:+.6f} s."
+        )
+
+    if (
+        (local_assigned_df is not None and "IE" in local_assigned_df.columns)
+        or (remote_assigned_df is not None and "IE" in remote_assigned_df.columns)
+    ):
+        neutral_channel = "IE"
+    else:
+        neutral_channel = "I0"
+
+    waveform_specs = [
+        (
+            summary_voltage_channel,
+            f"Waveform Tegangan Fasa Terganggu ({summary_voltage_channel})",
+        ),
+        (
+            summary_current_channel,
+            f"Waveform Arus Fasa Terganggu ({summary_current_channel})",
+        ),
+        (
+            neutral_channel,
+            f"Waveform Arus Netral ({neutral_channel})",
+        ),
+    ]
+
+    show_summary_waveforms = st.toggle(
+        "Tampilkan waveform fokus di Summary",
+        value=False,
+        key="show_summary_waveforms",
+        help="Matikan default agar Summary tetap ringan di hosting. Aktifkan saat ingin membuat report atau validasi visual.",
+    )
+
+    if show_summary_waveforms:
+        for channel_name, waveform_title in waveform_specs:
+            if (
+                (
+                    local_assigned_df is not None
+                    and local_fault_window is not None
+                    and channel_name in local_assigned_df.columns
+                )
+                or (
+                    remote_assigned_df is not None
+                    and remote_fault_window is not None
+                    and channel_name in remote_assigned_df.columns
+                )
+            ):
+                st.plotly_chart(
+                    build_summary_focus_waveform(
+                        local_assigned_df,
+                        remote_assigned_df,
+                        local_fault_window,
+                        remote_fault_window,
+                        channel_name,
+                        waveform_title,
+                        remote_time_shift_s=summary_remote_shift_s,
+                    ),
+                    use_container_width=True,
+                )
+            else:
+                st.info(f"Channel {channel_name} belum tersedia untuk grafik {waveform_title}.")
+
+    st.markdown("### Estimasi Penyebab Gangguan")
+    estimated_cause, estimated_cause_note = estimate_summary_disturbance_cause(
+        fault_type_summary,
+        st.session_state.get("high_resistance_result"),
+    )
+    cause_options = [
+        "Auto estimate",
+        "Petir",
+        "Pohon",
+        "Benda asing",
+        "Power swing",
+        "Belum diketahui",
+    ]
+    cause_choice = st.selectbox(
+        "Penyebab gangguan untuk report",
+        cause_options,
+        key="summary_disturbance_cause_choice",
+    )
+    displayed_cause = estimated_cause if cause_choice == "Auto estimate" else cause_choice
+    st.metric("Penyebab Gangguan", displayed_cause)
+    st.caption(estimated_cause_note)
+
+    st.markdown("### Grafik SE dan DE")
+    summary_location_fig = build_summary_line_position_from_session()
+    if summary_location_fig is not None:
+        st.plotly_chart(
+            summary_location_fig,
+            use_container_width=True,
+            key="summary_two_ended_line_position_fig",
+        )
+    else:
+        st.info(
+            "Grafik SE/DE akan muncul setelah Single-End atau Double-End selesai menghitung."
+        )
+    if "high_resistance_result" in st.session_state:
+        st.info(explain_high_resistance_result(st.session_state["high_resistance_result"]))
+
+    st.markdown("### Tower Map Fault Location")
+    summary_tower_df = st.session_state.get("tower_schedule_filtered_df")
+    if summary_tower_df is not None and not summary_tower_df.empty:
+        if get_fault_location_map_options():
+            render_tower_map(
+                summary_tower_df,
+                key_prefix="summary_tower_fault",
+                include_fault_layer=True,
+                default_show_fault=True,
+                height=560,
+                focus_on_fault=True,
+            )
+        else:
+            st.info("Tower map tersedia, tetapi lokasi fault akan muncul setelah perhitungan DE atau SE selesai.")
+            render_tower_map(
+                summary_tower_df,
+                key_prefix="summary_tower",
+                include_fault_layer=False,
+                default_show_fault=False,
+                height=520,
+            )
+    else:
+        st.info("Tower Map Summary akan muncul setelah data Tower Schedule dimuat dan difilter.")
+
+    st.markdown("### R-X Locus Trajectory")
+    summary_rx_local_label, summary_rx_remote_label = infer_gi_names_from_line_name(
+        st.session_state.get("line_param", {}).get("line_name", "")
+    )
+
+    def show_summary_rx_locus(end_suffix: str, fallback_label: str):
+        fig, _, meta, build_warning = build_rx_locus_figure_from_session(end_suffix)
+        if fig is None:
+            st.info(
+                build_warning
+                or f"Locus {fallback_label} akan muncul setelah data {fallback_label} lengkap."
+            )
+            return
+
+        label = meta.get("label", fallback_label)
+        loop = meta.get("loop", "-")
+        point_count = meta.get("point_count", 0)
+        zone_count = meta.get("zone_count", 0)
+        if build_warning:
+            st.warning(build_warning)
+        st.caption(
+            f"{label} | Loop {loop} | {point_count} titik trajectory | "
+            f"{zone_count} zona proteksi"
+        )
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            key=f"summary_rx_locus_{end_suffix}",
+        )
+
+    st.markdown(f"#### {summary_rx_local_label}")
+    show_summary_rx_locus("local", summary_rx_local_label)
+
+    st.markdown(f"#### {summary_rx_remote_label}")
+    show_summary_rx_locus("remote", summary_rx_remote_label)
+
+    if two_quality_summary and two_quality_summary.get("warnings"):
+        st.markdown("### Double-End Warnings")
+        for warning in two_quality_summary["warnings"]:
+            st.warning(warning)
+
+    st.markdown("### Report Hint")
+    st.write(
+        "Untuk hasil cetak ringkas, buka tab ini lalu gunakan menu browser/Streamlit Print. "
+        "Untuk analisis detail, lanjutkan ke tab workflow di sebelah kanan."
+    )
+
 with tab3:
     st.subheader("Waveform Hasil Signal Assignment")
 
@@ -4010,7 +5514,7 @@ with tab4:
 
     use_auto_fault_detection = st.checkbox(
         "Gunakan deteksi otomatis adaptif nominal + pre-fault",
-        value=True,
+        value=False,
         key="use_auto_fault_detection",
         help=(
             "Aplikasi memakai pre-fault RMS bila normal. Jika pre-fault terlihat sudah abnormal, "
@@ -5670,10 +7174,14 @@ def render_single_ended_analysis(end_side: str):
     fault_type_result = ctx["fault_type_result"]
 
     st.markdown("### Input Perhitungan")
+    line_param = select_effective_line_param_for_calculation(
+        line_param,
+        f"single_ended_{suffix}",
+    )
     col_se1, col_se2, col_se3, col_se4 = st.columns(4)
     col_se1.metric("End", ctx["label"])
     col_se2.metric("Fault Type", fault_type_result.get("fault_type", "-"))
-    col_se3.metric("Line Length", f'{line_param["length_km"]:.3f} km')
+    col_se3.metric("Line Length", f'{line_param["length_km"]:.6f} km')
     col_se4.metric("Z1/km", f'{line_param["Z1_per_km"].real:.4f} + j{line_param["Z1_per_km"].imag:.4f}')
 
     st.markdown("### Metode Rekomendasi Jarak")
@@ -5704,6 +7212,8 @@ def render_single_ended_analysis(end_side: str):
                 prefault_phasors=ctx["prefault_phasors"],
                 fault_context=single_ended_fault_context,
             )
+            single_result["line_length_source"] = line_param.get("length_source", "Line Parameter")
+            single_result["line_length_km_used"] = line_param["length_km"]
             single_df = build_single_ended_result_dataframe(single_result)
             st.session_state[result_key] = single_result
             st.session_state[df_key] = single_df
@@ -5718,6 +7228,19 @@ def render_single_ended_analysis(end_side: str):
 
     single_result = st.session_state[result_key]
     single_df = st.session_state[df_key]
+    previous_length = single_result.get("line_length_km_used")
+    previous_source = single_result.get("line_length_source")
+    if previous_length is not None and abs(float(previous_length) - float(line_param["length_km"])) > 1e-9:
+        st.warning(
+            "Sumber/panjang line yang dipilih sudah berubah dari hasil Single-End tersimpan. "
+            "Klik Calculate Single-Ended Fault Location ulang agar hasil memakai referensi jarak terbaru."
+        )
+    elif previous_source and previous_source != line_param.get("length_source", "Line Parameter"):
+        st.warning(
+            "Sumber panjang line yang dipilih berbeda dari hasil Single-End tersimpan. "
+            "Klik Calculate Single-Ended Fault Location ulang agar metadata hasil ikut terbaru."
+        )
+
     st.markdown("### Hasil Utama")
     col_r1, col_r2, col_r3, col_r4, col_r5 = st.columns(5)
     single_external_context = bool(single_result.get("external_context"))
@@ -6007,7 +7530,26 @@ with tab10:
         st.stop()
 
     local_phasors = st.session_state["phasors"]
-    line_param = st.session_state["line_param"]
+    line_param_original = st.session_state["line_param"]
+    tower_length_km = st.session_state.get("tower_schedule_selected_length_km")
+    tower_length_source = st.session_state.get("tower_schedule_selected_length_source", "Tower Schedule")
+    length_source_options = ["line_parameter"]
+    if tower_length_km is not None:
+        length_source_options.append("tower_schedule")
+
+    current_length_source = st.session_state.get("two_ended_line_length_source", "line_parameter")
+    if current_length_source not in length_source_options:
+        current_length_source = "line_parameter"
+
+    if current_length_source == "tower_schedule" and tower_length_km is not None:
+        line_param = override_line_param_length(
+            line_param_original,
+            float(tower_length_km),
+            f"Tower Schedule - {tower_length_source}",
+        )
+    else:
+        line_param = dict(line_param_original)
+        line_param["length_source"] = "Line Parameter"
 
     st.markdown("### Local End Data")
 
@@ -6015,7 +7557,7 @@ with tab10:
 
     col_l1.metric("Local V1 RMS", f'{local_phasors["V1"]["magnitude"]:.3f}')
     col_l2.metric("Local I1 RMS", f'{local_phasors["I1"]["magnitude"]:.3f}')
-    col_l3.metric("Line Length", f'{line_param["length_km"]:.3f} km')
+    col_l3.metric("Line Length", f'{line_param["length_km"]:.6f} km')
 
     missing_remote_inputs = []
     if "remote_assigned_df" not in st.session_state:
@@ -6222,11 +7764,7 @@ with tab10:
                 ),
             )
 
-            default_alignment_method = "voltage_sine_sag_hybrid"
-            if sync_reference_mode in ["fault_phase_voltage", "auto_voltage_sine", "selected_channels"]:
-                default_alignment_method = "voltage_sine_sag_hybrid"
-            elif sync_reference_mode in ["ground_current", "fault_phase_current"]:
-                default_alignment_method = "superimposed_energy"
+            default_alignment_method = "rms_envelope"
             sync_alignment_method = st.selectbox(
                 "Metode visual alignment",
                 ["voltage_sine_sag_hybrid", "raw_correlation", "rms_envelope", "superimposed_energy"],
@@ -6494,6 +8032,37 @@ with tab10:
         f"{remote_gi_label} sebagai sisi remote. Jika belum sesuai, ubah Line Name di tab Line Parameter."
     )
 
+    selected_de_length_source = st.selectbox(
+        "Sumber panjang line untuk kalkulasi DE",
+        length_source_options,
+        index=length_source_options.index(current_length_source),
+        format_func=lambda value: {
+            "line_parameter": (
+                f"Line Parameter ({line_param_original['length_km']:.6f} km)"
+            ),
+            "tower_schedule": (
+                f"Tower Schedule ({float(tower_length_km):.6f} km - {tower_length_source})"
+                if tower_length_km is not None
+                else "Tower Schedule belum tersedia"
+            ),
+        }[value],
+        key="two_ended_line_length_source",
+        help=(
+            "Pilih Tower Schedule jika panjang saluran dari tabel tower lebih akurat daripada "
+            "panjang pada Line Parameter. Data Tower Schedule harus dimuat dan difilter dahulu."
+        ),
+    )
+    if selected_de_length_source == "tower_schedule" and tower_length_km is not None:
+        st.info(
+            f"Kalkulasi DE memakai panjang Tower Schedule: {float(tower_length_km):.6f} km. "
+            "Z1_total/Z0_total dihitung ulang dari impedansi per km."
+        )
+    elif tower_length_km is None:
+        st.caption(
+            "Panjang Tower Schedule belum tersedia. Load dan filter data di tab Tower Schedule "
+            "jika ingin memakai panjang saluran dari tower."
+        )
+
     remote_direction_mode = st.selectbox(
         "Remote Record Adaptation",
         [
@@ -6639,6 +8208,8 @@ with tab10:
                     "calculation_reference_mode": "original_local_to_uploaded_remote",
                     "calculation_local_label": local_gi_label,
                     "calculation_remote_label": remote_gi_label,
+                    "line_length_source": line_param.get("length_source", "Line Parameter"),
+                    "line_length_km_used": line_param["length_km"],
                     "uploaded_remote_current_direction": two_result["remote_current_direction"],
                     "distance_from_original_local_km": two_result["distance_km"],
                     "distance_from_original_local_percent": two_result["distance_percent"],
@@ -6744,6 +8315,9 @@ with tab10:
                     recommended_method="reactance",
                     prefault_phasors=remote_single_prefault_phasors,
                 )
+                for se_result in (local_single_result, remote_single_result, remote_single_raw_result):
+                    se_result["line_length_source"] = line_param.get("length_source", "Line Parameter")
+                    se_result["line_length_km_used"] = line_param["length_km"]
 
                 local_single_df = build_single_ended_result_dataframe(local_single_result)
                 remote_single_df = build_single_ended_result_dataframe(remote_single_result)
@@ -7093,18 +8667,7 @@ with tab10:
                 {
                     "Point": f"Single-ended {local_gi_label}",
                     "Distance km": st.session_state["two_ended_local_single_result"]["recommended_distance_km"],
-                    "Score": max(
-                        0.0,
-                        {
-                            "VALID": 9.0,
-                            "CHECK": 6.0,
-                            "UNCERTAIN": 3.0,
-                        }.get(
-                            st.session_state["two_ended_local_single_result"]["status"],
-                            5.0,
-                        )
-                        - 0.4 * len(st.session_state["two_ended_local_single_result"]["warnings"]),
-                    ),
+                    "Score": single_ended_plot_score(st.session_state["two_ended_local_single_result"]),
                     "Track": "Single-ended",
                     "Color": "#059669",
                     "Symbol": "circle",
@@ -7122,18 +8685,7 @@ with tab10:
                 {
                     "Point": f"Single-ended {remote_gi_label}",
                     "Distance km": remote_marker_position["distance_from_local_km"],
-                    "Score": max(
-                        0.0,
-                        {
-                            "VALID": 9.0,
-                            "CHECK": 6.0,
-                            "UNCERTAIN": 3.0,
-                        }.get(
-                            st.session_state["two_ended_remote_single_result"]["status"],
-                            5.0,
-                        )
-                        - 0.4 * len(st.session_state["two_ended_remote_single_result"]["warnings"]),
-                    ),
+                    "Score": single_ended_plot_score(st.session_state["two_ended_remote_single_result"]),
                     "Track": "Single-ended",
                     "Color": "#d97706",
                     "Symbol": "circle-open",
@@ -7678,347 +9230,3 @@ with tab10:
                         st.warning(warning)
                 else:
                     st.success("Hasil time-based berada di dalam panjang saluran dan selisih waktu masih realistis.")
-
-
-with summary_container:
-    st.subheader("Summary / Report Ringkas")
-    st.caption(
-        "Halaman ini merangkum rekaman gangguan, hasil utama, dan grafik pendukung. "
-        "Summary dirender setelah workflow selesai sehingga hasil Single-End/Double-End terbaru ikut terbaca."
-    )
-
-    local_name = str(metadata.get("station_name") or "Local End")
-    remote_loaded = "remote_metadata" in st.session_state or (remote_cfg_file is not None and remote_dat_file is not None)
-    remote_status = "Uploaded" if remote_loaded else "Not uploaded"
-    remote_metadata_summary = st.session_state.get("remote_metadata", {})
-    remote_name = str(remote_metadata_summary.get("station_name") or "Remote End")
-
-    col_sum1, col_sum2, col_sum3, col_sum4 = st.columns(4)
-    col_sum1.metric("Local Record", local_name)
-    col_sum2.metric("Remote Record", remote_name if remote_loaded else remote_status)
-    col_sum3.metric("Samples", metadata.get("total_samples", "-"))
-    col_sum4.metric("Frequency", f"{metadata.get('frequency') or '-'} Hz")
-
-    ie_local_text = (
-        f"measured ({st.session_state.get('local_ie_channel')})"
-        if st.session_state.get("local_ie_source") == "measured"
-        else "calculated from Ia+Ib+Ic"
-    )
-    ie_remote_text = (
-        f"measured ({st.session_state.get('remote_ie_selected_channel')})"
-        if st.session_state.get("remote_ie_source") == "measured"
-        else "calculated from Ia+Ib+Ic"
-    )
-    st.caption(f"IE source: Local = {ie_local_text}; Remote = {ie_remote_text}.")
-
-    st.markdown("### Calculation Status")
-    status_rows = [
-        {
-            "Step": "Signal Assignment",
-            "Status": "Done" if "assigned_df" in st.session_state else "Pending",
-            "Main Result": "Local waveform mapped" if "assigned_df" in st.session_state else "-",
-        },
-        {
-            "Step": "Fault Cursor",
-            "Status": "Done" if "fault_window" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["fault_window"]["fault_time"]:.6f} s'
-                if "fault_window" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Phasor",
-            "Status": "Done" if "phasors" in st.session_state else "Pending",
-            "Main Result": (
-                f'V1 {st.session_state["phasors"]["V1"]["magnitude"]:.3f}, '
-                f'I1 {st.session_state["phasors"]["I1"]["magnitude"]:.3f}'
-                if "phasors" in st.session_state and "V1" in st.session_state["phasors"]
-                else "-"
-            ),
-        },
-        {
-            "Step": "Fault Type",
-            "Status": "Done" if "fault_type_result" in st.session_state else "Pending",
-            "Main Result": (
-                st.session_state["fault_type_result"].get("fault_type", "-")
-                if "fault_type_result" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Line Parameter",
-            "Status": "Done" if "line_param" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["line_param"].get("line_name", "-")} | '
-                f'{st.session_state["line_param"]["length_km"]:.3f} km'
-                if "line_param" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Single-End",
-            "Status": "Done" if "single_ended_result" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["single_ended_result"]["recommended_distance_km"]:.3f} km '
-                f'({st.session_state["single_ended_result"]["status"]})'
-                if "single_ended_result" in st.session_state
-                else "-"
-            ),
-        },
-        {
-            "Step": "Double-End",
-            "Status": "Done" if "two_ended_result" in st.session_state else "Pending",
-            "Main Result": (
-                f'{st.session_state["two_ended_result"].get("distance_from_original_local_km", st.session_state["two_ended_result"].get("distance_km", 0.0)):.3f} km | '
-                f'Q {st.session_state.get("two_ended_quality", {}).get("quality_score", "-")}/10'
-                if "two_ended_result" in st.session_state
-                else "-"
-            ),
-        },
-    ]
-    st.dataframe(pd.DataFrame(status_rows), use_container_width=True)
-
-    st.markdown("### Key Results")
-    key_col1, key_col2, key_col3, key_col4 = st.columns(4)
-    fault_type_summary = st.session_state.get("fault_type_result", {})
-    remote_fault_type_summary = st.session_state.get("remote_fault_type_result", {})
-    single_summary = st.session_state.get("single_ended_result")
-    two_summary = st.session_state.get("two_ended_result")
-    two_quality_summary = st.session_state.get("two_ended_quality", {})
-
-    key_col1.metric("Fault Type", fault_type_summary.get("fault_type", "-"))
-    key_col2.metric(
-        "Single-End",
-        f'{single_summary["recommended_distance_km"]:.3f} km' if single_summary else "-",
-    )
-    key_col3.metric(
-        "Double-End",
-        f'{two_summary.get("distance_from_original_local_km", two_summary.get("distance_km", 0.0)):.3f} km' if two_summary else "-",
-    )
-    key_col4.metric(
-        "DE Quality",
-        f'{two_quality_summary.get("quality_score", "-")}/10'
-        if two_quality_summary
-        else "-",
-    )
-
-    summary_operating_status = st.session_state.get("two_ended_operating_status")
-    if summary_operating_status:
-        st.markdown("### Status Diagnostik DE")
-        status_text = ", ".join(summary_operating_status.get("statuses", []))
-        if summary_operating_status.get("can_use_de_distance"):
-            st.success(f"Status: {status_text}")
-        else:
-            st.warning(f"Status: {status_text}")
-        for note in summary_operating_status.get("notes", []):
-            st.info(note)
-        st.caption(summary_operating_status.get("recommendation", ""))
-    st.markdown("### Perbandingan Pre-fault dan Fault")
-    local_comparison_df = build_prefault_fault_comparison_dataframe(
-        st.session_state.get("phasors"),
-        st.session_state.get("prefault_phasors"),
-        st.session_state.get("two_ended_local_gi_label", "Local"),
-    )
-    if not local_comparison_df.empty:
-        st.markdown("#### Rekaman GI Lokal")
-        st.dataframe(
-            local_comparison_df.style.format(
-                {
-                    "Pre-fault RMS": "{:.3f}",
-                    "Fault RMS": "{:.3f}",
-                    "Delta RMS": "{:.3f}",
-                    "Delta %": "{:.2f}",
-                    "Fault Angle deg": "{:.2f}",
-                },
-                na_rep="-",
-            ),
-            use_container_width=True,
-        )
-    else:
-        st.info("Tabel pre-fault/fault GI lokal belum tersedia. Jalankan Fault Cursor dan Phasor lokal dahulu.")
-
-    remote_comparison_df = build_prefault_fault_comparison_dataframe(
-        st.session_state.get("remote_phasors"),
-        st.session_state.get("remote_prefault_phasors"),
-        st.session_state.get("two_ended_remote_gi_label", "Remote"),
-    )
-    if not remote_comparison_df.empty:
-        st.markdown("#### Rekaman GI Remote")
-        st.dataframe(
-            remote_comparison_df.style.format(
-                {
-                    "Pre-fault RMS": "{:.3f}",
-                    "Fault RMS": "{:.3f}",
-                    "Delta RMS": "{:.3f}",
-                    "Delta %": "{:.2f}",
-                    "Fault Angle deg": "{:.2f}",
-                },
-                na_rep="-",
-            ),
-            use_container_width=True,
-        )
-    else:
-        st.info("Tabel pre-fault/fault GI remote belum tersedia. Jalankan Double-End sampai remote phasor terbaca.")
-
-    st.markdown("### Waveform Fokus Fault Detection")
-    summary_fault_type, summary_voltage_channel, summary_current_channel = choose_summary_fault_signals(
-        fault_type_summary,
-        remote_fault_type_summary,
-    )
-    local_assigned_df = st.session_state.get("assigned_df")
-    remote_assigned_df = st.session_state.get("remote_assigned_df")
-    local_fault_window = st.session_state.get("fault_window")
-    remote_fault_window = st.session_state.get("remote_fault_window")
-    summary_remote_shift_s = float(st.session_state.get("two_ended_remote_sync_shift_s", 0.0) or 0.0)
-    if abs(summary_remote_shift_s) > 1e-9:
-        st.caption(
-            "Waveform Summary memakai shift sinkronisasi remote dari tab Double-End: "
-            f"{summary_remote_shift_s:+.6f} s."
-        )
-
-    if (
-        (local_assigned_df is not None and "IE" in local_assigned_df.columns)
-        or (remote_assigned_df is not None and "IE" in remote_assigned_df.columns)
-    ):
-        neutral_channel = "IE"
-    else:
-        neutral_channel = "I0"
-
-    waveform_specs = [
-        (
-            summary_voltage_channel,
-            f"Waveform Tegangan Fasa Terganggu ({summary_voltage_channel})",
-        ),
-        (
-            summary_current_channel,
-            f"Waveform Arus Fasa Terganggu ({summary_current_channel})",
-        ),
-        (
-            neutral_channel,
-            f"Waveform Arus Netral ({neutral_channel})",
-        ),
-    ]
-
-    show_summary_waveforms = st.toggle(
-        "Tampilkan waveform fokus di Summary",
-        value=False,
-        key="show_summary_waveforms",
-        help="Matikan default agar Summary tetap ringan di hosting. Aktifkan saat ingin membuat report atau validasi visual.",
-    )
-
-    if show_summary_waveforms:
-        for channel_name, waveform_title in waveform_specs:
-            if (
-                (
-                    local_assigned_df is not None
-                    and local_fault_window is not None
-                    and channel_name in local_assigned_df.columns
-                )
-                or (
-                    remote_assigned_df is not None
-                    and remote_fault_window is not None
-                    and channel_name in remote_assigned_df.columns
-                )
-            ):
-                st.plotly_chart(
-                    build_summary_focus_waveform(
-                        local_assigned_df,
-                        remote_assigned_df,
-                        local_fault_window,
-                        remote_fault_window,
-                        channel_name,
-                        waveform_title,
-                        remote_time_shift_s=summary_remote_shift_s,
-                    ),
-                    use_container_width=True,
-                )
-            else:
-                st.info(f"Channel {channel_name} belum tersedia untuk grafik {waveform_title}.")
-
-    st.markdown("### Estimasi Penyebab Gangguan")
-    estimated_cause, estimated_cause_note = estimate_summary_disturbance_cause(
-        fault_type_summary,
-        st.session_state.get("high_resistance_result"),
-    )
-    cause_options = [
-        "Auto estimate",
-        "Petir",
-        "Pohon",
-        "Benda asing",
-        "Power swing",
-        "Belum diketahui",
-    ]
-    cause_choice = st.selectbox(
-        "Penyebab gangguan untuk report",
-        cause_options,
-        key="summary_disturbance_cause_choice",
-    )
-    displayed_cause = estimated_cause if cause_choice == "Auto estimate" else cause_choice
-    st.metric("Penyebab Gangguan", displayed_cause)
-    st.caption(estimated_cause_note)
-
-    st.markdown("### Grafik SE dan DE")
-    summary_location_fig = build_summary_line_position_from_session()
-    if summary_location_fig is not None:
-        st.plotly_chart(
-            summary_location_fig,
-            use_container_width=True,
-            key="summary_two_ended_line_position_fig",
-        )
-    else:
-        st.info(
-            "Grafik SE/DE akan muncul setelah Single-End atau Double-End selesai menghitung."
-        )
-    if "high_resistance_result" in st.session_state:
-        st.info(explain_high_resistance_result(st.session_state["high_resistance_result"]))
-
-    st.markdown("### R-X Locus Trajectory")
-    summary_rx_local_label, summary_rx_remote_label = infer_gi_names_from_line_name(
-        st.session_state.get("line_param", {}).get("line_name", "")
-    )
-    summary_rx_local_tab, summary_rx_remote_tab = st.tabs(
-        [summary_rx_local_label, summary_rx_remote_label]
-    )
-
-    def show_summary_rx_locus(end_suffix: str, fallback_label: str):
-        fig, _, meta, build_warning = build_rx_locus_figure_from_session(end_suffix)
-        if fig is None:
-            st.info(
-                build_warning
-                or f"Locus {fallback_label} akan muncul setelah data {fallback_label} lengkap."
-            )
-            return
-
-        label = meta.get("label", fallback_label)
-        loop = meta.get("loop", "-")
-        point_count = meta.get("point_count", 0)
-        zone_count = meta.get("zone_count", 0)
-        if build_warning:
-            st.warning(build_warning)
-        st.caption(
-            f"{label} | Loop {loop} | {point_count} titik trajectory | "
-            f"{zone_count} zona proteksi"
-        )
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            key=f"summary_rx_locus_{end_suffix}",
-        )
-
-    with summary_rx_local_tab:
-        show_summary_rx_locus("local", summary_rx_local_label)
-
-    with summary_rx_remote_tab:
-        show_summary_rx_locus("remote", summary_rx_remote_label)
-
-    if two_quality_summary and two_quality_summary.get("warnings"):
-        st.markdown("### Double-End Warnings")
-        for warning in two_quality_summary["warnings"]:
-            st.warning(warning)
-
-    st.markdown("### Report Hint")
-    st.write(
-        "Untuk hasil cetak ringkas, buka tab ini lalu gunakan menu browser/Streamlit Print. "
-        "Untuk analisis detail, lanjutkan ke tab workflow di sebelah kanan."
-    )
