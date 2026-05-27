@@ -7,7 +7,8 @@ import re
 import json
 import io
 import zipfile
-from datetime import datetime
+import textwrap
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import folium
 import numpy as np
@@ -16,6 +17,7 @@ import requests
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import streamlit.components.v1 as components
 from streamlit_folium import st_folium
 
 from comtrade_reader import read_comtrade
@@ -86,6 +88,13 @@ DEFAULT_TOWER_SCHEDULE_URL = (
 DEFAULT_TOWER_SCHEDULE_SHEET = "tower_schedule"
 DEFAULT_CASE_DRIVE_FOLDER_URL = "https://drive.google.com/drive/folders/<CASE_DRIVE_FOLDER_ID>?usp=sharing"
 DEFAULT_CASE_DRIVE_FOLDER_ID = "<CASE_DRIVE_FOLDER_ID>"
+OPENWEATHER_LIGHTNING_ENDPOINT = "https://demo.openweathermap.org/lightning/1.0/data"
+OPENWEATHER_ONECALL_CURRENT_ENDPOINT = "https://api.openweathermap.org/data/4.0/onecall/current"
+OPENWEATHER_ONECALL_15MIN_ENDPOINT = "https://api.openweathermap.org/data/4.0/onecall/timeline/15min"
+XWEATHER_LIGHTNING_FLASH_CLOSEST_ENDPOINT = "https://data.api.xweather.com/lightning/flash/closest"
+ACCUWEATHER_BASE_URL = "https://dataservice.accuweather.com"
+ACCUWEATHER_LIGHTNING_BASE_URL = "https://api.accuweather.com"
+LOCAL_TIMEZONE = timezone(timedelta(hours=7))
 
 
 @st.cache_data(show_spinner="Membaca file COMTRADE...")
@@ -156,6 +165,8 @@ CASE_STATE_EXCLUDE_PREFIXES = (
     "local_dat_file",
     "remote_cfg_file",
     "remote_dat_file",
+    "summary_weather_lightning_openweather",
+    "summary_weather_lightning_xweather",
 )
 CASE_STATE_EXCLUDE_KEYS = {
     "case_archive_file",
@@ -163,6 +174,10 @@ CASE_STATE_EXCLUDE_KEYS = {
     "case_local_dat_bytes",
     "case_remote_cfg_bytes",
     "case_remote_dat_bytes",
+    "openweather_lightning_api_key",
+    "xweather_client_id",
+    "xweather_client_secret",
+    "accuweather_api_key",
 }
 
 
@@ -2608,11 +2623,735 @@ def safe_display_number(value, decimals=1, suffix=""):
         return str(value)
 
 
+def get_openweather_lightning_api_key():
+    key = str(st.session_state.get("openweather_lightning_api_key", "") or "").strip()
+    if key:
+        return key
+
+    try:
+        key = str(st.secrets.get("OPENWEATHER_API_KEY", "") or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+
+    return str(os.environ.get("OPENWEATHER_API_KEY", "") or "").strip()
+
+
+def get_xweather_credentials():
+    client_id = str(st.session_state.get("xweather_client_id", "") or "").strip()
+    client_secret = str(st.session_state.get("xweather_client_secret", "") or "").strip()
+    if client_id and client_secret:
+        return client_id, client_secret
+
+    try:
+        client_id = client_id or str(st.secrets.get("XWEATHER_CLIENT_ID", "") or "").strip()
+        client_secret = client_secret or str(st.secrets.get("XWEATHER_CLIENT_SECRET", "") or "").strip()
+    except Exception:
+        pass
+
+    client_id = client_id or str(os.environ.get("XWEATHER_CLIENT_ID", "") or "").strip()
+    client_secret = client_secret or str(os.environ.get("XWEATHER_CLIENT_SECRET", "") or "").strip()
+    return client_id, client_secret
+
+
+def get_accuweather_api_key():
+    key = str(st.session_state.get("accuweather_api_key", "") or "").strip()
+    if key:
+        return key
+
+    try:
+        key = str(st.secrets.get("ACCUWEATHER_API_KEY", "") or "").strip()
+        if key:
+            return key
+    except Exception:
+        pass
+
+    return str(os.environ.get("ACCUWEATHER_API_KEY", "") or "").strip()
+
+
+def _accuweather_value(unit_container: dict | None, preferred_unit: str = "Metric"):
+    if not isinstance(unit_container, dict):
+        return None
+    preferred = unit_container.get(preferred_unit)
+    if isinstance(preferred, dict):
+        return preferred.get("Value")
+    for value in unit_container.values():
+        if isinstance(value, dict) and "Value" in value:
+            return value.get("Value")
+    return None
+
+
+def _accuweather_get(url: str, api_key: str, params: dict | None = None):
+    params = dict(params or {})
+    headers = {"Authorization": f"Bearer {api_key}"}
+    response = requests.get(url, params=params, headers=headers, timeout=10)
+    if response.status_code in [401, 403]:
+        legacy_params = dict(params)
+        legacy_params["apikey"] = api_key
+        response = requests.get(url, params=legacy_params, timeout=10)
+    return response
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_accuweather_current_weather(lat: float, lon: float, api_key: str, language: str = "id-id"):
+    try:
+        location_response = _accuweather_get(
+            f"{ACCUWEATHER_BASE_URL}/locations/v1/geoposition/search",
+            api_key,
+            params={
+                "q": f"{float(lat):.6f},{float(lon):.6f}",
+                "language": language,
+                "details": "false",
+            },
+        )
+        if location_response.status_code != 200:
+            try:
+                payload = location_response.json()
+            except Exception:
+                payload = {"message": location_response.text}
+            return {
+                "error": payload.get("message", "AccuWeather location lookup failed."),
+                "status_code": location_response.status_code,
+            }
+        location_payload = location_response.json()
+        location_key = location_payload.get("Key")
+        if not location_key:
+            return {"error": "AccuWeather location key tidak ditemukan.", "status_code": None}
+
+        current_response = _accuweather_get(
+            f"{ACCUWEATHER_BASE_URL}/currentconditions/v1/{location_key}",
+            api_key,
+            params={
+                "language": language,
+                "details": "true",
+            },
+        )
+        if current_response.status_code != 200:
+            try:
+                payload = current_response.json()
+            except Exception:
+                payload = {"message": current_response.text}
+            return {
+                "error": payload.get("message", "AccuWeather current conditions failed."),
+                "status_code": current_response.status_code,
+            }
+
+        records = current_response.json()
+        current = records[0] if records else {}
+        wind = current.get("Wind", {}) or {}
+        wind_speed = wind.get("Speed", {}) if isinstance(wind, dict) else {}
+        wind_direction = wind.get("Direction", {}) if isinstance(wind, dict) else {}
+        precip_1h = current.get("Precip1hr", {}) or {}
+
+        return {
+            "time": current.get("LocalObservationDateTime"),
+            "weather_code": current.get("WeatherIcon"),
+            "weather": current.get("WeatherText", "-"),
+            "temperature_c": _accuweather_value(current.get("Temperature"), "Metric"),
+            "humidity_pct": current.get("RelativeHumidity"),
+            "precipitation_mm": _accuweather_value(precip_1h, "Metric"),
+            "rain_mm": _accuweather_value(precip_1h, "Metric"),
+            "cloud_cover_pct": current.get("CloudCover"),
+            "wind_speed_kmh": _accuweather_value(wind_speed, "Metric"),
+            "wind_direction_deg": wind_direction.get("Degrees") if isinstance(wind_direction, dict) else None,
+            "source": "AccuWeather Core Weather",
+        }
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_openweather_onecall_current_weather(lat: float, lon: float, api_key: str, lang: str = "id"):
+    try:
+        response = requests.get(
+            OPENWEATHER_ONECALL_CURRENT_ENDPOINT,
+            params={
+                "lat": float(lat),
+                "lon": float(lon),
+                "units": "metric",
+                "lang": lang,
+                "appid": api_key,
+            },
+            timeout=10,
+        )
+        if response.status_code != 200:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"message": response.text}
+            return {
+                "error": payload.get("message", "OpenWeather One Call request failed."),
+                "status_code": response.status_code,
+            }
+
+        payload = response.json()
+        records = payload.get("data", [])
+        current = records[0] if records else {}
+        weather = current.get("weather", [])
+        weather_item = weather[0] if weather else {}
+        rain = current.get("rain", {}) or {}
+        snow = current.get("snow", {}) or {}
+        wind_speed_ms = current.get("wind_speed")
+        wind_speed_kmh = None
+        if wind_speed_ms is not None:
+            wind_speed_kmh = float(wind_speed_ms) * 3.6
+
+        return {
+            "time": datetime.fromtimestamp(current.get("dt"), tz=timezone.utc).astimezone(LOCAL_TIMEZONE).isoformat(timespec="minutes")
+            if current.get("dt") is not None
+            else None,
+            "weather_code": weather_item.get("id"),
+            "weather": weather_item.get("description") or weather_item.get("main") or "-",
+            "temperature_c": current.get("temp"),
+            "feels_like_c": current.get("feels_like"),
+            "humidity_pct": current.get("humidity"),
+            "pressure_hpa": current.get("pressure"),
+            "visibility_m": current.get("visibility"),
+            "precipitation_mm": rain.get("1h", 0.0) or snow.get("1h", 0.0),
+            "rain_mm": rain.get("1h", 0.0),
+            "cloud_cover_pct": current.get("clouds"),
+            "wind_speed_kmh": wind_speed_kmh,
+            "wind_direction_deg": current.get("wind_deg"),
+            "weather_icon_code": weather_item.get("icon"),
+            "weather_icon_url": (
+                f"https://openweathermap.org/img/wn/{weather_item.get('icon')}@4x.png"
+                if weather_item.get("icon")
+                else None
+            ),
+            "source": "OpenWeather One Call 4.0",
+        }
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_openweather_onecall_15min_forecast(lat: float, lon: float, api_key: str, lang: str = "id"):
+    try:
+        response = requests.get(
+            OPENWEATHER_ONECALL_15MIN_ENDPOINT,
+            params={
+                "lat": float(lat),
+                "lon": float(lon),
+                "units": "metric",
+                "lang": lang,
+                "appid": api_key,
+            },
+            timeout=10,
+        )
+        if response.status_code != 200:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"message": response.text}
+            return {
+                "error": payload.get("message", "OpenWeather One Call timeline request failed."),
+                "status_code": response.status_code,
+            }
+        return response.json()
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
+
+
+def _forecast_record_time(record: dict):
+    timestamp = record.get("dt")
+    if timestamp is not None:
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(LOCAL_TIMEZONE)
+        except (TypeError, ValueError, OSError):
+            pass
+    return parse_api_datetime(record.get("date") or record.get("dateTime") or record.get("time"))
+
+
+def _forecast_precipitation_mm(record: dict):
+    precipitation = record.get("precipitation")
+    if precipitation is not None:
+        try:
+            return float(precipitation)
+        except (TypeError, ValueError):
+            pass
+    total = 0.0
+    found = False
+    for key in ["rain", "snow"]:
+        value = record.get(key)
+        if isinstance(value, dict):
+            for nested_key in ["15min", "1h", "3h"]:
+                if nested_key in value:
+                    try:
+                        total += float(value[nested_key])
+                        found = True
+                    except (TypeError, ValueError):
+                        pass
+        elif value is not None:
+            try:
+                total += float(value)
+                found = True
+            except (TypeError, ValueError):
+                pass
+    return total if found else 0.0
+
+
+def build_openweather_forecast_summary(payload: dict, hours: int = 12):
+    records = payload.get("data", []) if isinstance(payload, dict) else []
+    if not records:
+        return {
+            "available": False,
+            "summary": "Forecast 15 menit belum tersedia.",
+            "items": [],
+            "thunder_count": 0,
+            "rain_count": 0,
+            "max_pop": None,
+            "total_precip_mm": 0.0,
+        }
+
+    now_local = datetime.now(tz=LOCAL_TIMEZONE)
+    cutoff = now_local + timedelta(hours=int(hours))
+    selected = []
+    for record in records:
+        record_time = _forecast_record_time(record)
+        if record_time is None:
+            continue
+        if record_time.tzinfo is None:
+            record_time = record_time.replace(tzinfo=LOCAL_TIMEZONE)
+        if now_local - timedelta(minutes=20) <= record_time <= cutoff:
+            selected.append((record_time, record))
+
+    if not selected:
+        selected = [
+            (_forecast_record_time(record) or now_local, record)
+            for record in records[: min(len(records), int(hours * 4))]
+        ]
+
+    hourly_buckets = {}
+
+    for record_time, record in selected:
+        minutes_ahead = (record_time - now_local).total_seconds() / 60.0
+        if minutes_ahead <= 0:
+            continue
+        hour_offset = int(math.ceil(minutes_ahead / 60.0))
+        if hour_offset < 1 or hour_offset > int(hours):
+            continue
+        hour_key = now_local + timedelta(hours=hour_offset)
+        hour_key = hour_key.replace(second=0, microsecond=0)
+        weather = record.get("weather", [])
+        weather_item = weather[0] if weather else {}
+        code = weather_item.get("id")
+        description = weather_item.get("description") or weather_item.get("main") or weather_code_label(code)
+        pop = record.get("pop")
+        try:
+            pop_value = float(pop)
+            if pop_value > 1.0:
+                pop_value = pop_value / 100.0
+        except (TypeError, ValueError):
+            pop_value = None
+        precipitation_mm = _forecast_precipitation_mm(record)
+        is_thunder = False
+        try:
+            is_thunder = 200 <= int(code) <= 232
+        except (TypeError, ValueError):
+            pass
+
+        bucket = hourly_buckets.setdefault(
+            hour_key,
+            {
+                "time": hour_key.strftime("%H:%M"),
+                "records": 0,
+                "pop_values": [],
+                "precip_mm": 0.0,
+                "thunder_count": 0,
+                "temperature_values": [],
+                "description_counts": {},
+                "weather_code": code,
+                "icon_url": (
+                    f"https://openweathermap.org/img/wn/{weather_item.get('icon')}@2x.png"
+                    if weather_item.get("icon")
+                    else None
+                ),
+            },
+        )
+        bucket["records"] += 1
+        if pop_value is not None:
+            bucket["pop_values"].append(pop_value)
+        bucket["precip_mm"] += precipitation_mm
+        if is_thunder:
+            bucket["thunder_count"] += 1
+        try:
+            bucket["temperature_values"].append(float(record.get("temp")))
+        except (TypeError, ValueError):
+            pass
+        desc_key = str(description or "-").title()
+        bucket["description_counts"][desc_key] = bucket["description_counts"].get(desc_key, 0) + 1
+        if pop_value is not None and pop_value == max(bucket["pop_values"], default=pop_value):
+            bucket["weather_code"] = code
+            bucket["icon_url"] = (
+                f"https://openweathermap.org/img/wn/{weather_item.get('icon')}@2x.png"
+                if weather_item.get("icon")
+                else bucket.get("icon_url")
+            )
+
+    timeline = []
+    thunder_slots = []
+    rain_slots = []
+    pops = []
+    total_precip = 0.0
+    for hour_key in sorted(hourly_buckets):
+        bucket = hourly_buckets[hour_key]
+        pop_value = max(bucket["pop_values"]) if bucket["pop_values"] else None
+        if pop_value is not None:
+            pops.append(pop_value)
+        total_precip += bucket["precip_mm"]
+        if bucket["thunder_count"]:
+            thunder_slots.append(hour_key)
+        if bucket["precip_mm"] > 0.0 or (pop_value is not None and pop_value >= 0.3):
+            rain_slots.append(hour_key)
+        description = max(bucket["description_counts"], key=bucket["description_counts"].get) if bucket["description_counts"] else "-"
+        temp_avg = (
+            sum(bucket["temperature_values"]) / len(bucket["temperature_values"])
+            if bucket["temperature_values"]
+            else None
+        )
+        timeline.append(
+            {
+                "time": bucket["time"],
+                "description": description,
+                "weather_code": bucket["weather_code"],
+                "icon_url": bucket["icon_url"],
+                "pop_pct": round(pop_value * 100.0) if pop_value is not None else None,
+                "precip_mm": bucket["precip_mm"],
+                "temperature_c": temp_avg,
+                "is_thunder": bool(bucket["thunder_count"]),
+            }
+        )
+
+    max_pop = max(pops) if pops else None
+    if rain_slots:
+        summary = f"Peluang hujan masih ada mulai sekitar {rain_slots[0].strftime('%H:%M')}."
+    else:
+        summary = f"Tidak ada sinyal hujan kuat dalam {hours} jam ke depan."
+
+    return {
+        "available": True,
+        "summary": summary,
+        "items": timeline[:12],
+        "thunder_count": len(thunder_slots),
+        "rain_count": len(rain_slots),
+        "max_pop": max_pop,
+        "total_precip_mm": total_precip,
+    }
+
+
+def normalize_event_time_for_api(event_time: datetime):
+    if event_time is None:
+        return None
+    if event_time.tzinfo is None:
+        return event_time.replace(tzinfo=LOCAL_TIMEZONE)
+    return event_time
+
+
+def format_openweather_time(value: datetime):
+    value = normalize_event_time_for_api(value)
+    if value is None:
+        return None
+    return value.isoformat(timespec="seconds")
+
+
+def calculate_haversine_km(lat1, lon1, lat2, lon2):
+    radius_earth_km = 6371.0088
+    phi1 = math.radians(float(lat1))
+    phi2 = math.radians(float(lat2))
+    d_phi = math.radians(float(lat2) - float(lat1))
+    d_lambda = math.radians(float(lon2) - float(lon1))
+    a = (
+        math.sin(d_phi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2.0) ** 2
+    )
+    return 2.0 * radius_earth_km * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+
+def parse_api_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def get_summary_fault_event_time(mode: str):
+    local_metadata = st.session_state.get("local_metadata", {})
+    local_fault_window = st.session_state.get("fault_window")
+    if not local_fault_window:
+        return None
+    return get_absolute_event_time(
+        local_metadata,
+        float(local_fault_window.get("fault_time", 0.0)),
+        mode,
+    )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_openweather_lightning_events(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    start_date: str,
+    end_date: str,
+    api_key: str,
+):
+    try:
+        response = requests.get(
+            OPENWEATHER_LIGHTNING_ENDPOINT,
+            params={
+                "lat": float(lat),
+                "lon": float(lon),
+                "radius": float(radius_km),
+                "start_date": start_date,
+                "end_date": end_date,
+                "apikey": api_key,
+            },
+            timeout=12,
+        )
+        if response.status_code != 200:
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"message": response.text}
+            return {
+                "error": payload.get("message", "OpenWeather Lightning request failed."),
+                "status_code": response.status_code,
+                "payload": payload,
+            }
+        return response.json()
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
+
+
+def build_openweather_lightning_dataframe(payload: dict, fault_lat: float, fault_lon: float, event_time: datetime | None):
+    events = payload.get("lightnings", []) if isinstance(payload, dict) else []
+    rows = []
+    event_time_api = normalize_event_time_for_api(event_time)
+
+    for event in events:
+        strike_lat = event.get("lat")
+        strike_lon = event.get("lon")
+        if strike_lat is None or strike_lon is None:
+            continue
+
+        strike_time = parse_api_datetime(event.get("datetime"))
+        delta_minutes = None
+        if strike_time is not None and event_time_api is not None:
+            delta_minutes = (strike_time - event_time_api.astimezone(timezone.utc)).total_seconds() / 60.0
+
+        rows.append(
+            {
+                "Lightning Time UTC": event.get("datetime"),
+                "Delta from Fault min": delta_minutes,
+                "Distance from Fault km": calculate_haversine_km(fault_lat, fault_lon, strike_lat, strike_lon),
+                "Latitude": strike_lat,
+                "Longitude": strike_lon,
+                "Quality": event.get("quality"),
+                "Location Error km": event.get("error"),
+                "ID": event.get("id"),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["Distance from Fault km", "Delta from Fault min"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_xweather_lightning_flash_closest(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    limit: int,
+    client_id: str,
+    client_secret: str,
+):
+    try:
+        response = requests.get(
+            XWEATHER_LIGHTNING_FLASH_CLOSEST_ENDPOINT,
+            params={
+                "p": f"{float(lat):.6f},{float(lon):.6f}",
+                "format": "json",
+                "radius": f"{min(float(radius_km), 40.0):.0f}km",
+                "minradius": "0km",
+                "limit": int(limit),
+                "client_id": client_id,
+                "client_secret": client_secret,
+            },
+            timeout=12,
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"success": False, "error": {"description": response.text}}
+
+        if response.status_code != 200 or not payload.get("success", False):
+            error = payload.get("error") or {}
+            return {
+                "error": error.get("description") or error.get("message") or "Xweather Lightning request failed.",
+                "status_code": response.status_code,
+                "payload": payload,
+            }
+        return payload
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
+
+
+def build_xweather_lightning_dataframe(payload: dict, fault_lat: float, fault_lon: float, event_time: datetime | None):
+    events = payload.get("response", []) if isinstance(payload, dict) else []
+    rows = []
+    event_time_api = normalize_event_time_for_api(event_time)
+
+    for event in events:
+        loc = event.get("loc", {}) or {}
+        ob = event.get("ob", {}) or {}
+        strike_lat = loc.get("lat")
+        strike_lon = loc.get("long")
+        if strike_lat is None or strike_lon is None:
+            continue
+
+        strike_time_iso = ob.get("dateTimeISO")
+        strike_time = parse_api_datetime(strike_time_iso)
+        delta_minutes = None
+        if strike_time is not None and event_time_api is not None:
+            delta_minutes = (strike_time - event_time_api.astimezone(timezone.utc)).total_seconds() / 60.0
+
+        rows.append(
+            {
+                "Lightning Time UTC": strike_time_iso,
+                "Age seconds": ob.get("age"),
+                "Delta from Fault min": delta_minutes,
+                "Distance from Fault km": calculate_haversine_km(fault_lat, fault_lon, strike_lat, strike_lon),
+                "Latitude": strike_lat,
+                "Longitude": strike_lon,
+                "Received Time UTC": event.get("recDateTimeISO"),
+                "ID": event.get("id"),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["Distance from Fault km", "Age seconds"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_accuweather_lightning_radius(
+    lat: float,
+    lon: float,
+    radius_km: float,
+    time_interval_minutes: int,
+    api_key: str,
+    strike_type: str = "all",
+):
+    try:
+        interval = int(time_interval_minutes)
+        if interval not in [5, 15, 30, 60, 120]:
+            interval = 15
+        radius_miles = min(float(radius_km) / 1.609344, 60.0)
+        params = {
+            "apikey": api_key,
+            "q": f"{float(lat):.6f},{float(lon):.6f}",
+            "distanceRadius": f"{radius_miles:.2f}",
+            "offset": "-1",
+        }
+        if strike_type in ["cg", "ic"]:
+            params["strikeType"] = strike_type
+
+        response = requests.get(
+            f"{ACCUWEATHER_LIGHTNING_BASE_URL}/lightning/v1/{interval}min/geoposition/radius.geojson",
+            params=params,
+            timeout=12,
+        )
+        try:
+            payload = response.json()
+        except Exception:
+            payload = {"message": response.text}
+
+        if response.status_code != 200:
+            return {
+                "error": payload.get("message", "AccuWeather Lightning request failed."),
+                "status_code": response.status_code,
+                "payload": payload,
+            }
+        return payload
+    except Exception as exc:
+        return {"error": str(exc), "status_code": None}
+
+
+def build_accuweather_lightning_dataframe(payload: dict, fault_lat: float, fault_lon: float, event_time: datetime | None):
+    features = payload.get("features", []) if isinstance(payload, dict) else []
+    rows = []
+    event_time_api = normalize_event_time_for_api(event_time)
+
+    for feature in features:
+        geometry = feature.get("geometry", {}) or {}
+        properties = feature.get("properties", {}) or {}
+        coordinates = geometry.get("coordinates", [])
+        if not isinstance(coordinates, list) or len(coordinates) < 2:
+            continue
+        strike_lon = coordinates[0]
+        strike_lat = coordinates[1]
+
+        strike_time_iso = properties.get("date")
+        strike_time = parse_api_datetime(strike_time_iso)
+        delta_minutes = None
+        if strike_time is not None and event_time_api is not None:
+            delta_minutes = (strike_time - event_time_api.astimezone(timezone.utc)).total_seconds() / 60.0
+
+        rows.append(
+            {
+                "Lightning Time UTC": strike_time_iso,
+                "Delta from Fault min": delta_minutes,
+                "Distance from Fault km": calculate_haversine_km(fault_lat, fault_lon, strike_lat, strike_lon),
+                "Latitude": strike_lat,
+                "Longitude": strike_lon,
+                "Strike Type": properties.get("strikeType") or "-",
+                "Peak Current A": properties.get("peakCurrent"),
+                "Source ID": properties.get("sourceId"),
+                "ID": properties.get("id"),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(
+        ["Distance from Fault km", "Delta from Fault min"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
 def weather_icon_for_code(code):
     try:
         code = int(code)
     except (TypeError, ValueError):
         return "?"
+    if 200 <= code <= 232:
+        return "!!"
+    if 300 <= code <= 321:
+        return ".."
+    if 500 <= code <= 531:
+        return "//"
+    if 600 <= code <= 622:
+        return "SN"
+    if 700 <= code <= 781:
+        return "~~"
+    if code == 800:
+        return "SUN"
+    if 801 <= code <= 804:
+        return "CL"
     if code in THUNDERSTORM_WEATHER_CODES:
         return "!!"
     if code in {61, 63, 65, 66, 67, 80, 81, 82}:
@@ -2628,6 +3367,136 @@ def weather_icon_for_code(code):
     return "WX"
 
 
+def weather_theme_for_code(code):
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "neutral"
+    if code in THUNDERSTORM_WEATHER_CODES or 200 <= code <= 232:
+        return "storm"
+    if code in {61, 63, 65, 66, 67, 80, 81, 82} or 500 <= code <= 531:
+        return "rain"
+    if code in {45, 48} or 700 <= code <= 781:
+        return "mist"
+    if code in {2, 3} or 801 <= code <= 804:
+        return "cloud"
+    if code in {0, 1, 800}:
+        return "clear"
+    return "neutral"
+
+
+def weather_symbol_for_code(code):
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "☁"
+    if 200 <= code <= 232 or code in THUNDERSTORM_WEATHER_CODES:
+        return "⚡"
+    if 300 <= code <= 321:
+        return "☂"
+    if 500 <= code <= 531:
+        return "☔"
+    if 600 <= code <= 622:
+        return "❄"
+    if 700 <= code <= 781:
+        return "≋"
+    if code == 800 or code in {0, 1}:
+        return "☀"
+    if code in {801, 2}:
+        return "⛅"
+    return "☁"
+
+
+def build_weather_trend_svg(items):
+    usable = []
+    for item in items:
+        try:
+            temp = float(item.get("temperature_c"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            rain = float(item.get("precip_mm") or 0.0)
+        except (TypeError, ValueError):
+            rain = 0.0
+        usable.append((temp, rain, str(item.get("time", "-"))))
+
+    if len(usable) < 2:
+        return ""
+
+    width = 520
+    height = 110
+    x_start = 18
+    x_step = (width - 36) / max(len(usable) - 1, 1)
+    temps = [item[0] for item in usable]
+    min_temp = min(temps)
+    max_temp = max(temps)
+    temp_span = max(max_temp - min_temp, 1.0)
+    points = []
+    labels = []
+    rain_bars = []
+
+    for idx, (temp, rain, time_label) in enumerate(usable):
+        x = x_start + idx * x_step
+        y = 68 - ((temp - min_temp) / temp_span) * 36
+        points.append(f"{x:.1f},{y:.1f}")
+        labels.append((x, y, temp, time_label))
+        bar_height = min(32.0, max(3.0, rain * 9.0)) if rain > 0 else 3.0
+        rain_bars.append(
+            f"<rect x='{x - 5:.1f}' y='{82 - bar_height:.1f}' width='10' height='{bar_height:.1f}' rx='4' />"
+        )
+
+    grid_lines = "".join(
+        f"<line x1='{x_start + idx * x_step:.1f}' y1='18' x2='{x_start + idx * x_step:.1f}' y2='92' />"
+        for idx in range(len(usable))
+    )
+    circles = "".join(
+        f"<circle cx='{point.split(',')[0]}' cy='{point.split(',')[1]}' r='3' />"
+        for point in points
+    )
+    text_labels = "".join(
+        f"<text x='{x:.1f}' y='{max(12.0, y - 8):.1f}' text-anchor='middle'>{temp:.0f}°</text>"
+        for x, y, temp, _ in labels
+    )
+    time_labels = "".join(
+        f"<text x='{x:.1f}' y='104' text-anchor='middle'>{time_label}</text>"
+        for x, _, _, time_label in labels
+    )
+    return (
+        "<svg class='weather-trend-svg' viewBox='0 0 520 110' role='img' aria-label='Grafik tren suhu dan hujan'>"
+        f"<g class='weather-trend-grid'>{grid_lines}</g>"
+        f"<g class='weather-trend-rain'>{''.join(rain_bars)}</g>"
+        f"<polyline class='weather-trend-line' points='{' '.join(points)}' />"
+        f"<g class='weather-trend-points'>{circles}</g>"
+        f"<g class='weather-trend-labels'>{text_labels}</g>"
+        f"<g class='weather-trend-axis'>{time_labels}</g>"
+        "</svg>"
+    )
+
+
+def build_rain_chance_bars(items):
+    bars = ""
+    max_pop = 1
+    for item in items:
+        try:
+            max_pop = max(max_pop, int(item.get("pop_pct") or 0))
+        except (TypeError, ValueError):
+            pass
+    for item in items:
+        try:
+            pop_num = int(item.get("pop_pct") or 0)
+        except (TypeError, ValueError):
+            pop_num = 0
+        bar_height = 12 + (pop_num / max_pop) * 58
+        bars += (
+            "<div class='rain-bar-wrap'>"
+            f"<i style='height:{bar_height:.0f}px'></i>"
+            f"<span>{pop_num}%</span>"
+            f"<small>{item.get('time', '-')}</small>"
+            "</div>"
+        )
+    return bars
+
+
 def weather_card_html(weather_rows):
     cards_html = []
     for row in weather_rows:
@@ -2636,70 +3505,204 @@ def weather_card_html(weather_rows):
         if row.get("Last Thunderstorm Time"):
             thunder_text = f"{row.get('Last Thunderstorm Time')} | {row.get('Last Thunderstorm Weather', '-')}"
             storm_class = "weather-storm-active"
+        theme = weather_theme_for_code(row.get("Weather Code"))
+        icon_url = row.get("Weather Icon URL")
+        if icon_url:
+            visual_html = f"<img class='weather-hero-img' src='{icon_url}' alt='{row.get('Current Weather', 'Weather')}' />"
+        else:
+            visual_html = f"<div class='weather-hero-fallback'>{weather_icon_for_code(row.get('Weather Code'))}</div>"
+        visual_caption = str(row.get("Current Weather") or "-").title()
+        forecast = row.get("Forecast Summary") or {}
+        forecast_items = forecast.get("items", [])
+        forecast_items_html = ""
+        temp_values = []
+        precip_values = []
+        for item in forecast_items:
+            temp_value = item.get("temperature_c")
+            precip_value = item.get("precip_mm") or 0.0
+            try:
+                temp_values.append(float(temp_value))
+            except (TypeError, ValueError):
+                pass
+            try:
+                precip_values.append(float(precip_value))
+            except (TypeError, ValueError):
+                precip_value = 0.0
+            item_icon = (
+                f"<img src='{item.get('icon_url')}' alt='{item.get('description', 'Forecast')}' />"
+                if item.get("icon_url")
+                else f"<strong>{weather_icon_for_code(item.get('weather_code'))}</strong>"
+            )
+            pop_label = f"{item.get('pop_pct')}%" if item.get("pop_pct") is not None else "-"
+            temp_label = safe_display_number(temp_value, 0, " C")
+            precip_label = safe_display_number(precip_value, 1, " mm") if precip_value else ""
+            risk_value = item.get("pop_pct") if item.get("pop_pct") is not None else 0
+            precip_height = min(28, max(3, float(precip_value) * 8.0)) if precip_value else 3
+            forecast_items_html += (
+                "<div class='weather-forecast-item'>"
+                f"<span>{item.get('time', '-')}</span>"
+                f"{item_icon}"
+                f"<b>{temp_label}</b>"
+                f"<em>{item.get('description', '-')}</em>"
+                f"<small>{pop_label}</small>"
+                "<div class='weather-precip-track'>"
+                f"<i style='height:{precip_height}px'></i>"
+                "</div>"
+                f"<label>{precip_label}</label>"
+                f"<mark>{risk_value}</mark>"
+                "</div>"
+            )
+        temp_min = min(temp_values) if temp_values else None
+        temp_max = max(temp_values) if temp_values else None
+        temp_range = (
+            f"{safe_display_number(temp_min, 0, ' C')} - {safe_display_number(temp_max, 0, ' C')}"
+            if temp_min is not None and temp_max is not None
+            else "-"
+        )
+        forecast_summary = forecast.get("summary", "Forecast belum tersedia.")
+        forecast_pop = (
+            f"{forecast.get('max_pop') * 100.0:.0f}%"
+            if forecast.get("max_pop") is not None
+            else "-"
+        )
+        forecast_precip = safe_display_number(forecast.get("total_precip_mm", 0.0), 2, " mm")
+        trend_svg = build_weather_trend_svg(forecast_items)
+        visibility_km = None
+        try:
+            visibility_km = float(row.get("Visibility m")) / 1000.0
+        except (TypeError, ValueError):
+            visibility_km = None
         cards_html.append(
-            f"""
-            <div class="weather-card">
-                <div class="weather-card-top">
-                    <div>
-                        <div class="weather-role">{row.get('Location', '-')}</div>
-                        <div class="weather-tower">{row.get('Tower', '-')}</div>
+            textwrap.dedent(f"""
+            <div class="weather-card weather-theme-{theme}">
+                <div class="weather-effect weather-effect-{theme}"></div>
+                <div class="weather-glass">
+                    <div class="weather-top">
+                        <div class="weather-now">
+                            <div class="weather-visual-badge">{visual_html}</div>
+                            <div>
+                                <div class="weather-desc">{row.get('Current Weather', '-')}</div>
+                                <div class="weather-location">{row.get('Location', '-')}</div>
+                                <div class="weather-tower">{row.get('Tower', '-')}</div>
+                            </div>
+                        </div>
+                        <div class="weather-temp-block">
+                            <div class="weather-temp">{safe_display_number(row.get('Temperature C'), 1, ' C')}</div>
+                            <div class="weather-range">{temp_range}</div>
+                        </div>
                     </div>
-                    <div class="weather-icon">{weather_icon_for_code(row.get('Weather Code'))}</div>
-                </div>
-                <div class="weather-main">
-                    <div>
-                        <div class="weather-temp">{safe_display_number(row.get('Temperature C'), 1, ' C')}</div>
-                        <div class="weather-desc">{row.get('Current Weather', '-')}</div>
+
+                    <div class="weather-attribute-list">
+                        <div><span>Jarak pandang</span><strong>{safe_display_number(visibility_km, 1, ' km')}</strong></div>
+                        <div><span>Terasa seperti</span><strong>{safe_display_number(row.get('Feels Like C'), 1, ' C')}</strong></div>
+                        <div><span>Kelembapan</span><strong>{safe_display_number(row.get('Humidity %'), 0, '%')}</strong></div>
+                        <div><span>Angin</span><strong>{safe_display_number(row.get('Wind km/h'), 1, ' km/h')}</strong></div>
+                        <div><span>Hujan saat ini</span><strong>{safe_display_number(row.get('Rain mm'), 2, ' mm')}</strong></div>
+                        <div><span>Tutupan awan</span><strong>{safe_display_number(row.get('Cloud Cover %'), 0, '%')}</strong></div>
                     </div>
-                    <div class="weather-distance">
-                        <span>{safe_display_number(row.get('Distance from Fault km'), 3, ' km')}</span>
-                        <small>dari fault</small>
+
+                    <div class="weather-forecast-row">
+                        <div class="weather-forecast-copy">
+                            <span>Prakiraan 12 jam</span>
+                            <strong>{forecast_summary}</strong>
+                            <small>{forecast_signal} | Peluang hujan tertinggi {forecast_pop} | Hujan total {forecast_precip}</small>
+                        </div>
+                        {trend_svg}
+                    </div>
+
+                    <div class="weather-forecast-strip">
+                        {forecast_items_html}
+                    </div>
+
+                    <div class="weather-storm {storm_class}">
+                        <span>Indikasi thunderstorm</span>
+                        <strong>{thunder_text}</strong>
+                    </div>
+
+                    <div class="weather-footer">
+                        <span>Kumulatif {safe_display_number(row.get('Cumulative km'), 3, ' km')}</span>
+                        <span>{safe_display_number(row.get('Latitude'), 6)}, {safe_display_number(row.get('Longitude'), 6)}</span>
+                        <span>Update {row.get('Weather Time') or '-'} | {row.get('Weather Source', '-')}</span>
                     </div>
                 </div>
-                <div class="weather-grid">
-                    <div><span>Rain</span><strong>{safe_display_number(row.get('Rain mm'), 2, ' mm')}</strong></div>
-                    <div><span>Humidity</span><strong>{safe_display_number(row.get('Humidity %'), 0, '%')}</strong></div>
-                    <div><span>Cloud</span><strong>{safe_display_number(row.get('Cloud Cover %'), 0, '%')}</strong></div>
-                    <div><span>Wind</span><strong>{safe_display_number(row.get('Wind km/h'), 1, ' km/h')}</strong></div>
-                </div>
-                <div class="weather-storm {storm_class}">
-                    <span>Indikasi thunderstorm</span>
-                    <strong>{thunder_text}</strong>
-                </div>
-                <div class="weather-meta">
-                    <span>Kumulatif {safe_display_number(row.get('Cumulative km'), 3, ' km')}</span>
-                    <span>{safe_display_number(row.get('Latitude'), 6)}, {safe_display_number(row.get('Longitude'), 6)}</span>
-                </div>
-                <div class="weather-time">Update cuaca: {row.get('Weather Time') or '-'}</div>
             </div>
-            """
+            """)
         )
     return (
-        """
+        textwrap.dedent("""
         <style>
         .weather-card-wrap {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            grid-template-columns: minmax(0, 1fr);
             gap: 14px;
             margin: 12px 0 14px 0;
         }
         .weather-card {
             border: 1px solid rgba(148, 163, 184, 0.45);
             border-radius: 8px;
-            padding: 16px;
-            background: linear-gradient(135deg, #f8fafc 0%, #eef6ff 100%);
-            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08);
+            padding: 14px 16px;
+            background: linear-gradient(135deg, #f8fafc 0%, #e0f2fe 100%);
+            box-shadow: 0 8px 22px rgba(15, 23, 42, 0.10);
             color: #0f172a;
             break-inside: avoid;
             page-break-inside: avoid;
+            overflow: hidden;
+            position: relative;
         }
-        .weather-card-top,
-        .weather-main,
+        .weather-layout {
+            display: grid;
+            grid-template-columns: minmax(360px, 0.9fr) minmax(440px, 1.1fr);
+            gap: 12px;
+            align-items: stretch;
+        }
+        .weather-current-panel,
+        .weather-forecast-panel {
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.72);
+            background: rgba(255, 255, 255, 0.52);
+            padding: 12px;
+            height: 100%;
+        }
+        .weather-current-panel {
+            display: flex;
+            flex-direction: column;
+        }
+        .weather-forecast-panel {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+        }
+        .weather-theme-clear {
+            background: linear-gradient(135deg, #fff7ed 0%, #dbeafe 100%);
+        }
+        .weather-theme-cloud {
+            background: linear-gradient(135deg, #f8fafc 0%, #dbeafe 56%, #e2e8f0 100%);
+        }
+        .weather-theme-rain {
+            background: linear-gradient(135deg, #eef6ff 0%, #c7d2fe 100%);
+        }
+        .weather-theme-storm {
+            background: linear-gradient(135deg, #eef2ff 0%, #fed7aa 100%);
+        }
+        .weather-theme-mist {
+            background: linear-gradient(135deg, #f8fafc 0%, #e5e7eb 100%);
+        }
+        .weather-hero,
         .weather-meta {
             display: flex;
             justify-content: space-between;
-            gap: 12px;
+            gap: 18px;
             align-items: flex-start;
+        }
+        .weather-hero {
+            min-height: 112px;
+            align-items: center;
+            padding: 0;
+            border-bottom: 0;
+        }
+        .weather-copy {
+            min-width: 0;
+            flex: 1;
         }
         .weather-role {
             color: #ef4444;
@@ -2712,75 +3715,203 @@ def weather_card_html(weather_rows):
             font-weight: 700;
             line-height: 1.25;
         }
-        .weather-icon {
-            min-width: 54px;
-            height: 54px;
+        .weather-temp {
+            font-size: 42px;
+            line-height: 1;
+            font-weight: 800;
+            margin-top: 18px;
+        }
+        .weather-desc {
+            color: #334155;
+            font-size: 16px;
+            margin-top: 4px;
+            text-transform: capitalize;
+        }
+        .weather-visual-card {
+            width: 154px;
+            border-radius: 8px;
+            padding: 8px;
+            background: rgba(255, 255, 255, 0.58);
+            border: 1px solid rgba(255, 255, 255, 0.78);
+            box-shadow: 0 18px 45px rgba(15,23,42,0.13);
+            flex: 0 0 auto;
+        }
+        .weather-visual {
+            width: 100%;
+            height: 110px;
+            border-radius: 8px;
+            display: grid;
+            place-items: center;
+            background:
+                radial-gradient(circle at 50% 38%, rgba(255,255,255,0.94), rgba(255,255,255,0.42) 54%, rgba(226,232,240,0.42));
+        }
+        .weather-hero-img {
+            width: 104px;
+            height: 104px;
+            object-fit: contain;
+            filter: drop-shadow(0 10px 12px rgba(15, 23, 42, 0.18));
+        }
+        .weather-visual-caption {
+            margin-top: 5px;
+            text-align: center;
+            font-size: 12px;
+            font-weight: 700;
+            color: #0f172a;
+        }
+        .weather-hero-fallback {
+            width: 96px;
+            height: 96px;
             border-radius: 50%;
             display: grid;
             place-items: center;
             background: #0f172a;
-            color: #fff;
-            font-size: 14px;
+            color: #ffffff;
+            font-size: 24px;
             font-weight: 800;
             letter-spacing: 0;
-        }
-        .weather-main {
-            margin-top: 14px;
-            align-items: center;
-        }
-        .weather-temp {
-            font-size: 34px;
-            line-height: 1;
-            font-weight: 700;
-        }
-        .weather-desc {
-            color: #475569;
-            margin-top: 4px;
-        }
-        .weather-distance {
-            text-align: right;
-            padding: 8px 10px;
-            border-radius: 8px;
-            background: rgba(255, 255, 255, 0.72);
-            border: 1px solid rgba(203, 213, 225, 0.8);
-        }
-        .weather-distance span {
-            display: block;
-            font-size: 18px;
-            font-weight: 700;
-        }
-        .weather-distance small {
-            color: #64748b;
         }
         .weather-grid {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
             gap: 8px;
-            margin-top: 14px;
+            margin-top: 10px;
         }
         .weather-grid div {
             background: rgba(255, 255, 255, 0.72);
             border: 1px solid rgba(203, 213, 225, 0.75);
             border-radius: 8px;
-            padding: 8px;
+            padding: 8px 9px;
         }
         .weather-grid span,
         .weather-storm span {
             display: block;
             color: #64748b;
-            font-size: 12px;
-            margin-bottom: 2px;
+            font-size: 11px;
+            margin-bottom: 1px;
         }
         .weather-grid strong,
         .weather-storm strong {
-            font-size: 14px;
+            font-size: 13px;
         }
         .weather-storm {
-            margin-top: 12px;
+            margin-top: 8px;
             border-radius: 8px;
-            padding: 10px;
+            padding: 8px 10px;
             border: 1px solid rgba(203, 213, 225, 0.8);
             background: rgba(255, 255, 255, 0.72);
+        }
+        .weather-forecast-head {
+            margin-bottom: 8px;
+        }
+        .weather-forecast-head span,
+        .weather-forecast-metrics span {
+            display: block;
+            color: #64748b;
+            font-size: 11px;
+            margin-bottom: 2px;
+        }
+        .weather-forecast-head strong {
+            font-size: 14px;
+        }
+        .weather-forecast-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 7px;
+            margin-bottom: 8px;
+        }
+        .weather-forecast-metrics div {
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.75);
+            background: rgba(248, 250, 252, 0.85);
+            padding: 7px 8px;
+        }
+        .weather-alert-pill {
+            margin: 0 0 8px 0;
+            padding: 7px 9px;
+            border-radius: 8px;
+            background: rgba(15, 23, 42, 0.06);
+            border: 1px solid rgba(148, 163, 184, 0.32);
+            color: #0f172a;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .weather-forecast-strip {
+            display: flex;
+            gap: 8px;
+            margin-top: 0;
+            overflow-x: auto;
+            padding-bottom: 2px;
+            flex: 1;
+        }
+        .weather-forecast-item {
+            flex: 0 0 86px;
+            min-width: 86px;
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.72);
+            background: linear-gradient(180deg, rgba(255,255,255,0.86), rgba(241,245,249,0.78));
+            padding: 7px 6px 6px 6px;
+            text-align: center;
+            display: grid;
+            grid-template-rows: auto 30px auto auto auto 30px;
+            align-content: center;
+            gap: 1px;
+        }
+        .weather-forecast-item span,
+        .weather-forecast-item small {
+            display: block;
+            color: #475569;
+            font-size: 10px;
+        }
+        .weather-forecast-item em {
+            display: block;
+            color: #0f172a;
+            font-size: 10px;
+            font-style: normal;
+            font-weight: 700;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .weather-forecast-item b {
+            display: block;
+            color: #0f172a;
+            font-size: 13px;
+            line-height: 1;
+        }
+        .weather-forecast-item img {
+            width: 30px;
+            height: 30px;
+            object-fit: contain;
+            margin: -3px auto -3px auto;
+        }
+        .weather-forecast-item strong {
+            display: grid;
+            place-items: center;
+            width: 28px;
+            height: 28px;
+            margin: 0 auto;
+            border-radius: 50%;
+            background: #0f172a;
+            color: #ffffff;
+            font-size: 9px;
+        }
+        .weather-precip-track {
+            width: 16px;
+            height: 30px;
+            margin: 1px auto 0 auto;
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            border-radius: 999px;
+            background: rgba(203, 213, 225, 0.45);
+            overflow: hidden;
+        }
+        .weather-precip-track i {
+            display: block;
+            width: 100%;
+            min-height: 3px;
+            border-radius: 999px;
+            background: linear-gradient(180deg, #60a5fa, #2563eb);
         }
         .weather-storm-active {
             border-color: rgba(234, 88, 12, 0.55);
@@ -2792,20 +3923,1155 @@ def weather_card_html(weather_rows):
         .weather-meta,
         .weather-time {
             color: #64748b;
-            font-size: 12px;
-            margin-top: 10px;
+            font-size: 11px;
+            margin-top: 8px;
         }
         @media print {
             .weather-card-wrap {
-                grid-template-columns: repeat(2, 1fr);
+                grid-template-columns: 1fr;
             }
             .weather-card {
                 box-shadow: none;
             }
         }
+        @media (max-width: 980px) {
+            .weather-layout {
+                grid-template-columns: 1fr;
+                align-items: start;
+            }
+            .weather-current-panel,
+            .weather-forecast-panel {
+                height: auto;
+            }
+        }
+        @media (max-width: 640px) {
+            .weather-card {
+                padding: 10px;
+            }
+            .weather-current-panel,
+            .weather-forecast-panel {
+                padding: 10px;
+                min-width: 0;
+            }
+            .weather-hero {
+                align-items: flex-start;
+                min-height: 0;
+                gap: 10px;
+            }
+            .weather-visual-card {
+                width: 92px;
+                padding: 8px;
+            }
+            .weather-visual {
+                height: 76px;
+            }
+            .weather-hero-img {
+                width: 72px;
+                height: 72px;
+            }
+            .weather-visual-caption {
+                font-size: 10px;
+            }
+            .weather-temp {
+                font-size: 34px;
+            }
+            .weather-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .weather-forecast-head {
+                grid-template-columns: 1fr;
+            }
+            .weather-forecast-metrics {
+                grid-template-columns: repeat(3, minmax(96px, 1fr));
+                overflow-x: auto;
+                padding-bottom: 2px;
+            }
+            .weather-forecast-metrics div {
+                min-width: 96px;
+            }
+            .weather-forecast-strip {
+                display: flex;
+                gap: 7px;
+                overflow-x: auto;
+                max-width: 100%;
+                flex: 0 0 auto;
+            }
+            .weather-forecast-item {
+                flex: 0 0 78px;
+                min-width: 78px;
+            }
+            .weather-meta {
+                display: grid;
+                grid-template-columns: 1fr;
+                gap: 2px;
+            }
+            .weather-time {
+                overflow-wrap: anywhere;
+            }
+        }
+        .weather-card {
+            border-radius: 16px;
+            padding: 0;
+            color: #f8fafc;
+            background:
+                radial-gradient(circle at 66% -14%, rgba(255, 239, 163, 0.95), rgba(255, 239, 163, 0.05) 15%, transparent 25%),
+                radial-gradient(circle at 0% 100%, rgba(239, 68, 68, 0.72), transparent 32%),
+                linear-gradient(135deg, #0f7caf 0%, #0f5d82 46%, #153d5a 100%);
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            box-shadow: 0 18px 46px rgba(15, 23, 42, 0.22);
+            overflow: hidden;
+            position: relative;
+        }
+        .weather-theme-cloud,
+        .weather-theme-mist {
+            background:
+                radial-gradient(circle at 66% -14%, rgba(255, 239, 163, 0.78), rgba(255, 239, 163, 0.04) 14%, transparent 25%),
+                radial-gradient(circle at 0% 100%, rgba(239, 68, 68, 0.62), transparent 32%),
+                linear-gradient(135deg, #1675a7 0%, #195779 48%, #213d56 100%);
+        }
+        .weather-theme-rain,
+        .weather-theme-storm {
+            background:
+                radial-gradient(circle at 64% -16%, rgba(250, 204, 21, 0.52), rgba(250, 204, 21, 0.03) 14%, transparent 25%),
+                radial-gradient(circle at 0% 100%, rgba(220, 38, 38, 0.66), transparent 32%),
+                linear-gradient(135deg, #0f5276 0%, #173b5a 48%, #202b44 100%);
+        }
+        .weather-effect {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            opacity: 0.28;
+            background-image:
+                linear-gradient(90deg, rgba(255,255,255,0.08) 1px, transparent 1px),
+                linear-gradient(rgba(255,255,255,0.06) 1px, transparent 1px);
+            background-size: 58px 58px;
+            mask-image: linear-gradient(180deg, transparent, #000 18%, #000 74%, transparent);
+        }
+        .weather-glass {
+            position: relative;
+            z-index: 1;
+            padding: 22px 28px 20px 28px;
+            border-radius: 16px;
+            background: rgba(15, 23, 42, 0.12);
+            backdrop-filter: blur(6px);
+        }
+        .weather-top {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 18px;
+            align-items: start;
+        }
+        .weather-now {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+            min-width: 0;
+        }
+        .weather-visual-badge {
+            width: 72px;
+            height: 72px;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            flex: 0 0 auto;
+            background: rgba(255, 255, 255, 0.10);
+        }
+        .weather-visual-badge .weather-hero-img {
+            width: 82px;
+            height: 82px;
+            object-fit: contain;
+            filter: drop-shadow(0 12px 16px rgba(0,0,0,0.25));
+        }
+        .weather-visual-badge .weather-hero-fallback {
+            width: 58px;
+            height: 58px;
+            font-size: 13px;
+            background: rgba(255, 255, 255, 0.16);
+            color: #ffffff;
+        }
+        .weather-desc {
+            color: #ffffff;
+            font-size: 30px;
+            line-height: 1.05;
+            margin: 0;
+            font-weight: 800;
+            text-transform: capitalize;
+        }
+        .weather-location {
+            color: rgba(255, 255, 255, 0.68);
+            font-size: 14px;
+            font-weight: 700;
+            margin-top: 2px;
+        }
+        .weather-tower {
+            color: rgba(255, 255, 255, 0.72);
+            font-size: 12px;
+            margin-top: 5px;
+        }
+        .weather-temp-block {
+            text-align: right;
+        }
+        .weather-temp {
+            color: #ffffff;
+            font-size: 34px;
+            line-height: 1;
+            font-weight: 800;
+            margin: 0;
+        }
+        .weather-range {
+            color: rgba(255, 255, 255, 0.58);
+            font-size: 13px;
+            margin-top: 5px;
+            font-weight: 700;
+        }
+        .weather-attribute-list {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px 24px;
+            margin-top: 20px;
+        }
+        .weather-attribute-list div {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            color: rgba(255, 255, 255, 0.78);
+            font-size: 13px;
+            font-weight: 650;
+        }
+        .weather-attribute-list strong {
+            color: #ffffff;
+            white-space: nowrap;
+        }
+        .weather-forecast-row {
+            display: grid;
+            grid-template-columns: minmax(260px, 0.9fr) minmax(360px, 1.1fr);
+            gap: 16px;
+            align-items: center;
+            margin-top: 18px;
+        }
+        .weather-forecast-copy span,
+        .weather-forecast-copy small {
+            display: block;
+            color: rgba(255, 255, 255, 0.66);
+            font-size: 12px;
+        }
+        .weather-forecast-copy strong {
+            display: block;
+            color: #ffffff;
+            font-size: 15px;
+            margin: 5px 0 6px 0;
+        }
+        .weather-trend-svg {
+            width: 100%;
+            height: 110px;
+            display: block;
+            overflow: visible;
+        }
+        .weather-trend-grid line {
+            stroke: rgba(255, 255, 255, 0.18);
+            stroke-dasharray: 4 5;
+        }
+        .weather-trend-rain rect {
+            fill: rgba(96, 165, 250, 0.75);
+        }
+        .weather-trend-line {
+            fill: none;
+            stroke: #f59e0b;
+            stroke-width: 4;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        .weather-trend-points circle {
+            fill: #111827;
+            stroke: #f59e0b;
+            stroke-width: 2;
+        }
+        .weather-forecast-strip {
+            display: flex;
+            gap: 14px;
+            overflow-x: auto;
+            padding: 12px 2px 8px 2px;
+            margin-top: 2px;
+        }
+        .weather-forecast-item {
+            flex: 0 0 74px;
+            min-width: 74px;
+            border: 0;
+            border-radius: 0;
+            background: transparent;
+            color: rgba(255, 255, 255, 0.74);
+            padding: 0;
+            display: grid;
+            grid-template-rows: 18px 34px 18px 16px 16px 28px;
+            justify-items: center;
+            gap: 1px;
+            text-align: center;
+        }
+        .weather-forecast-item span,
+        .weather-forecast-item small {
+            color: rgba(255, 255, 255, 0.72);
+            font-size: 11px;
+        }
+        .weather-forecast-item img {
+            width: 34px;
+            height: 34px;
+            object-fit: contain;
+            filter: drop-shadow(0 8px 10px rgba(0,0,0,0.25));
+            margin: 0;
+        }
+        .weather-forecast-item b {
+            color: #ffffff;
+            font-size: 13px;
+        }
+        .weather-forecast-item em {
+            max-width: 70px;
+            color: rgba(255, 255, 255, 0.62);
+            font-size: 10px;
+        }
+        .weather-forecast-item strong {
+            background: rgba(255, 255, 255, 0.15);
+            color: #fff;
+        }
+        .weather-precip-track {
+            width: 22px;
+            height: 28px;
+            background: rgba(255, 255, 255, 0.14);
+        }
+        .weather-precip-track i {
+            background: linear-gradient(180deg, #7dd3fc, #2563eb);
+        }
+        .weather-storm {
+            margin-top: 12px;
+            border-radius: 999px;
+            padding: 8px 12px;
+            border: 1px solid rgba(255, 255, 255, 0.16);
+            background: rgba(15, 23, 42, 0.16);
+        }
+        .weather-storm span {
+            color: rgba(255, 255, 255, 0.58);
+            font-size: 11px;
+        }
+        .weather-storm strong {
+            color: #ffffff;
+            font-size: 12px;
+        }
+        .weather-storm-active {
+            border-color: rgba(251, 191, 36, 0.72);
+            background: rgba(251, 146, 60, 0.18);
+        }
+        .weather-footer {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 12px;
+            color: rgba(255, 255, 255, 0.54);
+            font-size: 11px;
+            flex-wrap: wrap;
+        }
+        @media (max-width: 900px) {
+            .weather-glass {
+                padding: 18px;
+            }
+            .weather-top,
+            .weather-forecast-row {
+                grid-template-columns: 1fr;
+            }
+            .weather-temp-block {
+                text-align: left;
+            }
+            .weather-attribute-list {
+                grid-template-columns: 1fr;
+                gap: 7px;
+            }
+        }
+        @media (max-width: 640px) {
+            .weather-card {
+                border-radius: 10px;
+            }
+            .weather-glass {
+                padding: 14px;
+                border-radius: 10px;
+            }
+            .weather-now {
+                gap: 12px;
+            }
+            .weather-visual-badge {
+                width: 54px;
+                height: 54px;
+            }
+            .weather-visual-badge .weather-hero-img {
+                width: 64px;
+                height: 64px;
+            }
+            .weather-desc {
+                font-size: 22px;
+            }
+            .weather-temp {
+                font-size: 30px;
+            }
+            .weather-forecast-strip {
+                gap: 10px;
+            }
+            .weather-forecast-item {
+                flex-basis: 66px;
+                min-width: 66px;
+            }
+        }
+        /* Home Assistant-style compact forecast card override */
+        .weather-card-wrap {
+            place-items: start center;
+            margin: 10px 0 12px 0;
+        }
+        .weather-card {
+            width: min(100%, 760px);
+            border-radius: 14px;
+            background:
+                radial-gradient(circle at 70% -20%, rgba(255, 236, 148, 0.86), rgba(255, 236, 148, 0.05) 16%, transparent 28%),
+                radial-gradient(circle at -5% 115%, rgba(239, 68, 68, 0.62), transparent 30%),
+                linear-gradient(135deg, #1277a6 0%, #145875 50%, #163f58 100%);
+            box-shadow: 0 14px 34px rgba(15, 23, 42, 0.20);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+        }
+        .weather-glass {
+            padding: 18px 20px 16px 20px;
+            background: rgba(15, 23, 42, 0.08);
+            border-radius: 14px;
+        }
+        .weather-top {
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 14px;
+        }
+        .weather-now {
+            gap: 14px;
+        }
+        .weather-visual-badge {
+            width: 58px;
+            height: 58px;
+            background: rgba(255, 255, 255, 0.11);
+        }
+        .weather-visual-badge .weather-hero-img {
+            width: 68px;
+            height: 68px;
+        }
+        .weather-desc {
+            font-size: 23px;
+            letter-spacing: 0;
+        }
+        .weather-location {
+            font-size: 12px;
+            margin-top: 3px;
+        }
+        .weather-tower {
+            font-size: 11px;
+            margin-top: 2px;
+        }
+        .weather-temp {
+            font-size: 29px;
+        }
+        .weather-range {
+            font-size: 11px;
+        }
+        .weather-attribute-list {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 7px 22px;
+            margin-top: 16px;
+        }
+        .weather-attribute-list div {
+            font-size: 12px;
+        }
+        .weather-forecast-row {
+            grid-template-columns: minmax(0, 0.7fr) minmax(280px, 1fr);
+            gap: 14px;
+            margin-top: 16px;
+        }
+        .weather-forecast-copy span,
+        .weather-forecast-copy small {
+            font-size: 11px;
+        }
+        .weather-forecast-copy strong {
+            font-size: 13px;
+            margin: 3px 0 5px 0;
+        }
+        .weather-trend-svg {
+            height: 76px;
+        }
+        .weather-forecast-strip {
+            gap: 12px;
+            padding: 8px 0 6px 0;
+            margin-top: 4px;
+            scrollbar-width: thin;
+        }
+        .weather-forecast-item {
+            flex-basis: 56px;
+            min-width: 56px;
+            grid-template-rows: 16px 28px 16px 14px 14px 22px;
+        }
+        .weather-forecast-item span,
+        .weather-forecast-item small,
+        .weather-forecast-item em {
+            font-size: 9px;
+        }
+        .weather-forecast-item img {
+            width: 28px;
+            height: 28px;
+        }
+        .weather-forecast-item b {
+            font-size: 11px;
+        }
+        .weather-precip-track {
+            width: 18px;
+            height: 22px;
+        }
+        .weather-storm {
+            margin-top: 8px;
+            padding: 7px 10px;
+        }
+        .weather-footer {
+            margin-top: 8px;
+            font-size: 10px;
+        }
+        @media (max-width: 820px) {
+            .weather-card {
+                width: 100%;
+            }
+            .weather-forecast-row {
+                grid-template-columns: 1fr;
+            }
+            .weather-trend-svg {
+                height: 70px;
+            }
+        }
+        @media (max-width: 520px) {
+            .weather-glass {
+                padding: 14px;
+            }
+            .weather-top {
+                grid-template-columns: 1fr;
+            }
+            .weather-temp-block {
+                text-align: left;
+            }
+            .weather-attribute-list {
+                grid-template-columns: 1fr;
+            }
+            .weather-desc {
+                font-size: 20px;
+            }
+            .weather-forecast-item {
+                flex-basis: 54px;
+                min-width: 54px;
+            }
+        }
+        /* Close visual match to troinine/ha-weather-forecast-card demo */
+        .weather-card-wrap {
+            place-items: start center;
+            margin: 10px 0;
+        }
+        .weather-card {
+            width: min(100%, 552px);
+            min-height: 428px;
+            border-radius: 14px;
+            color: #ffffff;
+            background:
+                radial-gradient(circle at 64% -8%, rgba(255, 248, 178, 0.96) 0 7%, rgba(255, 248, 178, 0.20) 10%, transparent 19%),
+                radial-gradient(circle at -8% 105%, rgba(239, 68, 68, 0.82), rgba(239, 68, 68, 0.34) 18%, transparent 38%),
+                linear-gradient(135deg, rgba(15, 132, 184, 0.96), rgba(20, 83, 115, 0.94) 52%, rgba(28, 65, 91, 0.95));
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: 0 18px 40px rgba(0, 0, 0, 0.24);
+        }
+        .weather-effect {
+            opacity: 0.18;
+            background-image:
+                linear-gradient(90deg, rgba(255,255,255,0.07) 1px, transparent 1px),
+                linear-gradient(rgba(255,255,255,0.055) 1px, transparent 1px);
+            background-size: 44px 44px;
+        }
+        .weather-glass {
+            min-height: 428px;
+            padding: 26px 34px 26px 34px;
+            background: rgba(15, 23, 42, 0.06);
+            border-radius: 14px;
+            display: grid;
+            grid-template-rows: auto auto 1fr auto auto;
+            gap: 0;
+        }
+        .weather-top {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            align-items: start;
+            gap: 16px;
+        }
+        .weather-now {
+            display: flex;
+            align-items: center;
+            gap: 18px;
+        }
+        .weather-visual-badge {
+            width: 54px;
+            height: 54px;
+            background: transparent;
+            border-radius: 50%;
+        }
+        .weather-visual-badge .weather-hero-img {
+            width: 64px;
+            height: 64px;
+            filter: brightness(1.2) drop-shadow(0 8px 12px rgba(0,0,0,0.18));
+        }
+        .weather-visual-badge .weather-hero-fallback {
+            width: 52px;
+            height: 52px;
+            background: #facc15;
+            color: #1f2937;
+        }
+        .weather-desc {
+            font-size: 30px;
+            line-height: 1;
+            font-weight: 800;
+            color: #ffffff;
+            margin: 0;
+        }
+        .weather-location {
+            font-size: 14px;
+            color: rgba(255, 255, 255, 0.66);
+            font-weight: 700;
+            margin-top: 4px;
+        }
+        .weather-tower {
+            display: none;
+        }
+        .weather-temp {
+            font-size: 30px;
+            line-height: 1;
+            color: #ffffff;
+            font-weight: 800;
+            margin: 0;
+        }
+        .weather-range {
+            font-size: 13px;
+            color: rgba(255, 255, 255, 0.48);
+            font-weight: 800;
+            margin-top: 8px;
+        }
+        .weather-attribute-list {
+            margin-top: 28px;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px 46px;
+        }
+        .weather-attribute-list div {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 10px;
+            color: rgba(255, 255, 255, 0.76);
+            font-size: 13px;
+            font-weight: 800;
+        }
+        .weather-attribute-list strong {
+            color: #ffffff;
+            white-space: nowrap;
+        }
+        .weather-forecast-row {
+            display: grid;
+            grid-template-columns: 0.92fr 1.08fr;
+            gap: 18px;
+            align-items: end;
+            margin-top: 22px;
+        }
+        .weather-forecast-copy span {
+            color: rgba(255,255,255,0.56);
+            font-size: 12px;
+        }
+        .weather-forecast-copy strong {
+            display: block;
+            color: #ffffff;
+            font-size: 13px;
+            line-height: 1.25;
+            margin-top: 6px;
+        }
+        .weather-forecast-copy small {
+            display: block;
+            color: rgba(255,255,255,0.58);
+            font-size: 10px;
+            margin-top: 6px;
+        }
+        .weather-trend-svg {
+            width: 100%;
+            height: 112px;
+        }
+        .weather-trend-grid line {
+            stroke: rgba(255,255,255,0.18);
+            stroke-dasharray: 5 5;
+        }
+        .weather-trend-rain rect {
+            fill: rgba(96, 165, 250, 0.62);
+        }
+        .weather-trend-line {
+            fill: none;
+            stroke: #f59e0b;
+            stroke-width: 4;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        .weather-trend-points circle {
+            fill: #11314a;
+            stroke: #f59e0b;
+            stroke-width: 2;
+        }
+        .weather-forecast-strip {
+            display: flex;
+            gap: 10px;
+            overflow-x: auto;
+            padding: 0 0 6px 0;
+            margin-top: -106px;
+            width: 100%;
+            scrollbar-width: none;
+        }
+        .weather-forecast-strip::-webkit-scrollbar {
+            display: none;
+        }
+        .weather-forecast-item {
+            flex: 0 0 50px;
+            min-width: 50px;
+            background: transparent;
+            border: 0;
+            color: #ffffff;
+            padding: 0;
+            display: grid;
+            grid-template-rows: 18px 26px 18px 13px 13px 28px 16px 24px;
+            justify-items: center;
+            text-align: center;
+            gap: 0;
+        }
+        .weather-forecast-item span {
+            color: rgba(255,255,255,0.54);
+            font-size: 12px;
+            font-weight: 800;
+        }
+        .weather-forecast-item img {
+            width: 28px;
+            height: 28px;
+            object-fit: contain;
+            filter: brightness(1.2) drop-shadow(0 6px 8px rgba(0,0,0,0.18));
+        }
+        .weather-forecast-item b {
+            color: #ffffff;
+            font-size: 12px;
+            line-height: 1;
+        }
+        .weather-forecast-item em {
+            max-width: 48px;
+            color: rgba(255,255,255,0.48);
+            font-size: 9px;
+            font-style: normal;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .weather-forecast-item small {
+            color: rgba(255,255,255,0.60);
+            font-size: 10px;
+        }
+        .weather-precip-track {
+            width: 18px;
+            height: 28px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.20);
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .weather-precip-track i {
+            width: 100%;
+            min-height: 3px;
+            background: linear-gradient(180deg, #93c5fd, #3b82f6);
+        }
+        .weather-forecast-item label {
+            color: rgba(255,255,255,0.76);
+            font-size: 10px;
+            font-weight: 800;
+            min-height: 14px;
+        }
+        .weather-forecast-item mark {
+            display: grid;
+            place-items: center;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            color: #ffffff;
+            font-size: 11px;
+            font-weight: 800;
+            background: rgba(15,23,42,0.38);
+            border: 3px solid #f59e0b;
+            padding: 0;
+        }
+        .weather-storm {
+            margin-top: 8px;
+            border-radius: 999px;
+            padding: 8px 12px;
+            background: rgba(15,23,42,0.20);
+            border: 1px solid rgba(245,158,11,0.80);
+        }
+        .weather-storm span {
+            color: rgba(255,255,255,0.54);
+            font-size: 10px;
+        }
+        .weather-storm strong {
+            display: block;
+            color: #ffffff;
+            font-size: 11px;
+            margin-top: 2px;
+        }
+        .weather-footer {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 8px;
+            color: rgba(255,255,255,0.46);
+            font-size: 10px;
+            flex-wrap: wrap;
+        }
+        @media (max-width: 640px) {
+            .weather-card {
+                width: 100%;
+                min-height: 0;
+            }
+            .weather-glass {
+                min-height: 0;
+                padding: 16px;
+            }
+            .weather-top,
+            .weather-forecast-row {
+                grid-template-columns: 1fr;
+            }
+            .weather-temp-block {
+                text-align: left;
+            }
+            .weather-attribute-list {
+                grid-template-columns: 1fr;
+                gap: 8px;
+                margin-top: 18px;
+            }
+            .weather-forecast-strip {
+                margin-top: 10px;
+            }
+            .weather-trend-svg {
+                height: 86px;
+            }
+        }
+        /* Transmission fault report weather card */
+        .weather-card-wrap {
+            place-items: stretch;
+            margin: 10px 0 12px 0;
+        }
+        .weather-card {
+            width: 100%;
+            min-height: 0;
+            border-radius: 10px;
+            color: #0f172a;
+            background: linear-gradient(135deg, #f8fafc 0%, #dbeafe 100%);
+            border: 1px solid rgba(148, 163, 184, 0.46);
+            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.11);
+        }
+        .weather-effect {
+            display: none;
+        }
+        .weather-glass {
+            min-height: 0;
+            padding: 16px;
+            border-radius: 10px;
+            background: transparent;
+            display: grid;
+            grid-template-rows: auto;
+        }
+        .weather-top {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 16px;
+            align-items: start;
+            padding-bottom: 12px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.32);
+        }
+        .weather-now {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            min-width: 0;
+        }
+        .weather-visual-badge {
+            width: 64px;
+            height: 64px;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(203, 213, 225, 0.75);
+            box-shadow: inset 0 1px 8px rgba(255,255,255,0.55);
+        }
+        .weather-visual-badge .weather-hero-img {
+            width: 62px;
+            height: 62px;
+            filter: drop-shadow(0 8px 10px rgba(15,23,42,0.16));
+        }
+        .weather-visual-badge .weather-hero-fallback {
+            width: 46px;
+            height: 46px;
+            background: #0f172a;
+            color: #ffffff;
+            font-size: 11px;
+        }
+        .weather-desc {
+            color: #0f172a;
+            font-size: 24px;
+            line-height: 1.1;
+            font-weight: 800;
+            margin: 0;
+            text-transform: capitalize;
+        }
+        .weather-location {
+            color: #ef4444;
+            font-size: 12px;
+            font-weight: 800;
+            margin-top: 5px;
+        }
+        .weather-tower {
+            display: block;
+            color: #334155;
+            font-size: 12px;
+            font-weight: 700;
+            margin-top: 3px;
+        }
+        .weather-temp-block {
+            text-align: right;
+            min-width: 120px;
+        }
+        .weather-temp {
+            color: #0f172a;
+            font-size: 34px;
+            line-height: 1;
+            font-weight: 850;
+            margin: 0;
+        }
+        .weather-range {
+            color: #64748b;
+            font-size: 12px;
+            font-weight: 700;
+            margin-top: 5px;
+        }
+        .weather-attribute-list {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .weather-attribute-list div {
+            display: block;
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.76);
+            background: rgba(255, 255, 255, 0.70);
+            padding: 8px 9px;
+            color: #64748b;
+            font-size: 11px;
+            font-weight: 650;
+        }
+        .weather-attribute-list strong {
+            display: block;
+            margin-top: 2px;
+            color: #0f172a;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+        .weather-forecast-row {
+            display: grid;
+            grid-template-columns: minmax(0, 0.75fr) minmax(320px, 1.25fr);
+            gap: 14px;
+            align-items: center;
+            margin-top: 12px;
+        }
+        .weather-forecast-copy {
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.76);
+            background: rgba(255, 255, 255, 0.64);
+            padding: 10px;
+            min-width: 0;
+        }
+        .weather-forecast-copy span,
+        .weather-forecast-copy small {
+            display: block;
+            color: #64748b;
+            font-size: 11px;
+        }
+        .weather-forecast-copy strong {
+            display: block;
+            color: #0f172a;
+            font-size: 13px;
+            line-height: 1.3;
+            margin: 4px 0 5px 0;
+        }
+        .weather-trend-svg {
+            height: 88px;
+            width: 100%;
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.76);
+            background: rgba(255, 255, 255, 0.52);
+        }
+        .weather-trend-grid line {
+            stroke: rgba(100, 116, 139, 0.22);
+            stroke-dasharray: 4 5;
+        }
+        .weather-trend-rain rect {
+            fill: rgba(59, 130, 246, 0.46);
+        }
+        .weather-trend-line {
+            fill: none;
+            stroke: #f59e0b;
+            stroke-width: 4;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        .weather-trend-points circle {
+            fill: #ffffff;
+            stroke: #f59e0b;
+            stroke-width: 2;
+        }
+        .weather-forecast-strip {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding: 10px 0 4px 0;
+            margin-top: 2px;
+            scrollbar-width: thin;
+        }
+        .weather-forecast-item {
+            flex: 0 0 82px;
+            min-width: 82px;
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.78);
+            background: rgba(255, 255, 255, 0.70);
+            color: #0f172a;
+            padding: 7px 6px;
+            display: grid;
+            grid-template-rows: 16px 30px 16px 15px 14px 22px 12px 22px;
+            justify-items: center;
+            gap: 1px;
+            text-align: center;
+        }
+        .weather-forecast-item span,
+        .weather-forecast-item small {
+            color: #64748b;
+            font-size: 10px;
+            font-weight: 700;
+        }
+        .weather-forecast-item img {
+            width: 30px;
+            height: 30px;
+            object-fit: contain;
+            filter: drop-shadow(0 6px 8px rgba(15,23,42,0.14));
+        }
+        .weather-forecast-item b {
+            color: #0f172a;
+            font-size: 12px;
+            line-height: 1;
+        }
+        .weather-forecast-item em {
+            max-width: 72px;
+            color: #334155;
+            font-size: 10px;
+            font-style: normal;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .weather-forecast-item label {
+            color: #475569;
+            font-size: 9px;
+            font-weight: 700;
+            min-height: 10px;
+        }
+        .weather-forecast-item mark {
+            display: grid;
+            place-items: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            color: #0f172a;
+            background: #ffffff;
+            border: 3px solid #f59e0b;
+            font-size: 10px;
+            font-weight: 800;
+            padding: 0;
+        }
+        .weather-precip-track {
+            width: 18px;
+            height: 22px;
+            border-radius: 999px;
+            background: rgba(203, 213, 225, 0.58);
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            overflow: hidden;
+        }
+        .weather-precip-track i {
+            width: 100%;
+            min-height: 3px;
+            background: linear-gradient(180deg, #60a5fa, #2563eb);
+        }
+        .weather-storm {
+            margin-top: 10px;
+            border-radius: 8px;
+            padding: 8px 10px;
+            background: rgba(255, 237, 213, 0.82);
+            border: 1px solid rgba(249, 115, 22, 0.62);
+        }
+        .weather-storm span {
+            display: block;
+            color: #9a3412;
+            font-size: 11px;
+            margin-bottom: 2px;
+        }
+        .weather-storm strong {
+            color: #0f172a;
+            font-size: 12px;
+        }
+        .weather-footer {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            margin-top: 9px;
+            color: #64748b;
+            font-size: 10px;
+            flex-wrap: wrap;
+        }
+        @media (max-width: 1000px) {
+            .weather-attribute-list {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+            }
+            .weather-forecast-row {
+                grid-template-columns: 1fr;
+            }
+        }
+        @media (max-width: 640px) {
+            .weather-glass {
+                padding: 12px;
+            }
+            .weather-top {
+                grid-template-columns: 1fr;
+            }
+            .weather-temp-block {
+                text-align: left;
+            }
+            .weather-attribute-list {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .weather-desc {
+                font-size: 21px;
+            }
+            .weather-forecast-item {
+                flex-basis: 78px;
+                min-width: 78px;
+            }
+        }
         </style>
         <div class="weather-card-wrap">
-        """
+        """)
         + "".join(cards_html)
         + "</div>"
     )
@@ -2924,79 +5190,658 @@ def get_fault_adjacent_tower_rows(map_df: pd.DataFrame, distance_km: float):
     ]
 
 
+def weather_card_html(weather_rows):
+    cards_html = []
+    for row in weather_rows:
+        forecast = row.get("Forecast Summary") or {}
+        forecast_items = forecast.get("items", [])
+        theme = weather_theme_for_code(row.get("Weather Code"))
+        icon_url = row.get("Weather Icon URL")
+        if icon_url:
+            visual_html = f"<img class='weather-icon-main' src='{icon_url}' alt='{row.get('Current Weather', 'Weather')}' />"
+        else:
+            visual_html = f"<div class='weather-icon-fallback'>{weather_icon_for_code(row.get('Weather Code'))}</div>"
+
+        thunder_text = row.get("Last Thunderstorm Indication", "-")
+        storm_class = "weather-storm-muted"
+        if row.get("Last Thunderstorm Time"):
+            thunder_text = f"{row.get('Last Thunderstorm Time')} | {row.get('Last Thunderstorm Weather', '-')}"
+            storm_class = "weather-storm-active"
+
+        forecast_items_html = ""
+        temp_values = []
+        for item in forecast_items[:8]:
+            temp_value = item.get("temperature_c")
+            try:
+                temp_values.append(float(temp_value))
+            except (TypeError, ValueError):
+                pass
+            item_icon = (
+                f"<img src='{item.get('icon_url')}' alt='{item.get('description', 'Forecast')}' />"
+                if item.get("icon_url")
+                else f"<strong>{weather_icon_for_code(item.get('weather_code'))}</strong>"
+            )
+            pop_label = f"{item.get('pop_pct')}%" if item.get("pop_pct") is not None else "-"
+            forecast_items_html += (
+                "<div class='forecast-item'>"
+                f"<span>{item.get('time', '-')}</span>"
+                f"{item_icon}"
+                f"<b>{safe_display_number(temp_value, 0, '°C')}</b>"
+                f"<em>{item.get('description', '-')}</em>"
+                f"<small>{pop_label}</small>"
+                "</div>"
+            )
+
+        temp_range = "-"
+        if temp_values:
+            temp_range = f"{safe_display_number(min(temp_values), 0, ' C')} - {safe_display_number(max(temp_values), 0, ' C')}"
+        forecast_pop = f"{forecast.get('max_pop') * 100.0:.0f}%" if forecast.get("max_pop") is not None else "-"
+        forecast_precip = safe_display_number(forecast.get("total_precip_mm", 0.0), 2, " mm")
+        forecast_signal = "Ada potensi petir" if forecast.get("thunder_count", 0) else "Tidak ada sinyal petir kuat"
+
+        cards_html.append(
+            f"""
+            <div class="weather-card weather-theme-{theme}">
+                <section class="current-panel">
+                    <div class="current-head">
+                        <div>
+                            <div class="weather-role">{row.get('Location', '-')}</div>
+                            <div class="weather-title">{row.get('Tower', '-')}</div>
+                            <div class="weather-temp">{safe_display_number(row.get('Temperature C'), 1, ' C')}</div>
+                            <div class="weather-desc">{row.get('Current Weather', '-')}</div>
+                        </div>
+                        <div class="weather-visual">
+                            {visual_html}
+                            <div>{str(row.get('Current Weather') or '-').title()}</div>
+                        </div>
+                    </div>
+                    <div class="metric-grid">
+                        <div><span>Hujan saat ini</span><strong>{safe_display_number(row.get('Rain mm'), 2, ' mm')}</strong></div>
+                        <div><span>Kelembapan</span><strong>{safe_display_number(row.get('Humidity %'), 0, '%')}</strong></div>
+                        <div><span>Tutupan awan</span><strong>{safe_display_number(row.get('Cloud Cover %'), 0, '%')}</strong></div>
+                        <div><span>Kecepatan angin</span><strong>{safe_display_number(row.get('Wind km/h'), 1, ' km/h')}</strong></div>
+                    </div>
+                    <div class="storm-box {storm_class}">
+                        <span>Indikasi thunderstorm</span>
+                        <strong>{thunder_text}</strong>
+                    </div>
+                    <div class="weather-meta">
+                        <span>Kumulatif {safe_display_number(row.get('Cumulative km'), 3, ' km')}</span>
+                        <span>{safe_display_number(row.get('Latitude'), 6)}, {safe_display_number(row.get('Longitude'), 6)}</span>
+                    </div>
+                    <div class="weather-time">Update cuaca: {row.get('Weather Time') or '-'} | {row.get('Weather Source', '-')}</div>
+                </section>
+                <section class="forecast-panel">
+                    <div class="forecast-copy">
+                        <span>Prakiraan 12 jam ke depan</span>
+                        <strong>{forecast.get('summary', 'Forecast belum tersedia.')}</strong>
+                    </div>
+                    <div class="forecast-metrics">
+                        <div><span>Peluang hujan tertinggi</span><strong>{forecast_pop}</strong></div>
+                        <div><span>Perkiraan hujan total</span><strong>{forecast_precip}</strong></div>
+                        <div><span>Rentang suhu</span><strong>{temp_range}</strong></div>
+                        <div><span>Indikasi petir</span><strong>{forecast_signal}</strong></div>
+                    </div>
+                    <div class="forecast-strip">
+                        {forecast_items_html}
+                    </div>
+                </section>
+            </div>
+            """
+        )
+
+    return (
+        """
+        <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        .weather-card-wrap {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            gap: 14px;
+        }
+        .weather-card {
+            display: grid;
+            grid-template-columns: minmax(360px, 0.92fr) minmax(420px, 1.08fr);
+            gap: 12px;
+            padding: 14px;
+            border-radius: 10px;
+            border: 1px solid rgba(148, 163, 184, 0.46);
+            background: linear-gradient(135deg, #f8fafc 0%, #dbeafe 100%);
+            color: #0f172a;
+            box-shadow: 0 10px 26px rgba(15, 23, 42, 0.11);
+        }
+        .weather-theme-clear { background: linear-gradient(135deg, #fff7ed 0%, #dbeafe 100%); }
+        .weather-theme-cloud { background: linear-gradient(135deg, #f8fafc 0%, #dbeafe 56%, #e2e8f0 100%); }
+        .weather-theme-rain { background: linear-gradient(135deg, #eef6ff 0%, #c7d2fe 100%); }
+        .weather-theme-storm { background: linear-gradient(135deg, #eef2ff 0%, #fed7aa 100%); }
+        .weather-theme-mist { background: linear-gradient(135deg, #f8fafc 0%, #e5e7eb 100%); }
+        .current-panel,
+        .forecast-panel {
+            min-width: 0;
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.72);
+            background: rgba(255, 255, 255, 0.56);
+            padding: 12px;
+        }
+        .current-head {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 14px;
+            align-items: start;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.28);
+        }
+        .weather-role {
+            color: #ef4444;
+            font-size: 12px;
+            font-weight: 800;
+        }
+        .weather-title {
+            color: #0f172a;
+            font-size: 13px;
+            font-weight: 800;
+            margin-top: 3px;
+        }
+        .weather-temp {
+            font-size: 40px;
+            line-height: 1;
+            font-weight: 850;
+            margin-top: 18px;
+        }
+        .weather-desc {
+            color: #334155;
+            font-size: 16px;
+            margin-top: 5px;
+            text-transform: capitalize;
+        }
+        .weather-visual {
+            width: 130px;
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.74);
+            background: rgba(255, 255, 255, 0.70);
+            display: grid;
+            place-items: center;
+            padding: 8px;
+            text-align: center;
+            color: #0f172a;
+            font-size: 12px;
+            font-weight: 800;
+        }
+        .weather-icon-main {
+            width: 92px;
+            height: 92px;
+            object-fit: contain;
+            filter: drop-shadow(0 8px 10px rgba(15,23,42,0.16));
+        }
+        .weather-icon-fallback {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            display: grid;
+            place-items: center;
+            background: #0f172a;
+            color: #ffffff;
+            font-size: 13px;
+            font-weight: 800;
+        }
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .metric-grid div,
+        .forecast-metrics div,
+        .forecast-item {
+            border-radius: 8px;
+            border: 1px solid rgba(203, 213, 225, 0.76);
+            background: rgba(255, 255, 255, 0.70);
+        }
+        .metric-grid div,
+        .forecast-metrics div {
+            padding: 8px 9px;
+        }
+        .metric-grid span,
+        .forecast-metrics span,
+        .storm-box span,
+        .forecast-copy span {
+            display: block;
+            color: #64748b;
+            font-size: 11px;
+            margin-bottom: 2px;
+        }
+        .metric-grid strong,
+        .forecast-metrics strong,
+        .storm-box strong,
+        .forecast-copy strong {
+            color: #0f172a;
+            font-size: 13px;
+        }
+        .storm-box {
+            margin-top: 9px;
+            border-radius: 8px;
+            padding: 8px 10px;
+            background: rgba(255, 237, 213, 0.82);
+            border: 1px solid rgba(249, 115, 22, 0.62);
+        }
+        .storm-box span { color: #9a3412; }
+        .weather-meta,
+        .weather-time {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            color: #64748b;
+            font-size: 10px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+        .forecast-copy {
+            padding-bottom: 8px;
+        }
+        .forecast-copy strong {
+            display: block;
+            line-height: 1.3;
+        }
+        .forecast-metrics {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 8px;
+            margin-top: 2px;
+        }
+        .forecast-strip {
+            display: flex;
+            gap: 8px;
+            overflow-x: auto;
+            padding-top: 10px;
+            scrollbar-width: thin;
+        }
+        .forecast-item {
+            flex: 0 0 82px;
+            min-width: 82px;
+            padding: 7px 6px;
+            display: grid;
+            grid-template-rows: 16px 30px 16px 15px 14px;
+            justify-items: center;
+            gap: 1px;
+            text-align: center;
+        }
+        .forecast-item span,
+        .forecast-item small {
+            color: #64748b;
+            font-size: 10px;
+            font-weight: 700;
+        }
+        .forecast-item img {
+            width: 30px;
+            height: 30px;
+            object-fit: contain;
+            filter: drop-shadow(0 6px 8px rgba(15,23,42,0.14));
+        }
+        .forecast-item b {
+            color: #0f172a;
+            font-size: 12px;
+            line-height: 1;
+        }
+        .forecast-item em {
+            max-width: 72px;
+            color: #334155;
+            font-size: 10px;
+            font-style: normal;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .forecast-item strong {
+            display: grid;
+            place-items: center;
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: #0f172a;
+            color: #ffffff;
+            font-size: 9px;
+        }
+        @media (max-width: 980px) {
+            .weather-card {
+                grid-template-columns: 1fr;
+            }
+            .forecast-metrics {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        @media (max-width: 640px) {
+            .weather-card {
+                padding: 10px;
+            }
+            .current-head {
+                grid-template-columns: 1fr;
+            }
+            .weather-visual {
+                width: 100%;
+                grid-template-columns: auto 1fr;
+                justify-content: start;
+                text-align: left;
+            }
+            .weather-icon-main {
+                width: 58px;
+                height: 58px;
+            }
+            .metric-grid,
+            .forecast-metrics {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+        </style>
+        <div class="weather-card-wrap">
+        """
+        + "".join(cards_html)
+        + "</div>"
+    )
+
+
+def weather_card_html(weather_rows):
+    cards_html = []
+    for row in weather_rows:
+        forecast = row.get("Forecast Summary") or {}
+        forecast_items = forecast.get("items", [])[:8]
+        current_icon = f"<div class='weather-symbol weather-symbol-{weather_theme_for_code(row.get('Weather Code'))}'>{weather_symbol_for_code(row.get('Weather Code'))}</div>"
+        forecast_cards = ""
+        rain_bars = ""
+        max_pop_seen = 1
+        for item in forecast_items:
+            try:
+                max_pop_seen = max(max_pop_seen, int(item.get("pop_pct") or 0))
+            except (TypeError, ValueError):
+                pass
+        for item in forecast_items:
+            item_icon = f"<strong class='weather-symbol-mini weather-symbol-{weather_theme_for_code(item.get('weather_code'))}'>{weather_symbol_for_code(item.get('weather_code'))}</strong>"
+            temp_value = item.get("temperature_c")
+            try:
+                pop_num = int(item.get("pop_pct") or 0)
+            except (TypeError, ValueError):
+                pop_num = 0
+            bar_height = 12 + (pop_num / max_pop_seen) * 58
+            forecast_cards += (
+                "<div class='daily-card'>"
+                f"<span>{item.get('time', '-')}</span>"
+                f"{item_icon}"
+                f"<b>{safe_display_number(temp_value, 0, ' C')}</b>"
+                f"<small>{item.get('description', '-')}</small>"
+                "</div>"
+            )
+            rain_bars += (
+                "<div class='rain-bar-wrap'>"
+                f"<i style='height:{bar_height:.0f}px'></i>"
+                f"<span>{pop_num}%</span>"
+                f"<small>{item.get('time', '-')}</small>"
+                "</div>"
+            )
+        forecast_pop = f"{forecast.get('max_pop') * 100.0:.0f}%" if forecast.get("max_pop") is not None else "-"
+        forecast_precip = safe_display_number(forecast.get("total_precip_mm", 0.0), 2, " mm")
+        forecast_signal = "Ada potensi petir" if forecast.get("thunder_count", 0) else "Tidak ada sinyal petir kuat"
+        trend_svg = build_weather_trend_svg(forecast_items)
+        cards_html.append(
+            textwrap.dedent(f"""
+            <div class="dashboard-weather-card">
+                <aside class="dashboard-current">
+                    <div class="dashboard-location">
+                        <strong>{row.get('Location', '-')}</strong>
+                        <span>{row.get('Tower', '-')}</span>
+                    </div>
+                    <div class="dashboard-update">{row.get('Weather Time') or '-'}</div>
+                    <div class="dashboard-icon">{current_icon}</div>
+                    <div class="dashboard-condition">{row.get('Current Weather', '-')}</div>
+                    <div class="dashboard-temp">{safe_display_number(row.get('Temperature C'), 1, '°C')}</div>
+                    <div class="dashboard-feels">Terasa seperti {safe_display_number(row.get('Feels Like C'), 1, '°C')}</div>
+                    <div class="dashboard-metrics-list">
+                        <div><span>Hujan</span><b>{safe_display_number(row.get('Rain mm'), 2, ' mm')}</b></div>
+                        <div><span>Angin</span><b>{safe_display_number(row.get('Wind km/h'), 1, ' km/h')}</b></div>
+                        <div><span>Kelembapan</span><b>{safe_display_number(row.get('Humidity %'), 0, '%')}</b></div>
+                        <div><span>Tutupan awan</span><b>{safe_display_number(row.get('Cloud Cover %'), 0, '%')}</b></div>
+                        <div><span>Kumulatif fault</span><b>{safe_display_number(row.get('Cumulative km'), 3, ' km')}</b></div>
+                    </div>
+                </aside>
+                <main class="dashboard-forecast">
+                    <section class="dashboard-tile temp-tile">
+                        <header>Tren suhu, °C</header>
+                        {trend_svg}
+                    </section>
+                    <section class="dashboard-tile rain-tile">
+                        <header>Peluang hujan, %</header>
+                        <div class="rain-bars">{rain_bars}</div>
+                    </section>
+                    <section class="dashboard-tile summary-tile compact-summary">
+                        <header>Ringkasan titik gangguan</header>
+                        <strong>{forecast.get('summary', 'Forecast belum tersedia.')}</strong>
+                        <div><span>Peluang hujan tertinggi</span><b>{forecast_pop}</b></div>
+                        <div><span>Perkiraan hujan total</span><b>{forecast_precip}</b></div>
+                    </section>
+                    <section class="dashboard-daily">{forecast_cards}</section>
+                    <section class="dashboard-note">
+                        <small>{safe_display_number(row.get('Latitude'), 6)}, {safe_display_number(row.get('Longitude'), 6)} | {row.get('Weather Source', '-')}</small>
+                    </section>
+                </main>
+            </div>
+            """).strip()
+        )
+    return (
+        textwrap.dedent("""
+        <style>
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #111827; }
+        .weather-card-wrap { display: grid; gap: 16px; }
+        .dashboard-weather-card {
+            width: min(100%, 1440px);
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 250px minmax(0, 1fr);
+            border-radius: 14px;
+            overflow: hidden;
+            background: #ffffff;
+            border: 1px solid rgba(148, 163, 184, 0.34);
+            box-shadow: none;
+        }
+        .dashboard-current {
+            background: linear-gradient(180deg, #fbfdff 0%, #f8fafc 100%);
+            padding: 18px 22px;
+            border-right: 1px solid rgba(226, 232, 240, 0.9);
+        }
+        .dashboard-location { display: grid; gap: 4px; font-size: 12px; color: #111827; }
+        .dashboard-location span, .dashboard-update, .dashboard-feels { color: #6b7280; font-size: 12px; }
+        .dashboard-update { margin-top: 14px; text-align: center; }
+        .dashboard-icon { width: 104px; height: 104px; display: grid; place-items: center; margin: 12px auto 4px auto; }
+        .weather-symbol { font-size: 78px; line-height: 1; filter: drop-shadow(0 6px 8px rgba(15,23,42,0.18)); }
+        .weather-symbol-mini { display: block; font-size: 30px; line-height: 1; background: transparent; color: inherit; }
+        .weather-symbol-clear { color: #f59e0b; }
+        .weather-symbol-cloud { color: #64748b; }
+        .weather-symbol-rain { color: #2563eb; }
+        .weather-symbol-storm { color: #d97706; }
+        .weather-symbol-mist, .weather-symbol-neutral { color: #475569; }
+        .dashboard-condition { text-align: center; text-transform: capitalize; font-size: 13px; color: #111827; }
+        .dashboard-temp { text-align: center; font-size: 54px; line-height: 1; font-weight: 300; color: #f59e0b; margin-top: 8px; }
+        .dashboard-feels { text-align: center; margin-top: 6px; }
+        .dashboard-metrics-list { display: grid; gap: 9px; margin-top: 18px; }
+        .dashboard-metrics-list div { display: flex; justify-content: space-between; gap: 16px; align-items: center; font-size: 13px; }
+        .dashboard-metrics-list b { color: #111827; font-weight: 700; white-space: nowrap; }
+        .dashboard-metrics-list b::before { display: none; }
+        .dashboard-forecast { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-auto-rows: min-content; gap: 12px; padding: 18px 22px; background: #ffffff; }
+        .dashboard-tile, .dashboard-note { border-radius: 8px; background: #f8fafc; border: 1px solid rgba(241, 245, 249, 0.95); padding: 14px; }
+        .dashboard-tile header { font-size: 14px; color: #111827; margin-bottom: 8px; }
+        .weather-trend-svg { width: 100%; height: 94px; display: block; }
+        .weather-trend-grid line { stroke: rgba(148, 163, 184, 0.35); stroke-dasharray: 4 5; }
+        .weather-trend-rain rect { fill: rgba(56, 189, 248, 0.45); }
+        .weather-trend-line { fill: none; stroke: #eab308; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; }
+        .weather-trend-points circle { fill: #f8fafc; stroke: #f59e0b; stroke-width: 2; }
+        .weather-trend-labels text { fill: #334155; font-size: 20px; font-weight: 700; }
+        .weather-trend-axis text { fill: #64748b; font-size: 16px; font-weight: 600; }
+        .rain-bars { height: 94px; display: flex; align-items: end; justify-content: space-between; gap: 8px; padding-top: 8px; }
+        .rain-bar-wrap { flex: 1; min-width: 24px; display: grid; grid-template-rows: 1fr auto auto; justify-items: center; align-items: end; gap: 4px; color: #6b7280; font-size: 10px; }
+        .rain-bar-wrap i { width: 100%; max-width: 28px; display: block; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #0ea5e9, #bae6fd); }
+        .summary-tile { grid-column: span 2; }
+        .compact-summary { display: grid; grid-template-columns: minmax(260px, 1.7fr) repeat(2, minmax(150px, 1fr)); gap: 10px; align-items: center; padding: 10px 12px; }
+        .compact-summary header { margin: 0; grid-column: 1 / -1; }
+        .compact-summary strong { display: block; font-size: 14px; line-height: 1.25; }
+        .compact-summary div { border-radius: 8px; background: #ffffff; border: 1px solid rgba(226,232,240,0.92); padding: 8px 10px; }
+        .compact-summary span { display: block; color: #6b7280; font-size: 11px; margin-bottom: 3px; }
+        .dashboard-daily { grid-column: span 2; display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; padding: 4px 0 0 0; }
+        .daily-card { min-height: 112px; display: grid; grid-template-columns: 1fr; grid-template-rows: auto 38px auto auto; justify-items: center; align-items: center; border-radius: 10px; background: #f8fafc; border: 1px solid rgba(226,232,240,0.95); padding: 10px 8px; text-align: center; }
+        .daily-card span { color: #6b7280; font-size: 11px; }
+        .daily-card img, .daily-card strong { width: 38px; height: 38px; object-fit: contain; filter: saturate(1.2) contrast(1.1); }
+        .daily-card b { font-size: 20px; font-weight: 500; }
+        .daily-card small { color: #9ca3af; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; font-size: 10px; }
+        .dashboard-note { grid-column: span 2; display: grid; gap: 4px; color: #6b7280; font-size: 11px; padding: 8px 10px; }
+        .dashboard-note b { color: #111827; }
+        @media (max-width: 900px) {
+            .dashboard-weather-card { grid-template-columns: 1fr; }
+            .dashboard-current { border-right: 0; border-bottom: 1px solid rgba(226,232,240,0.9); }
+            .dashboard-forecast { grid-template-columns: 1fr; }
+            .summary-tile, .dashboard-daily, .dashboard-note { grid-column: span 1; }
+            .compact-summary { grid-template-columns: 1fr; }
+            .compact-summary header { grid-column: auto; }
+            .dashboard-daily { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        }
+        @media (max-width: 520px) {
+            .dashboard-current, .dashboard-forecast { padding: 20px; }
+            .dashboard-temp { font-size: 46px; }
+            .dashboard-daily { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        </style>
+        <div class="weather-card-wrap">
+        """).strip()
+        + "".join(cards_html)
+        + "</div>"
+    )
+
+
 def render_fault_weather_lightning_summary(tower_df: pd.DataFrame, key_prefix: str = "summary_weather_lightning"):
     map_df = prepare_tower_map_dataframe(tower_df)
     selected_fault_option = get_selected_fault_location_option("summary_tower_fault")
     if map_df.empty or not selected_fault_option:
         return
-
-    adjacent_rows = get_fault_adjacent_tower_rows(map_df, selected_fault_option["distance_km"])
-    if not adjacent_rows:
-        st.info("Data tower terdekat belum cukup untuk mengambil cuaca sekitar titik gangguan.")
+    fault_location, fault_location_warning = interpolate_tower_path_location(
+        map_df,
+        selected_fault_option["distance_km"],
+    )
+    if not fault_location:
+        st.info(f"Data cuaca titik gangguan belum dapat ditampilkan: {fault_location_warning}")
         return
 
-    st.markdown("### Cuaca Terkini & Indikasi Petir")
+    st.markdown("### Cuaca Terkini")
     st.caption(
-        "Data cuaca diambil pada dua tower pengapit/terdekat titik gangguan. "
-        "Histori petir di bawah adalah indikasi thunderstorm dari weather code, bukan data sambaran petir aktual."
+        "Data cuaca diambil pada titik lokasi gangguan hasil interpolasi Tower Schedule. "
+        "Data ini adalah kondisi cuaca dan prakiraan hujan dari OpenWeather."
     )
+    openweather_key_source = get_openweather_lightning_api_key()
+    with st.expander("Pengaturan cuaca", expanded=False):
+        openweather_key_input = st.text_input(
+            "OpenWeather API key",
+            value=openweather_key_source,
+            type="password",
+            key=f"{key_prefix}_openweather_api_key_input",
+            help=(
+                "Aplikasi selalu memakai OpenWeather One Call 4.0 jika API key tersedia. "
+                "Jika key kosong atau gagal, Open-Meteo dipakai sebagai fallback."
+            ),
+        ).strip()
+        st.caption("Sumber default: OpenWeather One Call 4.0. Fallback otomatis: Open-Meteo.")
+    st.session_state["openweather_lightning_api_key"] = openweather_key_input
 
-    weather_rows = []
-    for role, tower_row in adjacent_rows:
-        lat = float(tower_row["lat"])
-        lon = float(tower_row["lon"])
-        current = fetch_open_meteo_current_weather(lat, lon)
-        thunderstorm = fetch_open_meteo_recent_thunderstorm(lat, lon, past_days=7)
+    fault_lat, fault_lon, fault_cum_km = fault_location
+    if openweather_key_input:
+        current = fetch_openweather_onecall_current_weather(fault_lat, fault_lon, openweather_key_input)
         if current.get("error"):
-            current_summary = f"Gagal baca cuaca: {current['error']}"
-        else:
-            current_summary = current.get("weather", "-")
-        if thunderstorm.get("error"):
-            storm_summary = f"Gagal baca indikasi: {thunderstorm['error']}"
-            storm_time = None
-            storm_weather = storm_summary
-        elif thunderstorm.get("time"):
-            storm_time = thunderstorm.get("time")
-            storm_weather = thunderstorm.get("weather", "-")
-            storm_summary = (
-                f"{storm_time} | {storm_weather}"
-            )
-        else:
-            storm_time = None
-            storm_weather = thunderstorm.get("weather", "-")
-            storm_summary = thunderstorm.get("weather", "-")
-
-        weather_rows.append(
-            {
-                "Location": role,
-                "Tower": tower_row.get("SPAN", "-"),
-                "Distance from Fault km": float(tower_row.get("_cum_km", 0.0)) - float(selected_fault_option["distance_km"]),
-                "Cumulative km": tower_row.get("_cum_km"),
-                "Latitude": lat,
-                "Longitude": lon,
-                "Current Weather": current_summary,
-                "Weather Code": current.get("weather_code"),
-                "Temperature C": current.get("temperature_c"),
-                "Humidity %": current.get("humidity_pct"),
-                "Rain mm": current.get("rain_mm"),
-                "Precipitation mm": current.get("precipitation_mm"),
-                "Cloud Cover %": current.get("cloud_cover_pct"),
-                "Wind km/h": current.get("wind_speed_kmh"),
-                "Wind Dir deg": current.get("wind_direction_deg"),
-                "Weather Time": current.get("time"),
-                "Last Thunderstorm Indication": storm_summary,
-                "Last Thunderstorm Time": storm_time,
-                "Last Thunderstorm Weather": storm_weather,
+            st.warning(f"OpenWeather One Call 4.0 gagal dibaca, memakai Open-Meteo fallback: {current['error']}")
+            current = fetch_open_meteo_current_weather(fault_lat, fault_lon)
+            forecast_summary = {
+                "available": False,
+                "summary": "Forecast One Call 4.0 tidak tersedia saat fallback aktif.",
+                "items": [],
+                "thunder_count": 0,
+                "rain_count": 0,
+                "max_pop": None,
+                "total_precip_mm": 0.0,
             }
+        else:
+            forecast_payload = fetch_openweather_onecall_15min_forecast(fault_lat, fault_lon, openweather_key_input)
+            if forecast_payload.get("error"):
+                forecast_summary = {
+                    "available": False,
+                    "summary": f"Forecast One Call 4.0 belum dapat dibaca: {forecast_payload['error']}",
+                    "items": [],
+                    "thunder_count": 0,
+                    "rain_count": 0,
+                    "max_pop": None,
+                    "total_precip_mm": 0.0,
+                }
+            else:
+                forecast_summary = build_openweather_forecast_summary(forecast_payload, hours=12)
+    else:
+        current = fetch_open_meteo_current_weather(fault_lat, fault_lon)
+        forecast_summary = {
+            "available": False,
+            "summary": "Isi OpenWeather API key untuk forecast 15 menit One Call 4.0.",
+            "items": [],
+            "thunder_count": 0,
+            "rain_count": 0,
+            "max_pop": None,
+            "total_precip_mm": 0.0,
+        }
+
+    thunderstorm = fetch_open_meteo_recent_thunderstorm(fault_lat, fault_lon, past_days=7)
+    current_summary = f"Gagal baca cuaca: {current['error']}" if current.get("error") else current.get("weather", "-")
+    if thunderstorm.get("error"):
+        storm_summary = f"Gagal baca indikasi: {thunderstorm['error']}"
+        storm_time = None
+        storm_weather = storm_summary
+    elif thunderstorm.get("time"):
+        storm_time = thunderstorm.get("time")
+        storm_weather = thunderstorm.get("weather", "-")
+        storm_summary = f"{storm_time} | {storm_weather}"
+    else:
+        storm_time = None
+        storm_weather = thunderstorm.get("weather", "-")
+        storm_summary = thunderstorm.get("weather", "-")
+
+    fault_segment = get_fault_tower_segment(map_df, selected_fault_option["distance_km"])
+    if fault_segment:
+        fault_label = (
+            f"Span {compact_tower_span_label(fault_segment['prev'].get('SPAN', '-'))} - "
+            f"{compact_tower_span_label(fault_segment['next'].get('SPAN', '-'))}"
         )
+    else:
+        fault_label = selected_fault_option["label"]
+
+    weather_rows = [
+        {
+            "Location": f"Titik Gangguan - {selected_fault_option['label']}",
+            "Tower": fault_label,
+            "Distance from Fault km": 0.0,
+            "Cumulative km": fault_cum_km,
+            "Latitude": fault_lat,
+            "Longitude": fault_lon,
+            "Current Weather": current_summary,
+            "Weather Code": current.get("weather_code"),
+            "Weather Icon URL": current.get("weather_icon_url"),
+            "Temperature C": current.get("temperature_c"),
+            "Feels Like C": current.get("feels_like_c"),
+            "Visibility m": current.get("visibility_m"),
+            "Humidity %": current.get("humidity_pct"),
+            "Rain mm": current.get("rain_mm"),
+            "Precipitation mm": current.get("precipitation_mm"),
+            "Cloud Cover %": current.get("cloud_cover_pct"),
+            "Wind km/h": current.get("wind_speed_kmh"),
+            "Wind Dir deg": current.get("wind_direction_deg"),
+            "Weather Time": current.get("time"),
+            "Weather Source": current.get("source", "Open-Meteo"),
+            "Forecast Summary": forecast_summary,
+            "Last Thunderstorm Indication": storm_summary,
+            "Last Thunderstorm Time": storm_time,
+            "Last Thunderstorm Weather": storm_weather,
+        }
+    ]
 
     st.markdown(weather_card_html(weather_rows), unsafe_allow_html=True)
-    st.info(
-        "Untuk histori sambaran petir aktual, aplikasi perlu integrasi provider lightning "
-        "seperti API jaringan deteksi petir. Tanpa provider tersebut, aplikasi hanya menampilkan "
-        "indikasi cuaca thunderstorm di sekitar dua tower terdekat."
-    )
-
 
 def prepare_tower_map_dataframe(tower_df: pd.DataFrame):
     if tower_df is None or tower_df.empty or "LATITUDE" not in tower_df.columns or "LONGITUDE" not in tower_df.columns:
@@ -3782,6 +6627,7 @@ try:
     auto_transformer_data = get_auto_transformer_data(metadata)
     auto_recorded_side = detect_recorded_side(metadata)
 
+    st.session_state["local_metadata"] = metadata
     st.session_state["auto_assignment"] = auto_assignment
     st.session_state["auto_transformer_data"] = auto_transformer_data
     st.session_state["auto_recorded_side"] = auto_recorded_side
