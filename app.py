@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 import tempfile
 import os
 import math
@@ -8,6 +8,7 @@ import json
 import io
 import zipfile
 import textwrap
+import html
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 import folium
@@ -2587,14 +2588,69 @@ WMO_WEATHER_CODES = {
 }
 THUNDERSTORM_WEATHER_CODES = {95, 96, 99}
 
+WEATHER_DESCRIPTION_ID = {
+    "clear sky": "Cerah",
+    "mainly clear": "Umumnya cerah",
+    "few clouds": "Sedikit berawan",
+    "scattered clouds": "Berawan sebagian",
+    "broken clouds": "Berawan",
+    "overcast clouds": "Mendung",
+    "overcast": "Mendung",
+    "partly cloudy": "Berawan sebagian",
+    "clouds": "Berawan",
+    "mist": "Berkabut tipis",
+    "fog": "Berkabut",
+    "haze": "Berkabut asap",
+    "smoke": "Berasap",
+    "dust": "Berdebu",
+    "sand": "Berdebu pasir",
+    "squalls": "Angin kencang",
+    "tornado": "Tornado",
+    "light rain": "Hujan ringan",
+    "moderate rain": "Hujan sedang",
+    "heavy intensity rain": "Hujan lebat",
+    "very heavy rain": "Hujan sangat lebat",
+    "extreme rain": "Hujan ekstrem",
+    "freezing rain": "Hujan beku",
+    "light intensity shower rain": "Hujan ringan sesaat",
+    "shower rain": "Hujan sesaat",
+    "heavy intensity shower rain": "Hujan sesaat lebat",
+    "ragged shower rain": "Hujan sesaat tidak merata",
+    "light intensity drizzle": "Gerimis ringan",
+    "drizzle": "Gerimis",
+    "heavy intensity drizzle": "Gerimis lebat",
+    "slight rain": "Hujan ringan",
+    "slight rain showers": "Hujan ringan sesaat",
+    "moderate rain showers": "Hujan sedang sesaat",
+    "violent rain showers": "Hujan sesaat sangat lebat",
+    "light snow": "Salju ringan",
+    "snow": "Salju",
+    "heavy snow": "Salju lebat",
+    "thunderstorm": "Hujan disertai petir",
+    "thunderstorm with light rain": "Hujan ringan disertai petir",
+    "thunderstorm with rain": "Hujan disertai petir",
+    "thunderstorm with heavy rain": "Hujan lebat disertai petir",
+}
+
 
 def weather_code_label(code):
     if code is None or pd.isna(code):
         return "-"
     try:
-        return WMO_WEATHER_CODES.get(int(code), f"WMO {int(code)}")
+        label = WMO_WEATHER_CODES.get(int(code), f"WMO {int(code)}")
+        return translate_weather_description(label)
     except (TypeError, ValueError):
         return "-"
+
+
+def translate_weather_description(value):
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return "-"
+    normalized = re.sub(r"\s+", " ", text).strip().lower()
+    if normalized in WEATHER_DESCRIPTION_ID:
+        return WEATHER_DESCRIPTION_ID[normalized]
+    return text[:1].upper() + text[1:]
 
 
 def safe_number_formatter(decimals=2):
@@ -2625,6 +2681,10 @@ def safe_display_number(value, decimals=1, suffix=""):
 
 def get_openweather_lightning_api_key():
     key = str(st.session_state.get("openweather_lightning_api_key", "") or "").strip()
+    if key:
+        return key
+
+    key = str(st.session_state.get("summary_weather_lightning_openweather_api_key_input", "") or "").strip()
     if key:
         return key
 
@@ -2802,7 +2862,7 @@ def fetch_openweather_onecall_current_weather(lat: float, lon: float, api_key: s
             if current.get("dt") is not None
             else None,
             "weather_code": weather_item.get("id"),
-            "weather": weather_item.get("description") or weather_item.get("main") or "-",
+            "weather": translate_weather_description(weather_item.get("description") or weather_item.get("main") or "-"),
             "temperature_c": current.get("temp"),
             "feels_like_c": current.get("feels_like"),
             "humidity_pct": current.get("humidity"),
@@ -2936,7 +2996,9 @@ def build_openweather_forecast_summary(payload: dict, hours: int = 12):
         weather = record.get("weather", [])
         weather_item = weather[0] if weather else {}
         code = weather_item.get("id")
-        description = weather_item.get("description") or weather_item.get("main") or weather_code_label(code)
+        description = translate_weather_description(
+            weather_item.get("description") or weather_item.get("main") or weather_code_label(code)
+        )
         pop = record.get("pop")
         try:
             pop_value = float(pop)
@@ -2979,7 +3041,7 @@ def build_openweather_forecast_summary(payload: dict, hours: int = 12):
             bucket["temperature_values"].append(float(record.get("temp")))
         except (TypeError, ValueError):
             pass
-        desc_key = str(description or "-").title()
+        desc_key = translate_weather_description(description)
         bucket["description_counts"][desc_key] = bucket["description_counts"].get(desc_key, 0) + 1
         if pop_value is not None and pop_value == max(bucket["pop_values"], default=pop_value):
             bucket["weather_code"] = code
@@ -3025,9 +3087,9 @@ def build_openweather_forecast_summary(payload: dict, hours: int = 12):
 
     max_pop = max(pops) if pops else None
     if rain_slots:
-        summary = f"Peluang hujan masih ada mulai sekitar {rain_slots[0].strftime('%H:%M')}."
+        summary = f"Ada peluang hujan mulai sekitar {rain_slots[0].strftime('%H:%M')}."
     else:
-        summary = f"Tidak ada sinyal hujan kuat dalam {hours} jam ke depan."
+        summary = f"Tidak ada indikasi hujan dalam {hours} jam ke depan."
 
     return {
         "available": True,
@@ -3389,22 +3451,22 @@ def weather_symbol_for_code(code):
     try:
         code = int(code)
     except (TypeError, ValueError):
-        return "☁"
+        return "â˜"
     if 200 <= code <= 232 or code in THUNDERSTORM_WEATHER_CODES:
-        return "⚡"
+        return "âš¡"
     if 300 <= code <= 321:
-        return "☂"
+        return "â˜‚"
     if 500 <= code <= 531:
-        return "☔"
+        return "â˜”"
     if 600 <= code <= 622:
-        return "❄"
+        return "â„"
     if 700 <= code <= 781:
-        return "≋"
+        return "â‰‹"
     if code == 800 or code in {0, 1}:
-        return "☀"
+        return "â˜€"
     if code in {801, 2}:
-        return "⛅"
-    return "☁"
+        return "â›…"
+    return "â˜"
 
 
 def build_weather_trend_svg(items):
@@ -3473,6 +3535,48 @@ def build_weather_trend_svg(items):
     )
 
 
+def build_weather_trend_svg(items):
+    usable = []
+    for item in items:
+        try:
+            temp = float(item.get("temperature_c"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            rain = float(item.get("precip_mm") or 0.0)
+        except (TypeError, ValueError):
+            rain = 0.0
+        usable.append((temp, rain, str(item.get("time", "-"))))
+
+    if len(usable) < 2:
+        return ""
+
+    temps = [item[0] for item in usable]
+    min_temp = min(temps)
+    max_temp = max(temps)
+    temp_span = max(max_temp - min_temp, 1.0)
+    slots = []
+    for temp, rain, time_label in usable:
+        level = (temp - min_temp) / temp_span
+        try:
+            rain_level = min(1.0, max(0.0, float(rain) / 10.0))
+        except (TypeError, ValueError):
+            rain_level = 0.0
+        slots.append(
+            "<div class='trend-slot' "
+            f"style='--level:{level:.3f}; --rain-level:{rain_level:.3f};'>"
+            f"<span class='trend-value'>{temp:.0f}°</span>"
+            "<div class='trend-stage'><i></i><b></b><em></em></div>"
+            f"<small>{html.escape(time_label)}</small>"
+            "</div>"
+        )
+    return (
+        "<div class='weather-trend-chart' role='img' aria-label='Grafik tren suhu per jam'>"
+        + "".join(slots)
+        + "</div>"
+    )
+
+
 def build_rain_chance_bars(items):
     bars = ""
     max_pop = 1
@@ -3495,6 +3599,92 @@ def build_rain_chance_bars(items):
             "</div>"
         )
     return bars
+
+
+def build_weather_trend_svg(items):
+    usable = []
+    for item in items:
+        try:
+            temp = float(item.get("temperature_c"))
+        except (TypeError, ValueError):
+            continue
+        usable.append((temp, str(item.get("time", "-"))))
+
+    if len(usable) < 2:
+        return ""
+
+    temps = [item[0] for item in usable]
+    min_temp = min(temps)
+    max_temp = max(temps)
+    temp_span = max(max_temp - min_temp, 1.0)
+    levels = [(temp - min_temp) / temp_span for temp, _ in usable]
+    n_items = len(usable)
+    slots = []
+    for idx, (temp, time_label) in enumerate(usable):
+        level = levels[idx]
+        slots.append(
+            "<div class='trend-slot' "
+            f"style='--level:{level:.3f};'>"
+            f"<span class='trend-value'>{temp:.0f}°</span>"
+            "<div class='trend-stage'><i></i><b></b></div>"
+            f"<small>{html.escape(time_label)}</small>"
+            "</div>"
+        )
+    return (
+        "<div class='weather-trend-chart' role='img' aria-label='Grafik tren suhu per jam'>"
+        + "".join(slots)
+        + "</div>"
+    )
+
+
+def build_rain_chance_chart(items):
+    usable = []
+    for item in items:
+        try:
+            pop_num = int(item.get("pop_pct") or 0)
+        except (TypeError, ValueError):
+            pop_num = 0
+        usable.append((pop_num, str(item.get("time", "-"))))
+
+    if not usable:
+        return ""
+
+    max_pop = max(1, max(pop for pop, _ in usable))
+    levels = [pop / max_pop for pop, _ in usable]
+    slots = []
+    for idx, (pop_num, time_label) in enumerate(usable):
+        level = levels[idx]
+        slots.append(
+            "<div class='rain-bar-wrap' "
+            f"style='--rain-level:{level:.3f};'>"
+            "<i></i>"
+            f"<span>{pop_num}%</span>"
+            f"<small>{html.escape(time_label)}</small>"
+            "</div>"
+        )
+    return "".join(slots)
+
+
+def weather_symbol_for_code(code):
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "&#9729;"
+    if 200 <= code <= 232 or code in THUNDERSTORM_WEATHER_CODES:
+        return "&#9889;"
+    if 300 <= code <= 321:
+        return "&#9748;"
+    if 500 <= code <= 531:
+        return "&#9748;"
+    if 600 <= code <= 622:
+        return "&#10052;"
+    if 700 <= code <= 781:
+        return "&#8779;"
+    if code == 800 or code in {0, 1}:
+        return "&#9728;"
+    if code in {801, 2}:
+        return "&#9925;"
+    return "&#9729;"
 
 
 def weather_card_html(weather_rows):
@@ -3534,7 +3724,7 @@ def weather_card_html(weather_rows):
                 else f"<strong>{weather_icon_for_code(item.get('weather_code'))}</strong>"
             )
             pop_label = f"{item.get('pop_pct')}%" if item.get("pop_pct") is not None else "-"
-            temp_label = safe_display_number(temp_value, 0, " C")
+            temp_label = safe_display_number(temp_value, 0, "°C")
             precip_label = safe_display_number(precip_value, 1, " mm") if precip_value else ""
             risk_value = item.get("pop_pct") if item.get("pop_pct") is not None else 0
             precip_height = min(28, max(3, float(precip_value) * 8.0)) if precip_value else 3
@@ -5235,6 +5425,7 @@ def weather_card_html(weather_rows):
         temp_range = "-"
         if temp_values:
             temp_range = f"{safe_display_number(min(temp_values), 0, ' C')} - {safe_display_number(max(temp_values), 0, ' C')}"
+        rain_bars = build_rain_chance_chart(forecast_items)
         forecast_pop = f"{forecast.get('max_pop') * 100.0:.0f}%" if forecast.get("max_pop") is not None else "-"
         forecast_precip = safe_display_number(forecast.get("total_precip_mm", 0.0), 2, " mm")
         forecast_signal = "Ada potensi petir" if forecast.get("thunder_count", 0) else "Tidak ada sinyal petir kuat"
@@ -5561,25 +5752,17 @@ def weather_card_html(weather_rows):
                 pop_num = int(item.get("pop_pct") or 0)
             except (TypeError, ValueError):
                 pop_num = 0
-            bar_height = 12 + (pop_num / max_pop_seen) * 58
             forecast_cards += (
                 "<div class='daily-card'>"
                 f"<span>{item.get('time', '-')}</span>"
                 f"{item_icon}"
-                f"<b>{safe_display_number(temp_value, 0, ' C')}</b>"
+                f"<b>{safe_display_number(temp_value, 0, '°C')}</b>"
                 f"<small>{item.get('description', '-')}</small>"
                 "</div>"
             )
-            rain_bars += (
-                "<div class='rain-bar-wrap'>"
-                f"<i style='height:{bar_height:.0f}px'></i>"
-                f"<span>{pop_num}%</span>"
-                f"<small>{item.get('time', '-')}</small>"
-                "</div>"
-            )
+        rain_bars = build_rain_chance_chart(forecast_items)
         forecast_pop = f"{forecast.get('max_pop') * 100.0:.0f}%" if forecast.get("max_pop") is not None else "-"
         forecast_precip = safe_display_number(forecast.get("total_precip_mm", 0.0), 2, " mm")
-        forecast_signal = "Ada potensi petir" if forecast.get("thunder_count", 0) else "Tidak ada sinyal petir kuat"
         trend_svg = build_weather_trend_svg(forecast_items)
         cards_html.append(
             textwrap.dedent(f"""
@@ -5668,6 +5851,14 @@ def weather_card_html(weather_rows):
         .dashboard-forecast { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-auto-rows: min-content; gap: 12px; padding: 18px 22px; background: #ffffff; }
         .dashboard-tile, .dashboard-note { border-radius: 8px; background: #f8fafc; border: 1px solid rgba(241, 245, 249, 0.95); padding: 14px; }
         .dashboard-tile header { font-size: 14px; color: #111827; margin-bottom: 8px; }
+        .weather-trend-chart { position: relative; height: 94px; display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; align-items: stretch; }
+        .trend-slot { position: relative; display: grid; grid-template-rows: 20px 1fr 16px; align-items: end; justify-items: center; min-width: 0; color: #64748b; }
+        .trend-value { color: #0f172a; font-size: 16px; font-weight: 700; line-height: 1; }
+        .trend-stage { position: relative; width: 100%; height: 52px; border-bottom: 1px solid rgba(148,163,184,0.28); overflow: visible; }
+        .trend-stage::before { content: ""; position: absolute; left: 50%; top: 2px; bottom: 0; border-left: 1px dashed rgba(148,163,184,0.38); }
+        .trend-stage i { position: absolute; left: calc(50% - 1px); bottom: 8px; width: 2px; height: calc(8px + (var(--level) * 30px)); border-radius: 999px; background: linear-gradient(180deg, #f59e0b, #facc15); z-index: 2; }
+        .trend-stage b { position: absolute; left: calc(50% - 5px); bottom: calc(6px + (var(--level) * 30px)); width: 10px; height: 10px; border-radius: 999px; background: #ffffff; border: 2px solid #f59e0b; z-index: 2; }
+        .trend-slot small { font-size: 11px; color: #64748b; white-space: nowrap; }
         .weather-trend-svg { width: 100%; height: 94px; display: block; }
         .weather-trend-grid line { stroke: rgba(148, 163, 184, 0.35); stroke-dasharray: 4 5; }
         .weather-trend-rain rect { fill: rgba(56, 189, 248, 0.45); }
@@ -5675,9 +5866,9 @@ def weather_card_html(weather_rows):
         .weather-trend-points circle { fill: #f8fafc; stroke: #f59e0b; stroke-width: 2; }
         .weather-trend-labels text { fill: #334155; font-size: 20px; font-weight: 700; }
         .weather-trend-axis text { fill: #64748b; font-size: 16px; font-weight: 600; }
-        .rain-bars { height: 94px; display: flex; align-items: end; justify-content: space-between; gap: 8px; padding-top: 8px; }
-        .rain-bar-wrap { flex: 1; min-width: 24px; display: grid; grid-template-rows: 1fr auto auto; justify-items: center; align-items: end; gap: 4px; color: #6b7280; font-size: 10px; }
-        .rain-bar-wrap i { width: 100%; max-width: 28px; display: block; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #0ea5e9, #bae6fd); }
+        .rain-bars { position: relative; height: 94px; display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); align-items: end; gap: 8px; padding-top: 8px; }
+        .rain-bar-wrap { position: relative; z-index: 2; min-width: 24px; display: grid; grid-template-rows: 1fr auto auto; justify-items: center; align-items: end; gap: 4px; color: #6b7280; font-size: 10px; }
+        .rain-bar-wrap i { width: 100%; max-width: 28px; height: calc(12px + (var(--rain-level) * 46px)); display: block; border-radius: 4px 4px 0 0; background: linear-gradient(180deg, #0ea5e9, #bae6fd); }
         .summary-tile { grid-column: span 2; }
         .compact-summary { display: grid; grid-template-columns: minmax(260px, 1.7fr) repeat(2, minmax(150px, 1fr)); gap: 10px; align-items: center; padding: 10px 12px; }
         .compact-summary header { margin: 0; grid-column: 1 / -1; }
@@ -5745,11 +5936,13 @@ def render_fault_weather_lightning_summary(tower_df: pd.DataFrame, key_prefix: s
             ),
         ).strip()
         st.caption("Sumber default: OpenWeather One Call 4.0. Fallback otomatis: Open-Meteo.")
-    st.session_state["openweather_lightning_api_key"] = openweather_key_input
+    openweather_key = openweather_key_input or openweather_key_source
+    if openweather_key:
+        st.session_state["openweather_lightning_api_key"] = openweather_key
 
     fault_lat, fault_lon, fault_cum_km = fault_location
-    if openweather_key_input:
-        current = fetch_openweather_onecall_current_weather(fault_lat, fault_lon, openweather_key_input)
+    if openweather_key:
+        current = fetch_openweather_onecall_current_weather(fault_lat, fault_lon, openweather_key)
         if current.get("error"):
             st.warning(f"OpenWeather One Call 4.0 gagal dibaca, memakai Open-Meteo fallback: {current['error']}")
             current = fetch_open_meteo_current_weather(fault_lat, fault_lon)
@@ -5763,7 +5956,7 @@ def render_fault_weather_lightning_summary(tower_df: pd.DataFrame, key_prefix: s
                 "total_precip_mm": 0.0,
             }
         else:
-            forecast_payload = fetch_openweather_onecall_15min_forecast(fault_lat, fault_lon, openweather_key_input)
+            forecast_payload = fetch_openweather_onecall_15min_forecast(fault_lat, fault_lon, openweather_key)
             if forecast_payload.get("error"):
                 forecast_summary = {
                     "available": False,
@@ -5788,20 +5981,11 @@ def render_fault_weather_lightning_summary(tower_df: pd.DataFrame, key_prefix: s
             "total_precip_mm": 0.0,
         }
 
-    thunderstorm = fetch_open_meteo_recent_thunderstorm(fault_lat, fault_lon, past_days=7)
-    current_summary = f"Gagal baca cuaca: {current['error']}" if current.get("error") else current.get("weather", "-")
-    if thunderstorm.get("error"):
-        storm_summary = f"Gagal baca indikasi: {thunderstorm['error']}"
-        storm_time = None
-        storm_weather = storm_summary
-    elif thunderstorm.get("time"):
-        storm_time = thunderstorm.get("time")
-        storm_weather = thunderstorm.get("weather", "-")
-        storm_summary = f"{storm_time} | {storm_weather}"
-    else:
-        storm_time = None
-        storm_weather = thunderstorm.get("weather", "-")
-        storm_summary = thunderstorm.get("weather", "-")
+    current_summary = (
+        f"Gagal baca cuaca: {current['error']}"
+        if current.get("error")
+        else translate_weather_description(current.get("weather", "-"))
+    )
 
     fault_segment = get_fault_tower_segment(map_df, selected_fault_option["distance_km"])
     if fault_segment:
@@ -5835,13 +6019,14 @@ def render_fault_weather_lightning_summary(tower_df: pd.DataFrame, key_prefix: s
             "Weather Time": current.get("time"),
             "Weather Source": current.get("source", "Open-Meteo"),
             "Forecast Summary": forecast_summary,
-            "Last Thunderstorm Indication": storm_summary,
-            "Last Thunderstorm Time": storm_time,
-            "Last Thunderstorm Weather": storm_weather,
         }
     ]
 
-    st.markdown(weather_card_html(weather_rows), unsafe_allow_html=True)
+    weather_html = weather_card_html(weather_rows)
+    if hasattr(st, "html"):
+        st.html(weather_html)
+    else:
+        components.html(weather_html, height=760, scrolling=False)
 
 def prepare_tower_map_dataframe(tower_df: pd.DataFrame):
     if tower_df is None or tower_df.empty or "LATITUDE" not in tower_df.columns or "LONGITUDE" not in tower_df.columns:
@@ -7297,7 +7482,7 @@ def parse_distance_setting_number(value):
 def normalize_distance_setting_column(name: str):
     text = str(name or "").lower().strip()
     text = re.sub(r"\s+", "", text)
-    for old in ["(", ")", "-", "_", "/", "\\", ".", "ohm", "Ω"]:
+    for old in ["(", ")", "-", "_", "/", "\\", ".", "ohm", "Î©"]:
         text = text.replace(old, "")
     return text
 
@@ -9702,7 +9887,7 @@ with tab6:
             max_value=1.00,
             step=0.0001,
             format="%.5f",
-            help="Fasa dianggap drop jika Vphase <= threshold × Vmax."
+            help="Fasa dianggap drop jika Vphase <= threshold Ã— Vmax."
         )
 
     with col_ft2:
@@ -9713,7 +9898,7 @@ with tab6:
             max_value=10.00,
             step=0.0001,
             format="%.5f",
-            help="Fasa dianggap faulted jika Iphase >= threshold × Imin."
+            help="Fasa dianggap faulted jika Iphase >= threshold Ã— Imin."
         )
 
     with col_ft3:
@@ -10754,7 +10939,7 @@ def render_high_resistance_check(end_side: str):
         col_a.metric("Location", ctx["label"])
         col_b.metric("Selected Loop", hr_result["selected_loop"])
         col_c.metric("High Resistance", "Suspected" if hr_result["high_resistance_suspected"] else "No")
-        col_d.metric("Rf Estimate", f'{hr_result["Rf_est_ohm"]:.3f} Ω')
+        col_d.metric("Rf Estimate", f'{hr_result["Rf_est_ohm"]:.3f} Î©')
         col_e.metric("Analysis Confidence", f'{hr_result["analysis_confidence"]}/10')
 
         if hr_result["high_resistance_suspected"]:
@@ -10886,7 +11071,7 @@ def render_single_ended_analysis(end_side: str):
     col_r1.metric("End", ctx["label"])
     col_r2.metric("Signed Distance" if single_external_context else "Recommended Distance", f'{single_result["recommended_distance_km"]:.3f} km')
     col_r3.metric("Distance %", f'{single_result["recommended_distance_percent"]:.2f} %')
-    col_r4.metric("Zapp", f'{single_result["Zapp_R"]:.3f} + j{single_result["Zapp_X"]:.3f} Ω')
+    col_r4.metric("Zapp", f'{single_result["Zapp_R"]:.3f} + j{single_result["Zapp_X"]:.3f} Î©')
     col_r5.metric("Status", single_result["status"])
 
     if single_result["status"] == "VALID":
@@ -11294,7 +11479,7 @@ with tab10:
 
         col_sync1, col_sync2, col_sync3 = st.columns(3)
 
-        col_sync1.metric("Δ Fault Time", f"{delta_fault_time:.6f} s")
+        col_sync1.metric("Î” Fault Time", f"{delta_fault_time:.6f} s")
         col_sync2.metric("1 Cycle Time", f"{one_cycle_time:.6f} s")
         col_sync3.metric(
             "Trigger Sync Check",
@@ -11631,7 +11816,7 @@ with tab10:
             col_twsr1.metric("TWS from Local", f'{tws_result["distance_from_local_km"]:.3f} km')
             col_twsr2.metric("TWS from Remote", f'{tws_result["distance_from_remote_km"]:.3f} km')
             col_twsr3.metric("TWS Position", f'{tws_result["distance_from_local_percent"]:.2f} %')
-            col_twsr4.metric("Δt Local-Remote", f'{tws_result["delta_t_s"] * 1e6:.3f} µs')
+            col_twsr4.metric("Î”t Local-Remote", f'{tws_result["delta_t_s"] * 1e6:.3f} Âµs')
 
             tws_detail_df = pd.DataFrame(
                 [
@@ -12869,3 +13054,4 @@ with tab10:
                         st.warning(warning)
                 else:
                     st.success("Hasil time-based berada di dalam panjang saluran dan selisih waktu masih realistis.")
+
