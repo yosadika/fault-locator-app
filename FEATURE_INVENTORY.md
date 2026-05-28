@@ -2,6 +2,8 @@
 
 Dokumen ini adalah baseline fitur, logika, dan metode kalkulasi aplikasi. Saat melakukan refactor atau menambah fitur, jangan menghapus perilaku di dokumen ini tanpa konfirmasi eksplisit.
 
+Catatan refactor: flow runtime dan pembagian modul teknis dicatat di `APP_FLOW.md`. Inventory ini tetap menjadi baseline fitur dan perilaku aplikasi.
+
 ## Tujuan Aplikasi
 
 - Membaca rekaman gangguan COMTRADE local end dan optional remote end.
