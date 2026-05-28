@@ -245,12 +245,13 @@ Dokumen ini adalah baseline fitur, logika, dan metode kalkulasi aplikasi. Saat m
   - semua kolom spreadsheet tetap ditampilkan.
   - kolom tambahan `Fault Context`.
   - kolom tambahan `Distance from Fault km`.
-- Summary juga menampilkan cuaca sekitar titik gangguan:
+- Summary juga menampilkan cuaca terkini di titik gangguan:
   - sumber lokasi mengikuti pilihan fault pada Tower Map Summary, default DE bila tersedia.
-  - lokasi cuaca diambil dari dua tower pengapit titik gangguan; jika tidak ada span pengapit, ambil dua tower terdekat berdasarkan `KUMULATIF km`.
-  - cuaca terkini memakai Open-Meteo no-key forecast API.
-  - histori petir sementara memakai indikasi weather-code thunderstorm 7 hari terakhir dari Open-Meteo.
-  - aplikasi tidak mengklaim data tersebut sebagai histori sambaran petir aktual; sambaran aktual memerlukan integrasi provider lightning khusus.
+  - lokasi cuaca memakai koordinat titik gangguan hasil interpolasi Tower Schedule, bukan dua tower terdekat.
+  - cuaca terkini dan forecast memakai OpenWeather One Call 4.0 jika API key tersedia.
+  - Open-Meteo hanya dipakai sebagai fallback untuk cuaca saat ini bila OpenWeather gagal atau API key tidak tersedia.
+  - aplikasi tidak menampilkan data petir/badai karena belum ada provider data sambaran petir aktual yang aktif.
+  - forecast ditampilkan per 1 jam relatif terhadap waktu akses, dengan ringkasan peluang hujan, total hujan, tren suhu, dan sub-card prakiraan per jam.
 
 ## High Resistance Check
 
@@ -444,7 +445,7 @@ Dokumen ini adalah baseline fitur, logika, dan metode kalkulasi aplikasi. Saat m
   - estimasi penyebab gangguan
   - grafik SE/DE
   - Tower Map Fault Location jika data tower tersedia
-  - cuaca terkini dan indikasi thunderstorm pada dua tower terdekat/pengapit titik fault
+  - cuaca terkini dan forecast hujan di titik fault
   - R-X Locus local/remote
   - warning kualitas DE/HR.
 - Grafik SE/DE:
@@ -458,13 +459,16 @@ Dokumen ini adalah baseline fitur, logika, dan metode kalkulasi aplikasi. Saat m
   - fokus ke dua tower pengapit.
   - Map Settings default tertutup.
   - tabel -5/+5 tower sekitar fault default terbuka saat focus fault.
-- Weather/Lightning Summary:
+- Weather Summary:
   - tampil setelah Tower Map Fault Location memiliki data tower dan sumber fault.
-  - ditampilkan sebagai kartu grafis per tower, bukan dataframe interaktif, agar Summary/report lebih mudah dibaca.
-  - kartu berisi tower, jarak dari fault, koordinat, cuaca terkini, temperatur, kelembapan, hujan/presipitasi, tutupan awan, angin, timestamp cuaca, dan indikasi thunderstorm terakhir.
+  - ditampilkan sebagai kartu grafis tunggal untuk titik gangguan, bukan dataframe interaktif, agar Summary/report lebih mudah dibaca.
+  - kartu berisi lokasi fault, span pengapit, koordinat, cuaca terkini, temperatur, terasa seperti, kelembapan, hujan, tutupan awan, angin, timestamp cuaca, sumber API, tren suhu, peluang hujan, total hujan, dan sub-card forecast per jam.
+  - istilah cuaca dari provider diterjemahkan ke bahasa Indonesia yang lazim, misalnya `Broken Clouds` menjadi `Berawan`.
+  - kartu memakai simbol cuaca berbasis HTML entity agar stabil di Streamlit dan tidak bergantung pada encoding emoji mentah.
+  - teks ringkasan hujan memakai istilah netral seperti `indikasi hujan`, bukan `hujan kuat` atau `hujan lebat` kecuali ada klasifikasi intensitas khusus.
   - kartu harus print-friendly dan tidak pecah di tengah halaman bila memungkinkan.
-  - jika Open-Meteo tidak dapat diakses, kartu menampilkan pesan gagal baca tanpa menghentikan Summary.
-  - label harus jelas bahwa histori petir adalah proxy thunderstorm, bukan data strike aktual.
+  - jika OpenWeather/Open-Meteo tidak dapat diakses, kartu menampilkan pesan gagal baca tanpa menghentikan Summary.
+  - tidak ada widget atau label petir/badai pada kartu cuaca tanpa data provider lightning aktual.
 
 ## Case Storage
 
