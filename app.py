@@ -2732,8 +2732,10 @@ def fault_label_anchor_from_segment(fault_segment):
             return (-18, 76), "below"
         return (-18, -16), "above"
     if dx >= 0:
-        return (226, 20), "left"
-    return (-18, 20), "right"
+        # Label berada di kiri fault point, jadi pointer harus keluar dari sisi
+        # kanan label agar mengarah kembali ke pinpoint.
+        return (226, 20), "right"
+    return (-18, 20), "left"
 
 
 WMO_WEATHER_CODES = {
@@ -8470,6 +8472,12 @@ with tab_tower:
         "Sumber data diatur di Setup DB. "
         f"Sheet aktif: {st.session_state['tower_schedule_sheet_name']}."
     )
+    tower_schedule_url_configured = bool(str(st.session_state.get("tower_schedule_url", "") or "").strip())
+    if not tower_schedule_url_configured:
+        st.warning(
+            "Link Tower Schedule Spreadsheet belum diatur. Buka tab Setup DB lalu isi "
+            "`Tower Schedule Spreadsheet URL` atau upload runtime credentials terlebih dahulu."
+        )
     col_tower_refresh, _ = st.columns([0.9, 5])
     with col_tower_refresh:
         st.write("")
@@ -8482,17 +8490,18 @@ with tab_tower:
             st.info("Cache tower schedule dibersihkan. Isi filter awal lalu klik Load / Refresh Tower Schedule.")
 
     tower_filter_options_df = pd.DataFrame()
-    try:
-        tower_filter_options_df = read_google_spreadsheet_query_cached(
-            st.session_state["tower_schedule_url"],
-            st.session_state["tower_schedule_sheet_name"],
-            "select F, G where F is not null or G is not null",
-        )
-        tower_filter_options_df = make_streamlit_safe_columns(tower_filter_options_df)
-        tower_filter_options_df.columns = [str(col).strip() for col in tower_filter_options_df.columns]
-    except Exception as e:
-        st.warning("Daftar ULTG/Segment belum dapat dibaca. Gunakan input manual atau cek akses spreadsheet.")
-        st.caption(str(e))
+    if tower_schedule_url_configured:
+        try:
+            tower_filter_options_df = read_google_spreadsheet_query_cached(
+                st.session_state["tower_schedule_url"],
+                st.session_state["tower_schedule_sheet_name"],
+                "select F, G where F is not null or G is not null",
+            )
+            tower_filter_options_df = make_streamlit_safe_columns(tower_filter_options_df)
+            tower_filter_options_df.columns = [str(col).strip() for col in tower_filter_options_df.columns]
+        except Exception as e:
+            st.warning("Daftar ULTG/Segment belum dapat dibaca. Gunakan input manual atau cek akses spreadsheet.")
+            st.caption(str(e))
 
     def _preload_options_from_df(df, column_name):
         if df.empty or column_name not in df.columns:
@@ -8559,14 +8568,20 @@ with tab_tower:
         tower_load_requested = False
         load_tower_schedule = st.button("Load / Refresh Tower Schedule", key="load_tower_schedule")
         if load_tower_schedule:
-            if not tower_load_all and not tower_pre_ultg and not tower_pre_segment:
+            if not tower_schedule_url_configured:
+                st.warning(
+                    "Tidak bisa memuat Tower Schedule karena link spreadsheet belum diatur di Setup DB."
+                )
+            elif not tower_load_all and not tower_pre_ultg and not tower_pre_segment:
                 st.warning("Isi ULTG atau Segment terlebih dahulu, atau centang Load semua data.")
             else:
                 read_google_spreadsheet_query_cached.clear()
                 st.session_state["tower_schedule_loaded"] = True
                 tower_load_requested = True
 
-    if not st.session_state.get("tower_schedule_loaded") and "tower_schedule_df" not in st.session_state:
+    if not tower_schedule_url_configured and "tower_schedule_df" not in st.session_state:
+        st.info("Isi konfigurasi Tower Schedule di Setup DB sebelum memuat data tower.")
+    elif not st.session_state.get("tower_schedule_loaded") and "tower_schedule_df" not in st.session_state:
         st.info("Klik Load / Refresh Tower Schedule untuk membaca data tower dari spreadsheet.")
     else:
         try:
@@ -10420,6 +10435,17 @@ with tab7:
                 return False
             return True
 
+        if (
+            line_parameter_source in ["Database Excel Line Data", "Database Excel Cable Data"]
+            and not str(st.session_state.get("database_spreadsheet_url", "") or "").strip()
+        ):
+            st.warning(
+                "Link Database Spreadsheet belum diatur. Buka tab Setup DB lalu isi "
+                "`Database Spreadsheet URL` atau upload runtime credentials terlebih dahulu. "
+                "Sementara gunakan `Input Manual` untuk mengisi parameter saluran."
+            )
+            line_parameter_source = "Input Manual"
+
         if line_parameter_source in ["Database Excel Line Data", "Database Excel Cable Data"]:
             use_cable_database = line_parameter_source == "Database Excel Cable Data"
             database_source_key = "cable_data" if use_cable_database else "line_data"
@@ -10427,6 +10453,7 @@ with tab7:
                 f"{database_source_key}_spreadsheet_url",
                 st.session_state.get("database_spreadsheet_url", ""),
             )
+            database_spreadsheet_url = str(database_spreadsheet_url or "").strip()
             database_sheet_name = st.session_state.get(
                 f"{database_source_key}_sheet_name",
                 "cable_impedance" if use_cable_database else "line_impedance",
@@ -10527,6 +10554,10 @@ with tab7:
                 ratio_gib_vt_col = detected_columns.get("ratio_gib_vt")
 
                 corrected_columns = {
+                    "ultg": None if use_cable_database else detected_columns.get("ultg"),
+                    "gi": None if use_cable_database else detected_columns.get("gi"),
+                    "line_number": None if use_cable_database else detected_columns.get("line_number"),
+                    "segment": None if use_cable_database else detected_columns.get("segment"),
                     "line_name": None if line_name_col == "None" else line_name_col,
                     "bay_pht": None if bay_pht_col == "None" else bay_pht_col,
                     "length": None if length_col == "None" else length_col,
@@ -10583,6 +10614,10 @@ with tab7:
                 with st.expander("Detail data impedansi yang dipilih", expanded=False):
                     st.json(
                         {
+                            "ultg": excel_impedance_data.get("ultg"),
+                            "gi": excel_impedance_data.get("gi"),
+                            "line_number": excel_impedance_data.get("line_number"),
+                            "segment": excel_impedance_data.get("segment"),
                             "line_name": excel_impedance_data["line_name"],
                             "bay_pht": excel_impedance_data["bay_pht"],
                             "gi_a": excel_impedance_data["gi_a"],

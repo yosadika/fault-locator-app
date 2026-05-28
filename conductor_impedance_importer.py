@@ -237,9 +237,25 @@ def detect_impedance_columns(df: pd.DataFrame):
     columns = list(df.columns)
 
     detected = {
+        "ultg": find_column(df, ["ULTG"]),
         "gi": find_column(df, ["GI"]),
         "bay_pht": find_column(df, ["BAY PHT", "BAY", "PHT", "BAY_PHT"]),
-        "line_name": find_column(df, ["BAY PHT", "BAY", "PHT", "LINE NAME", "NAMA SALURAN"]),
+        "line_number": find_column(df, ["LINE", "NO LINE", "SIRKIT", "CIRCUIT"]),
+        "segment": find_column(df, ["SEGMENT", "NAMA SEGMENT", "NAMA SEGMEN", "SEGMEN"]),
+        "line_name": find_column(
+            df,
+            [
+                "SEGMENT",
+                "NAMA SEGMENT",
+                "NAMA SEGMEN",
+                "SEGMEN",
+                "LINE NAME",
+                "NAMA SALURAN",
+                "BAY PHT",
+                "BAY",
+                "PHT",
+            ],
+        ),
         "length": find_column(
             df,
             [
@@ -561,13 +577,29 @@ def extract_impedance_from_row(row, columns: dict):
     line_name = None
     length = None
 
+    ultg = None
+    gi = None
     bay = None
+    line_number = None
+    segment = None
     gi_a = None
     gi_b = None
     conductor_type = None
 
+    if columns.get("ultg"):
+        ultg = str(row[columns["ultg"]])
+
+    if columns.get("gi"):
+        gi = str(row[columns["gi"]])
+
     if columns.get("bay_pht"):
         bay = str(row[columns["bay_pht"]])
+
+    if columns.get("line_number"):
+        line_number = str(row[columns["line_number"]])
+
+    if columns.get("segment"):
+        segment = str(row[columns["segment"]])
 
     if columns.get("gia_name"):
         gi_a = str(row[columns["gia_name"]])
@@ -581,8 +613,16 @@ def extract_impedance_from_row(row, columns: dict):
     if columns.get("line_name"):
         line_name = str(row[columns["line_name"]])
 
+    if (not gi_a or gi_a.lower() == "nan") and gi and gi.lower() != "nan":
+        gi_a = gi
+
+    if (not gi_b or gi_b.lower() == "nan") and bay and bay.lower() != "nan":
+        gi_b = bay
+
     if not line_name or line_name.lower() == "nan":
-        if gi_a and gi_b:
+        if segment and segment.lower() != "nan":
+            line_name = segment
+        elif gi_a and gi_b:
             line_name = f"{gi_a} - {gi_b}"
         elif bay:
             line_name = bay
@@ -596,6 +636,10 @@ def extract_impedance_from_row(row, columns: dict):
     ratio_gib_vt = parse_ratio(row[columns["ratio_gib_vt"]]) if columns.get("ratio_gib_vt") else None
 
     return {
+        "ultg": ultg,
+        "gi": gi,
+        "line_number": line_number,
+        "segment": segment,
         "line_name": line_name,
         "bay_pht": bay,
         "gi_a": gi_a,
@@ -623,6 +667,10 @@ def build_row_label(df: pd.DataFrame, columns: dict):
     labels = []
 
     bay_col = columns.get("bay_pht")
+    gi_col = columns.get("gi")
+    segment_col = columns.get("segment")
+    line_name_col = columns.get("line_name")
+    line_number_col = columns.get("line_number")
     gia_col = columns.get("gia_name")
     gib_col = columns.get("gib_name")
     length_col = columns.get("length")
@@ -632,7 +680,22 @@ def build_row_label(df: pd.DataFrame, columns: dict):
     for idx, row in df.iterrows():
         parts = [f"Row {idx + 1}"]
 
-        if bay_col:
+        primary_name = None
+
+        if segment_col:
+            primary_name = row[segment_col]
+        elif line_name_col:
+            primary_name = row[line_name_col]
+
+        if primary_name is not None and str(primary_name).lower() != "nan":
+            parts.append(str(primary_name))
+
+        if line_number_col:
+            parts.append(f"Line {row[line_number_col]}")
+
+        if gi_col and bay_col:
+            parts.append(f"{row[gi_col]} - {row[bay_col]}")
+        elif bay_col:
             parts.append(f"BAY={row[bay_col]}")
 
         if gia_col and gib_col:
