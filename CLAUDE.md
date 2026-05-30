@@ -43,7 +43,8 @@ Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rek
 5. **Fault inception ≠ DFT cursor:** inception untuk sync/trigger, DFT cursor untuk kalkulasi phasor/locus.
 6. **Default yang tidak boleh diubah:**
    - Auto fault cursor detection: `off`
-   - Visual alignment DE: RMS envelope magnitude
+   - Referensi visual alignment DE: `fault_cursor` (Fault cursor only)
+   - Metode visual alignment DE: RMS envelope magnitude
    - Zone relay base: primary ohm
    - Tower Map Summary: default fault source = DE jika tersedia
 7. **Setelah perubahan apapun**, jalankan:
@@ -76,6 +77,8 @@ Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rek
 - **UI behavior Streamlit: investigasi dulu, coding kemudian** — sebelum mengimplementasi show/hide/accordion, verifikasi: apakah widget menulis balik ke session_state? Apakah `expanded=` controlled atau initial-state-only? Jika tidak yakin, solusi client-side (JS) lebih reliable dari Python/session_state.
 - **Tombol berdampingan di Streamlit: selalu `use_container_width=True`** — tanpanya tombol tidak mengisi lebar kolom dan tampak terpisah jauh meski kolom sudah sempit.
 - **Label tombol dan teks UI: title case EYD** — "Refresh Nama File", bukan "Refresh nama file". Berlaku untuk semua label `st.button`, `st.download_button`, heading, dan caption UI.
+- **Context overhead ~3,250 token per turn adalah biaya tetap** — gabungkan beberapa perubahan kecil dalam satu sesi agar overhead diamortisasi, bukan dibayar ulang per task.
+- **Prompt efektif = screenshot + deskripsi masalah + arah solusi** — ketiga elemen ini menghasilkan penyelesaian 1 prompt. Jika arah solusi tidak ada, tanya dulu sebelum coding.
 
 ## Pemilihan Model Dinamis (Routing)
 

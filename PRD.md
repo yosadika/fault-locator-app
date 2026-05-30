@@ -249,7 +249,7 @@ Dokumen ini adalah sumber kebenaran tunggal untuk spesifikasi fitur, perilaku ap
 - Quality score: penalti distance negatif/> line length/imaginary, penalti mismatch tegangan, dikunci 0–10.
 - Remote adaptation: `auto_adapt_record`, `auto_current_direction_only`, manual `into_line`, manual `opposite_to_line`.
 - Candidate ranking: distance keluar line, imaginary distance, mismatch ratio, quality score, penalti angle shift, penalti polaritas/arah tertentu.
-- Visual sync: **default RMS envelope magnitude**, opsi sinkronisasi fault cursor/time/visual. Fault inception untuk alignment, DFT cursor untuk kalkulasi phasor.
+- Visual sync: **referensi default `fault_cursor` (Fault cursor only)**, **metode default RMS envelope magnitude**, opsi sinkronisasi fault cursor/time/visual. Fault inception untuk alignment, DFT cursor untuk kalkulasi phasor.
 - Optional TWS/time-based: `distance_from_local = (L + v * delta_t) / 2`, warning bila delta time/distance tidak realistis.
 - Scenario: internal line fault atau reverse/backfeed/external fault. SOTF/parallel/adjacent line diperlakukan sebagai konteks reverse/backfeed, bukan label wajib.
 - Perbandingan SE pada halaman DE memakai line parameter efektif yang sama; jika DE memakai Tower Schedule, SE comparison juga memakai panjang Tower Schedule.

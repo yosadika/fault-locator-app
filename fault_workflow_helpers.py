@@ -700,126 +700,355 @@ def _render_remote_fault_cursor(
     key_prefix: str,
     compact: bool = False,
 ):
-    st.markdown("### Remote Fault Cursor")
-    remote_assigned_df = st.session_state.get(assigned_df_key)
-    if remote_assigned_df is None:
+    if not compact:
+        st.subheader("Remote Fault Detection & Cursor Window")
+
+    _trigger_ctx = st.expander("Trigger Metadata", expanded=False) if compact else contextlib.nullcontext()
+    with _trigger_ctx:
+        if not compact:
+            st.markdown("### Trigger Metadata")
+        col_t1, col_t2 = st.columns(2)
+        col_t1.metric("CFG Start Time", str(metadata.get("cfg_start_time") or "-"))
+        col_t2.metric("CFG Trigger Time", str(metadata.get("cfg_trigger_time") or "-"))
+        st.caption(
+            "Trigger timestamp dibaca dari metadata CFG remote jika tersedia. "
+            "Fault inception tetap dideteksi dari waveform DAT untuk menentukan window DFT."
+        )
+
+    assigned_df = st.session_state.get(assigned_df_key)
+    if assigned_df is None:
         st.info("Selesaikan Remote End > Signals terlebih dahulu.")
         return
 
-    remote_metadata = metadata
-    remote_transformer_data = st.session_state.get(transformer_key, {})
-    col_rf1, col_rf2, col_rf3 = st.columns(3)
-    with col_rf1:
-        remote_frequency = st.number_input(
-            "Remote Frequency (Hz)",
-            value=float(remote_metadata.get("frequency") or 50.0),
+    transformer_data = st.session_state.get(transformer_key, {})
+
+    st.markdown("### Parameter Deteksi Gangguan")
+
+    col_fd1, col_w1, col_w2 = st.columns(3)
+
+    with col_fd1:
+        frequency = st.number_input(
+            "Frekuensi Sistem (Hz)",
+            value=float(metadata.get("frequency") or 50.0),
             min_value=40.0,
             max_value=70.0,
             step=0.001,
             format="%.5f",
             key=f"{key_prefix}_frequency",
         )
-    remote_auto_fault_detection_settings = calculate_auto_fault_detection_parameters(
-        remote_assigned_df,
-        frequency=remote_frequency,
-        pre_fault_cycles=2,
-        nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
-        nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
+
+    with col_w1:
+        pre_fault_cycles = st.number_input(
+            "Pre-fault Window (cycles)",
+            value=2,
+            min_value=1,
+            max_value=10,
+            step=1,
+            key=f"{key_prefix}_pre_fault_cycles",
+        )
+
+    with col_w2:
+        post_fault_cycles = st.number_input(
+            "Post-fault Window (cycles)",
+            value=4,
+            min_value=1,
+            max_value=20,
+            step=1,
+            key=f"{key_prefix}_post_fault_cycles",
+        )
+
+    auto_fault_detection_settings = calculate_auto_fault_detection_parameters(
+        assigned_df,
+        frequency=frequency,
+        pre_fault_cycles=int(pre_fault_cycles),
+        nominal_phase_voltage_rms=transformer_data.get("nominal_phase_voltage_rms"),
+        nominal_current_rms=transformer_data.get("nominal_current_rms"),
     )
-    use_remote_auto_fault_detection = st.checkbox(
-        "Gunakan deteksi otomatis adaptif remote nominal + pre-fault",
+
+    use_auto_fault_detection = st.checkbox(
+        "Gunakan deteksi otomatis adaptif nominal + pre-fault",
         value=False,
         key=f"{key_prefix}_use_auto_fault_detection",
+        help=(
+            "Aplikasi memakai pre-fault RMS bila normal. Jika pre-fault terlihat sudah abnormal, "
+            "aplikasi memakai referensi nominal dari VT/CT sebagai pembanding tambahan."
+        ),
     )
-    _rthresh_ctx = st.expander("Parameter Deteksi Lanjutan", expanded=False) if compact else contextlib.nullcontext()
-    with _rthresh_ctx:
-        _rc2, _rc3 = st.columns(2)
-        with _rc2:
-            remote_current_multiplier = st.number_input(
-                "Remote Current Fault Multiplier",
-                value=float(remote_auto_fault_detection_settings["current_threshold_multiplier"]),
+
+    _thresh_ctx = st.expander("Parameter Deteksi Lanjutan", expanded=False) if compact else contextlib.nullcontext()
+    with _thresh_ctx:
+        col_fd2, col_fd3 = st.columns(2)
+        with col_fd2:
+            current_threshold_multiplier = st.number_input(
+                "Multiplier Kenaikan Arus",
+                value=float(auto_fault_detection_settings["current_threshold_multiplier"]),
                 min_value=1.01,
                 max_value=10.0,
                 step=0.001,
                 format="%.5f",
-                key=f"{key_prefix}_current_multiplier",
-                disabled=use_remote_auto_fault_detection,
+                disabled=use_auto_fault_detection,
+                key=f"{key_prefix}_current_threshold_multiplier",
             )
-        with _rc3:
-            remote_voltage_threshold = st.number_input(
-                "Remote Voltage Drop Threshold",
-                value=float(remote_auto_fault_detection_settings["voltage_drop_threshold"]),
+        with col_fd3:
+            voltage_drop_threshold = st.number_input(
+                "Batas Drop Tegangan",
+                value=float(auto_fault_detection_settings["voltage_drop_threshold"]),
                 min_value=0.1,
                 max_value=1.0,
                 step=0.0001,
                 format="%.5f",
-                key=f"{key_prefix}_voltage_threshold",
-                disabled=use_remote_auto_fault_detection,
+                disabled=use_auto_fault_detection,
+                key=f"{key_prefix}_voltage_drop_threshold",
             )
-    if use_remote_auto_fault_detection:
-        remote_current_multiplier = remote_auto_fault_detection_settings["current_threshold_multiplier"]
-        remote_voltage_threshold = remote_auto_fault_detection_settings["voltage_drop_threshold"]
-    remote_detection = detect_fault_inception(
-        remote_assigned_df,
-        frequency=remote_frequency,
-        current_threshold_multiplier=remote_current_multiplier,
-        voltage_drop_threshold=remote_voltage_threshold,
-        min_prefault_cycles=2,
+
+    if use_auto_fault_detection:
+        current_threshold_multiplier = auto_fault_detection_settings["current_threshold_multiplier"]
+        voltage_drop_threshold = auto_fault_detection_settings["voltage_drop_threshold"]
+
+    with st.expander("Detail Parameter Deteksi Otomatis"):
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {"Parameter": key, "Value": value}
+                    for key, value in auto_fault_detection_settings.items()
+                ]
+            ).style.format(
+                {"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}
+            ),
+            use_container_width=True,
+        )
+
+    with st.expander("Advanced Fault Bar Tuning"):
+        use_advanced_fault_detection = st.checkbox(
+            "Use Advanced Fault Detection",
+            value=use_auto_fault_detection,
+            help="Aktifkan hanya jika fault bar otomatis kurang presisi pada record remote.",
+            disabled=use_auto_fault_detection,
+            key=f"{key_prefix}_use_advanced_fault_detection",
+        )
+
+        fault_detection_method = st.selectbox(
+            "Fault Detection Method",
+            ["legacy_rms", "hybrid_superimposed"],
+            index=1,
+            disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
+            help="hybrid_superimposed memakai energi perubahan satu siklus lalu divalidasi RMS.",
+            key=f"{key_prefix}_fault_detection_method",
+        )
+
+        col_adv1, col_adv2, col_adv3, col_adv4 = st.columns(4)
+
+        with col_adv1:
+            adaptive_threshold_sigma = st.number_input(
+                "Adaptive Threshold Sigma",
+                value=6.0,
+                min_value=2.0,
+                max_value=20.0,
+                step=0.001,
+                format="%.5f",
+                help="Threshold adaptif terhadap noise pre-fault. Lebih kecil = lebih sensitif.",
+                disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
+                key=f"{key_prefix}_adaptive_threshold_sigma",
+            )
+
+        with col_adv2:
+            superimposed_threshold_sigma = st.number_input(
+                "Superimposed Threshold Sigma",
+                value=8.0,
+                min_value=2.0,
+                max_value=30.0,
+                step=0.001,
+                format="%.5f",
+                disabled=(
+                    not use_advanced_fault_detection
+                    or use_auto_fault_detection
+                    or fault_detection_method != "hybrid_superimposed"
+                ),
+                help="Threshold energi superimposed terhadap baseline pre-fault.",
+                key=f"{key_prefix}_superimposed_threshold_sigma",
+            )
+
+        with col_adv3:
+            consecutive_samples_input = st.number_input(
+                "Consecutive Samples",
+                value=0,
+                min_value=0,
+                max_value=200,
+                step=1,
+                help="0 = otomatis sekitar 0.1 siklus. Nilai lebih besar menolak spike sesaat.",
+                disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
+                key=f"{key_prefix}_consecutive_samples_input",
+            )
+
+        with col_adv4:
+            refine_fault_bar = st.checkbox(
+                "Refine Fault Bar",
+                value=True,
+                help="Backtrack dari kandidat RMS ke perubahan instantaneous awal.",
+                disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
+                key=f"{key_prefix}_refine_fault_bar",
+            )
+
+    if use_auto_fault_detection:
+        use_advanced_fault_detection = True
+        fault_detection_method = auto_fault_detection_settings["fault_detection_method"]
+        adaptive_threshold_sigma = auto_fault_detection_settings["adaptive_threshold_sigma"]
+        superimposed_threshold_sigma = auto_fault_detection_settings["superimposed_threshold_sigma"]
+        consecutive_samples_input = 0
+        refine_fault_bar = auto_fault_detection_settings["refine_fault_bar"]
+
+    detection = detect_fault_inception(
+        assigned_df,
+        frequency=frequency,
+        current_threshold_multiplier=current_threshold_multiplier,
+        voltage_drop_threshold=voltage_drop_threshold,
+        min_prefault_cycles=int(pre_fault_cycles),
         adaptive_threshold_sigma=(
-            remote_auto_fault_detection_settings["adaptive_threshold_sigma"]
-            if use_remote_auto_fault_detection
+            adaptive_threshold_sigma
+            if use_advanced_fault_detection
             else None
         ),
-        refine_fault_bar=use_remote_auto_fault_detection,
+        consecutive_samples=(
+            None
+            if (
+                not use_advanced_fault_detection
+                or int(consecutive_samples_input) == 0
+            )
+            else int(consecutive_samples_input)
+        ),
+        refine_fault_bar=(
+            refine_fault_bar
+            if use_advanced_fault_detection
+            else False
+        ),
         method=(
-            remote_auto_fault_detection_settings["fault_detection_method"]
-            if use_remote_auto_fault_detection
+            fault_detection_method
+            if use_advanced_fault_detection
             else "legacy_rms"
         ),
-        superimposed_threshold_sigma=remote_auto_fault_detection_settings["superimposed_threshold_sigma"],
-        nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
-        nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
+        superimposed_threshold_sigma=superimposed_threshold_sigma,
+        nominal_phase_voltage_rms=transformer_data.get("nominal_phase_voltage_rms"),
+        nominal_current_rms=transformer_data.get("nominal_current_rms"),
     )
-    st.session_state[fault_detection_key] = remote_detection
-    if not remote_detection["detected"]:
-        st.warning("Remote fault inception tidak terdeteksi otomatis. Gunakan slider manual.")
-        min_remote_time = float(remote_assigned_df["time"].min())
-        max_remote_time = float(remote_assigned_df["time"].max())
-        manual_remote_fault_time = st.slider(
+
+    st.session_state[fault_detection_key] = detection
+
+    if detection["detected"]:
+        st.success("Awal gangguan remote berhasil terdeteksi otomatis.")
+
+        fault_window = build_fault_window(
+            assigned_df,
+            fault_index=detection["fault_index"],
+            samples_per_cycle=detection["samples_per_cycle"],
+            pre_fault_cycles=int(pre_fault_cycles),
+            post_fault_cycles=int(post_fault_cycles),
+        )
+
+        st.session_state[fault_window_key] = fault_window
+        samples_per_cycle = detection["samples_per_cycle"]
+
+        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
+        col_r1.metric("Fault Time", f'{fault_window["fault_time"]:.6f} s')
+        col_r2.metric("Left Cursor", f'{fault_window["left_time"]:.6f} s')
+        col_r3.metric("Right Cursor", f'{fault_window["right_time"]:.6f} s')
+        col_r4.metric("DFT Cursor", f'{fault_window["dft_time"]:.6f} s')
+
+        st.write("Sampling Rate:", f'{detection["fs"]:.2f} Hz')
+        st.write("Samples per Cycle:", detection["samples_per_cycle"])
+
+        if detection.get("refine_fault_bar"):
+            st.caption(
+                "Fault bar refinement: "
+                f'RMS candidate {detection["rms_fault_time"]:.6f} s -> '
+                f'refined {detection["fault_time"]:.6f} s. '
+                f'Confidence {detection.get("confidence_score", 0):.2f}/10, '
+                f'consecutive samples {detection.get("consecutive_samples", "-")}.'
+            )
+
+        if detection.get("superimposed"):
+            superimposed = detection["superimposed"]
+            st.caption(
+                "Superimposed detector: "
+                f'threshold {superimposed["threshold"]:.6f}, '
+                f'peak energy {superimposed.get("peak_energy", 0.0):.6f}.'
+            )
+
+    else:
+        st.warning(detection["message"])
+
+        st.markdown("### Manual Cursor")
+
+        fs = detection["fs"]
+        samples_per_cycle = int(round(fs / frequency))
+
+        min_time = float(assigned_df["time"].min())
+        max_time = float(assigned_df["time"].max())
+
+        manual_fault_time = st.slider(
             "Pilih waktu awal gangguan remote manual (s)",
-            min_value=min_remote_time,
-            max_value=max_remote_time,
-            value=min_remote_time,
-            step=(max_remote_time - min_remote_time) / 1000,
+            min_value=min_time,
+            max_value=max_time,
+            value=min_time,
+            step=(max_time - min_time) / 1000,
             key=f"{key_prefix}_manual_fault_time",
         )
-        remote_fault_index = int((remote_assigned_df["time"] - manual_remote_fault_time).abs().idxmin())
-        remote_samples_per_cycle = int(round(estimate_sampling_rate(remote_assigned_df) / remote_frequency))
-    else:
-        st.success("Remote fault inception berhasil terdeteksi otomatis.")
-        remote_fault_index = remote_detection["fault_index"]
-        remote_samples_per_cycle = remote_detection["samples_per_cycle"]
-    remote_fault_window = build_fault_window(
-        remote_assigned_df,
-        fault_index=remote_fault_index,
-        samples_per_cycle=remote_samples_per_cycle,
-        pre_fault_cycles=2,
-        post_fault_cycles=4,
-    )
-    st.session_state[fault_window_key] = remote_fault_window
-    st.session_state["remote_samples_per_cycle"] = remote_samples_per_cycle
-    st.session_state["remote_frequency_hz"] = remote_frequency
-    col_rw1, col_rw2, col_rw3 = st.columns(3)
-    col_rw1.metric("Remote Fault Time", f'{remote_fault_window["fault_time"]:.6f} s')
-    col_rw2.metric("Remote DFT Time", f'{remote_fault_window["dft_time"]:.6f} s')
-    col_rw3.metric("Remote Samples/Cycle", remote_samples_per_cycle)
-    remote_plot_channels = [
-        channel for channel in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
-        if channel in remote_assigned_df.columns
-    ]
-    _rexp_label = "Detail Window Analisis" if compact else "Validasi Window Analisis"
-    with st.expander(_rexp_label, expanded=False):
-        if not compact:
+
+        fault_index = int(
+            (assigned_df["time"] - manual_fault_time).abs().idxmin()
+        )
+
+        fault_window = build_fault_window(
+            assigned_df,
+            fault_index=fault_index,
+            samples_per_cycle=samples_per_cycle,
+            pre_fault_cycles=int(pre_fault_cycles),
+            post_fault_cycles=int(post_fault_cycles),
+        )
+
+        st.session_state[fault_window_key] = fault_window
+
+    st.session_state["remote_samples_per_cycle"] = samples_per_cycle
+    st.session_state["remote_frequency_hz"] = frequency
+
+    if fault_window_key in st.session_state:
+        fault_window = st.session_state[fault_window_key]
+        _info_text = (
+            "Left Cursor dan Right Cursor digunakan sebagai range analisis. "
+            "DFT Cursor digunakan pada Step 4 untuk mengambil fasor 1 siklus "
+            "setelah awal gangguan."
+        )
+        _exp_label = "Detail Window Analisis" if compact else "Validasi Window Analisis"
+        with st.expander(_exp_label, expanded=False):
+            st.json(fault_window)
+            st.info(_info_text)
+            if not compact:
+                remote_plot_channels = [
+                    ch for ch in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
+                    if ch in assigned_df.columns
+                ]
+                remote_selected_plot = st.multiselect(
+                    "Pilih sinyal remote untuk validasi fault window",
+                    remote_plot_channels,
+                    default=[c for c in ["Ia", "Ib", "Ic"] if c in remote_plot_channels] or remote_plot_channels[:3],
+                    key=f"{key_prefix}_fault_window_plot_channels",
+                )
+                if remote_selected_plot:
+                    fig = build_fault_window_plot(
+                        assigned_df, fault_window, remote_selected_plot,
+                        "Remote Fault Detection dan Cursor Window",
+                    )
+                    _pad = (fault_window["right_time"] - fault_window["left_time"]) * 0.3
+                    fig.update_layout(xaxis_range=[
+                        fault_window["left_time"] - _pad,
+                        fault_window["right_time"] + _pad,
+                    ])
+                    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_fault_window_chart")
+
+        if compact:
+            remote_plot_channels = [
+                ch for ch in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
+                if ch in assigned_df.columns
+            ]
             remote_selected_plot = st.multiselect(
                 "Pilih sinyal remote untuk validasi fault window",
                 remote_plot_channels,
@@ -827,35 +1056,16 @@ def _render_remote_fault_cursor(
                 key=f"{key_prefix}_fault_window_plot_channels",
             )
             if remote_selected_plot:
-                remote_fault_fig = build_fault_window_plot(
-                    remote_assigned_df, remote_fault_window, remote_selected_plot,
+                fig = build_fault_window_plot(
+                    assigned_df, fault_window, remote_selected_plot,
                     "Remote Fault Detection dan Cursor Window",
                 )
-                _rpad = (remote_fault_window["right_time"] - remote_fault_window["left_time"]) * 0.3
-                remote_fault_fig.update_layout(xaxis_range=[
-                    remote_fault_window["left_time"] - _rpad,
-                    remote_fault_window["right_time"] + _rpad,
+                _pad = (fault_window["right_time"] - fault_window["left_time"]) * 0.3
+                fig.update_layout(xaxis_range=[
+                    fault_window["left_time"] - _pad,
+                    fault_window["right_time"] + _pad,
                 ])
-                st.plotly_chart(remote_fault_fig, use_container_width=True, key=f"{key_prefix}_fault_window_chart")
-
-    if compact:
-        remote_selected_plot = st.multiselect(
-            "Pilih sinyal remote untuk validasi fault window",
-            remote_plot_channels,
-            default=[c for c in ["Ia", "Ib", "Ic"] if c in remote_plot_channels] or remote_plot_channels[:3],
-            key=f"{key_prefix}_fault_window_plot_channels",
-        )
-        if remote_selected_plot:
-            remote_fault_fig = build_fault_window_plot(
-                remote_assigned_df, remote_fault_window, remote_selected_plot,
-                "Remote Fault Detection dan Cursor Window",
-            )
-            _rpad = (remote_fault_window["right_time"] - remote_fault_window["left_time"]) * 0.3
-            remote_fault_fig.update_layout(xaxis_range=[
-                remote_fault_window["left_time"] - _rpad,
-                remote_fault_window["right_time"] + _rpad,
-            ])
-            st.plotly_chart(remote_fault_fig, use_container_width=True, key=f"{key_prefix}_fault_window_chart")
+                st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_fault_window_chart")
 
 
 def render_fault_cursor(

@@ -161,24 +161,26 @@ def render():
         )
     )
     st.markdown("### Local vs Remote Phasor Diagram")
-    phasor_plot_group = st.radio(
-        "Pilih kelompok fasor untuk perbandingan",
-        ["Voltage", "Current"],
-        horizontal=True,
-        key="two_ended_phasor_plot_group",
-    )
+    _col_pg, _col_ps = st.columns(2)
+    with _col_pg:
+        phasor_plot_group = st.radio(
+            "Kelompok Fasor",
+            ["Voltage", "Current"],
+            horizontal=True,
+            key="two_ended_phasor_plot_group",
+        )
+    with _col_ps:
+        remote_phasor_plot_source = st.radio(
+            "Sumber Fasor Remote",
+            ["Uploaded remote", "Adapted remote for DE"],
+            horizontal=True,
+            key="two_ended_remote_phasor_plot_source",
+            help=(
+                "Uploaded remote menampilkan fasor sesuai rekaman remote. Adapted remote memakai fasor "
+                "yang sudah dikoreksi arah/polaritas/sudut setelah perhitungan DE tersedia."
+            ),
+        )
     phasor_plot_signals = ["Va", "Vb", "Vc"] if phasor_plot_group == "Voltage" else ["Ia", "Ib", "Ic"]
-
-    remote_phasor_plot_source = st.radio(
-        "Sumber fasor remote",
-        ["Uploaded remote", "Adapted remote for DE"],
-        horizontal=True,
-        key="two_ended_remote_phasor_plot_source",
-        help=(
-            "Uploaded remote menampilkan fasor sesuai rekaman remote. Adapted remote memakai fasor "
-            "yang sudah dikoreksi arah/polaritas/sudut setelah perhitungan DE tersedia."
-        ),
-    )
     remote_phasors_for_plot = remote_phasors
     if (
         remote_phasor_plot_source == "Adapted remote for DE"
@@ -317,14 +319,6 @@ def render():
                 "selected_channels": "Selected plotted channels",
             }
             default_sync_reference = "fault_cursor"
-            if "fault_phase_voltage" in sync_reference_options:
-                default_sync_reference = "fault_phase_voltage"
-            elif "auto_voltage_sine" in sync_reference_options:
-                default_sync_reference = "auto_voltage_sine"
-            elif "fault_phase_current" in sync_reference_options:
-                default_sync_reference = "fault_phase_current"
-            elif "ground_current" in sync_reference_options:
-                default_sync_reference = "ground_current"
 
             sync_reference_mode = st.selectbox(
                 "Referensi visual alignment waveform",
