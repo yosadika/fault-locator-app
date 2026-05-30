@@ -58,6 +58,7 @@ from conductor_impedance_importer import (
     detect_impedance_columns,
     extract_impedance_from_row,
     build_row_label,
+    find_column,
 )
 from single_ended import (
     calculate_single_ended_fault_location,
@@ -92,6 +93,7 @@ from fault_workflow_helpers import (
     explain_two_ended_quality,
     explain_high_resistance_result,
     explain_sync_warning,
+    render_fault_cursor,
 )
 from case_storage import (
     DEFAULT_CASE_DRIVE_FOLDER_URL,
@@ -538,20 +540,256 @@ st.markdown(
 
 install_print_friendly_tables()
 
+# Accordion sidebar: JS client-side — tutup semua expander lain saat satu dibuka
+import streamlit.components.v1 as _stc
+_stc.html("""
+<script>
+(function () {
+    function setup() {
+        var sb = window.parent.document.querySelector('[data-testid="stSidebar"]');
+        if (!sb) { setTimeout(setup, 300); return; }
+
+        function bind() {
+            sb.querySelectorAll('details').forEach(function (det) {
+                var summary = det.querySelector('summary');
+                if (!summary || summary._acc) return;
+                summary._acc = true;
+                summary.addEventListener('click', function () {
+                    if (!det.open) {
+                        sb.querySelectorAll('details[open]').forEach(function (other) {
+                            if (other !== det) {
+                                    var s = other.querySelector('summary');
+                                    if (s) s.click();
+                                }
+                        });
+                    }
+                });
+            });
+        }
+
+        bind();
+        new MutationObserver(bind).observe(sb, { childList: true, subtree: true });
+    }
+    setup();
+})();
+</script>
+""", height=0)
+
 st.title("Transmission Fault Locator")
 
-with st.sidebar.expander("Upload Local End COMTRADE", expanded=False):
+_local_has_cfg = bool(st.session_state.get("local_cfg_file") is not None or st.session_state.get("case_local_cfg_bytes"))
+_local_has_dat = bool(st.session_state.get("local_dat_file") is not None or st.session_state.get("case_local_dat_bytes"))
+_local_complete = _local_has_cfg and _local_has_dat
+with st.sidebar.expander("Upload Local End COMTRADE", expanded=(_local_has_cfg or _local_has_dat) and not _local_complete):
     cfg_file = st.file_uploader("Local .cfg", key="local_cfg_file")
     dat_file = st.file_uploader("Local .dat", key="local_dat_file")
 
-with st.sidebar.expander("Upload Remote End COMTRADE", expanded=False):
+_remote_has_cfg = bool(st.session_state.get("remote_cfg_file") is not None or st.session_state.get("case_remote_cfg_bytes"))
+_remote_has_dat = bool(st.session_state.get("remote_dat_file") is not None or st.session_state.get("case_remote_dat_bytes"))
+_remote_complete = _remote_has_cfg and _remote_has_dat
+with st.sidebar.expander("Upload Remote End COMTRADE", expanded=(_remote_has_cfg or _remote_has_dat) and not _remote_complete):
     st.caption("Opsional. Diisi jika ingin menghitung double-ended.")
     remote_cfg_file = st.file_uploader("Remote .cfg", key="remote_cfg_file")
     remote_dat_file = st.file_uploader("Remote .dat", key="remote_dat_file")
 
+_creds_db_url = (
+    str(st.session_state.get("database_spreadsheet_url", "") or "").strip()
+    or str(get_config_secret("DATABASE_SPREADSHEET_URL", "") or "").strip()
+)
+_creds_complete = bool(
+    st.session_state.get("runtime_credentials_loaded_name") or _creds_db_url
+)
+_creds_file_present = st.session_state.get("sidebar_credentials_upload") is not None
+_creds_applied = bool(st.session_state.get("runtime_credentials_loaded_name"))
+with st.sidebar.expander("Credentials", expanded=_creds_file_present and not _creds_applied):
+    _loaded_name = st.session_state.get("runtime_credentials_loaded_name")
+    if _loaded_name:
+        st.caption(f"Aktif: {_loaded_name}")
+    _sb_cred = st.file_uploader(
+        "credentials.toml / .json",
+        type=["toml", "json"],
+        key="sidebar_credentials_upload",
+        label_visibility="collapsed",
+        help="Upload credentials.toml atau credentials.json untuk mengisi URL database otomatis.",
+    )
+    if _sb_cred is not None:
+        _sb_fp = hashlib.md5(_sb_cred.getvalue()).hexdigest()
+        if st.session_state.get("runtime_credentials_fingerprint") != _sb_fp:
+            _sb_payload, _sb_err = parse_runtime_credentials_upload(_sb_cred)
+            if _sb_err:
+                st.error(_sb_err)
+            else:
+                st.session_state["runtime_credentials"] = _sb_payload
+                st.session_state["runtime_credentials_loaded_name"] = _sb_cred.name
+                st.session_state["runtime_credentials_fingerprint"] = _sb_fp
+                _sb_applied = apply_runtime_credentials(_sb_payload)
+                st.success(
+                    "Credentials diterapkan: " + ", ".join(_sb_applied)
+                    if _sb_applied else "Credentials terbaca."
+                )
+        elif st.session_state.get("runtime_credentials"):
+            apply_runtime_credentials(st.session_state["runtime_credentials"])
+    st.caption("Pengaturan lengkap & clear credentials tersedia di tab Setup DB.")
+
+with st.sidebar.expander("Filter GI / Line", expanded=False):
+    _sidebar_db_url = (
+        str(st.session_state.get("database_spreadsheet_url", "") or "").strip()
+        or str(get_config_secret("DATABASE_SPREADSHEET_URL", "") or "").strip()
+    )
+    _sidebar_line_sheet = st.session_state.get("line_data_sheet_name", "line_impedance")
+    if not _sidebar_db_url:
+        st.caption("Isi Database Spreadsheet URL di Setup DB untuk mengaktifkan filter.")
+    else:
+        try:
+            # ULTG dan Segment → dari line_impedance
+            _gf_li = read_google_spreadsheet_table_cached(_sidebar_db_url, _sidebar_line_sheet)
+            _gf_li = make_streamlit_safe_columns(_gf_li)
+            _c_li_ultg = find_column(_gf_li, ["ULTG"])
+            _c_li_seg  = find_column(_gf_li, ["SEGMENT"])
+
+            # GI, Bay, Line → dari distance_settings
+            _ds_sheet = st.session_state.get("distance_settings_sheet_name", "distance_settings")
+            _gf_ds = read_google_spreadsheet_table_cached(_sidebar_db_url, _ds_sheet)
+            _gf_ds = make_streamlit_safe_columns(_gf_ds)
+            _c_ds_ultg = find_column(_gf_ds, ["ULTG"])
+            _c_ds_gi   = find_column(_gf_ds, ["GI"])
+            _c_ds_bay  = find_column(_gf_ds, ["BAY", "BAY PHT"])
+            _c_ds_line = find_column(_gf_ds, ["LINE"])
+
+            def _nv(v):
+                """Normalisasi float-integer: '1.0'→'1', '2.0'→'2'."""
+                try:
+                    f = float(v)
+                    if f == int(f):
+                        return str(int(f))
+                except (ValueError, TypeError):
+                    pass
+                return str(v)
+
+            def _sf_vals(df, col):
+                if col is None or col not in df.columns:
+                    return []
+                vals = df[col].dropna().astype(str).str.strip()
+                return sorted(
+                    {_nv(v) for v in vals if v and v.lower() not in ("nan", "none")},
+                    key=str.upper,
+                )
+
+            def _sb_select(label, real_vals, key):
+                _ph = f"Pilih {label}"
+                _opts = [_ph] + real_vals
+                _cur = st.session_state.get(key, _ph)
+                if _cur not in _opts:
+                    _cur = _ph
+                return st.selectbox(
+                    label, _opts,
+                    index=_opts.index(_cur),
+                    key=key,
+                    label_visibility="collapsed",
+                )
+
+            def _active(v):
+                return bool(v) and v != "Semua" and not v.startswith("Pilih ")
+
+            def _filt(df, col, val):
+                if not _active(val) or not col or col not in df.columns:
+                    return df
+                norm = _nv(val)
+                return df[df[col].astype(str).str.strip().apply(_nv) == norm]
+
+            # — ULTG (dari line_impedance) —
+            _sel_ultg = _sb_select("ULTG", _sf_vals(_gf_li, _c_li_ultg), "sidebar_filter_ultg")
+            _gf_li_u  = _filt(_gf_li, _c_li_ultg, _sel_ultg)
+            _gf_ds_u  = _filt(_gf_ds, _c_ds_ultg, _sel_ultg)
+
+            # — Segment (dari line_impedance, difilter ULTG) —
+            _sb_select("Segment", _sf_vals(_gf_li_u, _c_li_seg), "sidebar_filter_segment")
+
+            def _bay_line_opts(df, bay_col, line_col):
+                """Bangun opsi gabungan 'BAY / LINE' dari dataframe."""
+                if not bay_col or not line_col or bay_col not in df.columns or line_col not in df.columns:
+                    return []
+                d = df[[bay_col, line_col]].dropna().astype(str)
+                d = d[~d[bay_col].str.strip().str.lower().isin(("nan", "none"))]
+                combined = d[bay_col].str.strip() + " / " + d[line_col].str.strip().apply(_nv)
+                return sorted(set(combined), key=str.upper)
+
+            def _parse_bay_line(val):
+                """Uraikan 'BAY / LINE' → (bay, line). Gunakan rsplit agar nama bay yang mengandung '/' aman."""
+                if not _active(val):
+                    return "", ""
+                parts = val.rsplit(" / ", 1)
+                return parts[0], (parts[1] if len(parts) > 1 else "")
+
+            # — GI Lokal (dari distance_settings, difilter ULTG) —
+            _sel_gi_l = _sb_select("GI Lokal", _sf_vals(_gf_ds_u, _c_ds_gi), "sidebar_filter_gi_local")
+            _gf_ds_gl = _filt(_gf_ds_u, _c_ds_gi, _sel_gi_l)
+
+            # — Bay / Line GI Lokal (gabungan, difilter GI Lokal) —
+            _sel_bl_l = _sb_select("Bay / Line GI Lokal", _bay_line_opts(_gf_ds_gl, _c_ds_bay, _c_ds_line), "sidebar_filter_bay_line_local")
+            _bay_l, _line_l = _parse_bay_line(_sel_bl_l)
+            st.session_state["sidebar_filter_bay_local"]  = _bay_l
+            st.session_state["sidebar_filter_line_local"] = _line_l
+
+            # — GI Remote (dari distance_settings, difilter ULTG) —
+            _sel_gi_r = _sb_select("GI Remote", _sf_vals(_gf_ds_u, _c_ds_gi), "sidebar_filter_gi_remote")
+            _gf_ds_gr = _filt(_gf_ds_u, _c_ds_gi, _sel_gi_r)
+
+            # — Bay / Line GI Remote (gabungan, difilter GI Remote) —
+            _sel_bl_r = _sb_select("Bay / Line GI Remote", _bay_line_opts(_gf_ds_gr, _c_ds_bay, _c_ds_line), "sidebar_filter_bay_line_remote")
+            _bay_r, _line_r = _parse_bay_line(_sel_bl_r)
+            st.session_state["sidebar_filter_bay_remote"]  = _bay_r
+            st.session_state["sidebar_filter_line_remote"] = _line_r
+
+        except Exception as _sidebar_gi_err:
+            st.caption(f"Filter GI belum dapat dimuat: {_sidebar_gi_err}")
+
+# Sinkronisasi sidebar filters ke Tower Schedule, R-X Locus, dan Line Parameter
+def _sb_ia(v):
+    return bool(v) and v != "Semua" and not v.startswith("Pilih ")
+
+_sb_ultg  = st.session_state.get("sidebar_filter_ultg", "")
+_sb_seg   = st.session_state.get("sidebar_filter_segment", "")
+_sb_gi_l  = st.session_state.get("sidebar_filter_gi_local", "")
+_sb_bay_l = st.session_state.get("sidebar_filter_bay_local", "")
+_sb_gi_r  = st.session_state.get("sidebar_filter_gi_remote", "")
+_sb_bay_r = st.session_state.get("sidebar_filter_bay_remote", "")
+
+# Tower Schedule: override langsung (bukan setdefault) selama data belum dimuat
+if "tower_schedule_df" not in st.session_state:
+    if _sb_ia(_sb_ultg):
+        st.session_state["tower_schedule_pre_ultg"] = _sb_ultg
+    if _sb_ia(_sb_seg):
+        st.session_state["tower_schedule_pre_segment"] = _sb_seg
+
+# R-X Locus: sync substation dan bay saat sidebar berubah
+_sb_locus_key = f"{_sb_gi_l}|{_sb_bay_l}|{_sb_gi_r}|{_sb_bay_r}"
+if _sb_locus_key != st.session_state.get("_sb_locus_sync_key", ""):
+    st.session_state["_sb_locus_sync_key"] = _sb_locus_key
+    if _sb_ia(_sb_gi_l):
+        st.session_state["rx_locus_substation_local"] = _sb_gi_l
+    if _sb_ia(_sb_bay_l):
+        st.session_state["rx_locus_bay_local"] = _sb_bay_l
+    if _sb_ia(_sb_gi_r):
+        st.session_state["rx_locus_substation_remote"] = _sb_gi_r
+    if _sb_ia(_sb_bay_r):
+        st.session_state["rx_locus_bay_remote"] = _sb_bay_r
+
+# Line Parameter: auto-select Database Excel Line Data saat sidebar GI/Segment aktif
+_sb_li_key = f"{_sb_gi_l}|{_sb_seg}"
+_sb_li_active = _sb_ia(_sb_gi_l) or _sb_ia(_sb_seg)
+if _sb_li_key != st.session_state.get("_sb_li_sync_key", ""):
+    st.session_state["_sb_li_sync_key"] = _sb_li_key
+    if _sb_li_active:
+        st.session_state["line_parameter_source"] = "Database Excel Line Data"
+elif _sb_li_active and st.session_state.get("line_parameter_source", "Input Manual") == "Input Manual":
+    # Sidebar aktif tapi source masih di default — pastikan sync terjadi (misal setelah case restore)
+    st.session_state["line_parameter_source"] = "Database Excel Line Data"
+
 st.sidebar.divider()
-st.sidebar.header("Case Storage")
-case_archive_file = st.sidebar.file_uploader("Load Case (.zip)", type=["zip"], key="case_archive_file")
+_case_loaded = bool(st.session_state.get("_restored_case_hash"))
+with st.sidebar.expander("Case Storage", expanded=False):
+    case_archive_file = st.file_uploader("Load Case (.zip)", type=["zip"], key="case_archive_file")
 if case_archive_file is not None:
     import hashlib as _hashlib
     _archive_bytes = case_archive_file.getvalue()
@@ -957,132 +1195,15 @@ with tab_remote:
                 st.plotly_chart(remote_assigned_fig, use_container_width=True)
 
     with remote_tab_cursor:
-        st.markdown("### Remote Fault Cursor")
-        remote_assigned_df = st.session_state.get("remote_assigned_df")
-        if remote_assigned_df is None:
-            st.info("Selesaikan Remote End > Signals terlebih dahulu.")
-        else:
-            remote_transformer_data = st.session_state.get("remote_transformer_data", {})
-            col_rf1, col_rf2, col_rf3 = st.columns(3)
-            with col_rf1:
-                remote_frequency = st.number_input(
-                    "Remote Frequency (Hz)",
-                    value=float(remote_metadata.get("frequency") or 50.0),
-                    min_value=40.0,
-                    max_value=70.0,
-                    step=0.001,
-                    format="%.5f",
-                    key="remote_frequency",
-                )
-            remote_auto_fault_detection_settings = calculate_auto_fault_detection_parameters(
-                remote_assigned_df,
-                frequency=remote_frequency,
-                pre_fault_cycles=2,
-                nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
-                nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
-            )
-            use_remote_auto_fault_detection = st.checkbox(
-                "Gunakan deteksi otomatis adaptif remote nominal + pre-fault",
-                value=False,
-                key="use_remote_auto_fault_detection",
-            )
-            with col_rf2:
-                remote_current_multiplier = st.number_input(
-                    "Remote Current Fault Multiplier",
-                    value=float(remote_auto_fault_detection_settings["current_threshold_multiplier"]),
-                    min_value=1.01,
-                    max_value=10.0,
-                    step=0.001,
-                    format="%.5f",
-                    key="remote_current_multiplier",
-                    disabled=use_remote_auto_fault_detection,
-                )
-            with col_rf3:
-                remote_voltage_threshold = st.number_input(
-                    "Remote Voltage Drop Threshold",
-                    value=float(remote_auto_fault_detection_settings["voltage_drop_threshold"]),
-                    min_value=0.1,
-                    max_value=1.0,
-                    step=0.0001,
-                    format="%.5f",
-                    key="remote_voltage_threshold",
-                    disabled=use_remote_auto_fault_detection,
-                )
-            if use_remote_auto_fault_detection:
-                remote_current_multiplier = remote_auto_fault_detection_settings["current_threshold_multiplier"]
-                remote_voltage_threshold = remote_auto_fault_detection_settings["voltage_drop_threshold"]
-            remote_detection = detect_fault_inception(
-                remote_assigned_df,
-                frequency=remote_frequency,
-                current_threshold_multiplier=remote_current_multiplier,
-                voltage_drop_threshold=remote_voltage_threshold,
-                min_prefault_cycles=2,
-                adaptive_threshold_sigma=(
-                    remote_auto_fault_detection_settings["adaptive_threshold_sigma"]
-                    if use_remote_auto_fault_detection
-                    else None
-                ),
-                refine_fault_bar=use_remote_auto_fault_detection,
-                method=(
-                    remote_auto_fault_detection_settings["fault_detection_method"]
-                    if use_remote_auto_fault_detection
-                    else "legacy_rms"
-                ),
-                superimposed_threshold_sigma=remote_auto_fault_detection_settings["superimposed_threshold_sigma"],
-                nominal_phase_voltage_rms=remote_transformer_data.get("nominal_phase_voltage_rms"),
-                nominal_current_rms=remote_transformer_data.get("nominal_current_rms"),
-            )
-            st.session_state["remote_fault_detection"] = remote_detection
-            if not remote_detection["detected"]:
-                st.warning("Remote fault inception tidak terdeteksi otomatis. Gunakan slider manual.")
-                min_remote_time = float(remote_assigned_df["time"].min())
-                max_remote_time = float(remote_assigned_df["time"].max())
-                manual_remote_fault_time = st.slider(
-                    "Pilih waktu awal gangguan remote manual (s)",
-                    min_value=min_remote_time,
-                    max_value=max_remote_time,
-                    value=min_remote_time,
-                    step=(max_remote_time - min_remote_time) / 1000,
-                    key="manual_remote_fault_time",
-                )
-                remote_fault_index = int((remote_assigned_df["time"] - manual_remote_fault_time).abs().idxmin())
-                remote_samples_per_cycle = int(round(estimate_sampling_rate(remote_assigned_df) / remote_frequency))
-            else:
-                st.success("Remote fault inception berhasil terdeteksi otomatis.")
-                remote_fault_index = remote_detection["fault_index"]
-                remote_samples_per_cycle = remote_detection["samples_per_cycle"]
-            remote_fault_window = build_fault_window(
-                remote_assigned_df,
-                fault_index=remote_fault_index,
-                samples_per_cycle=remote_samples_per_cycle,
-                pre_fault_cycles=2,
-                post_fault_cycles=4,
-            )
-            st.session_state["remote_fault_window"] = remote_fault_window
-            st.session_state["remote_samples_per_cycle"] = remote_samples_per_cycle
-            st.session_state["remote_frequency_hz"] = remote_frequency
-            col_rw1, col_rw2, col_rw3 = st.columns(3)
-            col_rw1.metric("Remote Fault Time", f'{remote_fault_window["fault_time"]:.6f} s')
-            col_rw2.metric("Remote DFT Time", f'{remote_fault_window["dft_time"]:.6f} s')
-            col_rw3.metric("Remote Samples/Cycle", remote_samples_per_cycle)
-            remote_plot_channels = [
-                channel for channel in ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"]
-                if channel in remote_assigned_df.columns
-            ]
-            remote_selected_plot = st.multiselect(
-                "Pilih sinyal remote untuk validasi fault window",
-                remote_plot_channels,
-                default=[channel for channel in ["Ia", "Ib", "Ic"] if channel in remote_plot_channels] or remote_plot_channels[:3],
-                key="remote_fault_window_plot_channels",
-            )
-            if remote_selected_plot:
-                remote_fault_fig = build_fault_window_plot(
-                    remote_assigned_df,
-                    remote_fault_window,
-                    remote_selected_plot,
-                    "Remote Fault Detection dan Cursor Window",
-                )
-                st.plotly_chart(remote_fault_fig, use_container_width=True)
+        render_fault_cursor(
+            end="remote",
+            assigned_df_key="remote_assigned_df",
+            metadata_key="remote_metadata",
+            transformer_key="remote_transformer_data",
+            fault_window_key="remote_fault_window",
+            fault_detection_key="remote_fault_detection",
+            key_prefix="remote_fc",
+        )
 
     with remote_tab_phasor:
         st.markdown("### Remote Phasor")
@@ -1800,13 +1921,23 @@ with tab0:
 
     case_filename, case_archive_bytes = build_case_archive_bytes(_auto_case_name)
     st.caption(f"File akan disimpan sebagai: `{case_filename}`")
-    st.download_button(
-        "Export Case ZIP",
-        data=case_archive_bytes,
-        file_name=case_filename,
-        mime="application/zip",
-        key="export_case_zip",
-    )
+    _col_exp, _col_ref, _col_pad = st.columns([3, 2, 7])
+    with _col_exp:
+        st.download_button(
+            "Export Case ZIP",
+            data=case_archive_bytes,
+            file_name=case_filename,
+            mime="application/zip",
+            key="export_case_zip",
+            use_container_width=True,
+        )
+    with _col_ref:
+        st.button(
+            "↺ Refresh Nama File",
+            key="refresh_case_name",
+            help="Perbarui nama file ZIP ke waktu terkini. Nama file menggunakan timestamp saat halaman terakhir dimuat — klik tombol ini agar timestamp mencerminkan waktu sekarang sebelum mengekspor.",
+            use_container_width=True,
+        )
 
 
 with tab_tower:
@@ -1880,6 +2011,16 @@ with tab_tower:
 
     pre_ultg_options = _preload_options_from_df(tower_filter_options_df, "ULTG")
 
+    def _norm_filter(s):
+        """Normalisasi untuk matching: lowercase, strip, collapse spasi di sekitar hyphen."""
+        return str(s).strip().lower().replace(" - ", "-").replace("- ", "-").replace(" -", "-")
+
+    # Resolve sidebar-synced ULTG: exact match → pakai langsung; normalized match → pakai nilai asli spreadsheet; no match → Semua
+    _pre_ultg_synced = st.session_state.get("tower_schedule_pre_ultg", "Semua")
+    if _sb_ia(_pre_ultg_synced) and _pre_ultg_synced not in pre_ultg_options:
+        _matched_ultg = next((o for o in pre_ultg_options if _norm_filter(o) == _norm_filter(_pre_ultg_synced)), None)
+        st.session_state["tower_schedule_pre_ultg"] = _matched_ultg if _matched_ultg else "Semua"
+
     tower_has_loaded_data = "tower_schedule_df" in st.session_state
     with st.expander("Filter Awal Load", expanded=not tower_has_loaded_data):
         pre_filter_col1, pre_filter_col2, pre_filter_col3 = st.columns([1, 1, 1.2])
@@ -1904,8 +2045,14 @@ with tab_tower:
                 ultg_normalized == tower_pre_ultg.strip().upper()
             ]
         pre_segment_options = _preload_options_from_df(segment_options_df, "SEGMENT")
-        if st.session_state.get("tower_schedule_pre_segment", "Semua") not in pre_segment_options:
-            st.session_state["tower_schedule_pre_segment"] = "Semua"
+        _pre_seg_synced = st.session_state.get("tower_schedule_pre_segment", "Semua")
+        if _pre_seg_synced not in pre_segment_options:
+            if _sb_ia(_pre_seg_synced):
+                # Resolve: normalized match → pakai nilai asli spreadsheet; no match → Semua
+                _matched_seg = next((o for o in pre_segment_options if _norm_filter(o) == _norm_filter(_pre_seg_synced)), None)
+                st.session_state["tower_schedule_pre_segment"] = _matched_seg if _matched_seg else "Semua"
+            else:
+                st.session_state["tower_schedule_pre_segment"] = "Semua"
 
         with pre_filter_col2:
             selected_pre_segment = st.selectbox(
@@ -2635,329 +2782,15 @@ with tab3:
 
 
 with tab4:
-    st.subheader("Fault Detection & Cursor Window")
-
-    st.markdown("### Trigger Metadata")
-
-    col_t1, col_t2 = st.columns(2)
-
-    col_t1.metric("CFG Start Time", str(metadata.get("cfg_start_time") or "-"))
-    col_t2.metric("CFG Trigger Time", str(metadata.get("cfg_trigger_time") or "-"))
-
-    st.caption(
-        "Trigger timestamp dibaca dari metadata CFG jika tersedia. "
-        "Fault inception tetap dideteksi dari waveform DAT untuk menentukan window DFT."
+    render_fault_cursor(
+        end="local",
+        assigned_df_key="assigned_df",
+        metadata_key="local_metadata",
+        transformer_key="local_transformer_data",
+        fault_window_key="fault_window",
+        fault_detection_key="fault_detection",
+        key_prefix="local_fc",
     )
-
-    if "assigned_df" not in st.session_state:
-        st.warning("Silakan lakukan Signal Assignment terlebih dahulu.")
-        st.stop()
-
-    assigned_df = st.session_state["assigned_df"]
-    local_transformer_data = st.session_state.get("local_transformer_data", {})
-
-    st.markdown("### Parameter Deteksi Gangguan")
-
-    col_fd1, col_w1, col_w2 = st.columns(3)
-
-    with col_fd1:
-        frequency = st.number_input(
-            "Frekuensi Sistem (Hz)",
-            value=float(metadata["frequency"]) if metadata["frequency"] else 50.0,
-            min_value=40.0,
-            max_value=70.0,
-            step=0.001,
-            format="%.5f",
-        )
-
-    with col_w1:
-        pre_fault_cycles = st.number_input(
-            "Pre-fault Window (cycles)",
-            value=2,
-            min_value=1,
-            max_value=10,
-            step=1
-        )
-
-    with col_w2:
-        post_fault_cycles = st.number_input(
-            "Post-fault Window (cycles)",
-            value=4,
-            min_value=1,
-            max_value=20,
-            step=1
-        )
-
-    auto_fault_detection_settings = calculate_auto_fault_detection_parameters(
-        assigned_df,
-        frequency=frequency,
-        pre_fault_cycles=int(pre_fault_cycles),
-        nominal_phase_voltage_rms=local_transformer_data.get("nominal_phase_voltage_rms"),
-        nominal_current_rms=local_transformer_data.get("nominal_current_rms"),
-    )
-
-    use_auto_fault_detection = st.checkbox(
-        "Gunakan deteksi otomatis adaptif nominal + pre-fault",
-        value=False,
-        key="use_auto_fault_detection",
-        help=(
-            "Aplikasi memakai pre-fault RMS bila normal. Jika pre-fault terlihat sudah abnormal, "
-            "aplikasi memakai referensi nominal dari VT/CT sebagai pembanding tambahan."
-        ),
-    )
-
-    col_fd2, col_fd3 = st.columns(2)
-
-    with col_fd2:
-        current_threshold_multiplier = st.number_input(
-            "Multiplier Kenaikan Arus",
-            value=float(auto_fault_detection_settings["current_threshold_multiplier"]),
-            min_value=1.01,
-            max_value=10.0,
-            step=0.001,
-            format="%.5f",
-            disabled=use_auto_fault_detection,
-        )
-
-    with col_fd3:
-        voltage_drop_threshold = st.number_input(
-            "Batas Drop Tegangan",
-            value=float(auto_fault_detection_settings["voltage_drop_threshold"]),
-            min_value=0.1,
-            max_value=1.0,
-            step=0.0001,
-            format="%.5f",
-            disabled=use_auto_fault_detection,
-        )
-
-    if use_auto_fault_detection:
-        current_threshold_multiplier = auto_fault_detection_settings["current_threshold_multiplier"]
-        voltage_drop_threshold = auto_fault_detection_settings["voltage_drop_threshold"]
-
-    with st.expander("Detail Parameter Deteksi Otomatis"):
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {"Parameter": key, "Value": value}
-                    for key, value in auto_fault_detection_settings.items()
-                ]
-            ).style.format(
-                {"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}
-            ),
-            use_container_width=True,
-        )
-
-    with st.expander("Advanced Fault Bar Tuning"):
-        use_advanced_fault_detection = st.checkbox(
-            "Use Advanced Fault Detection",
-            value=use_auto_fault_detection,
-            help="Aktifkan hanya jika fault bar otomatis kurang presisi pada record lokal.",
-            disabled=use_auto_fault_detection,
-        )
-
-        fault_detection_method = st.selectbox(
-            "Fault Detection Method",
-            ["legacy_rms", "hybrid_superimposed"],
-            index=1,
-            disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
-            help="hybrid_superimposed memakai energi perubahan satu siklus lalu divalidasi RMS.",
-        )
-
-        col_adv1, col_adv2, col_adv3, col_adv4 = st.columns(4)
-
-        with col_adv1:
-            adaptive_threshold_sigma = st.number_input(
-                "Adaptive Threshold Sigma",
-                value=6.0,
-                min_value=2.0,
-                max_value=20.0,
-                step=0.001,
-                format="%.5f",
-                help="Threshold adaptif terhadap noise pre-fault. Lebih kecil = lebih sensitif.",
-                disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
-            )
-
-        with col_adv2:
-            superimposed_threshold_sigma = st.number_input(
-                "Superimposed Threshold Sigma",
-                value=8.0,
-                min_value=2.0,
-                max_value=30.0,
-                step=0.001,
-                format="%.5f",
-                disabled=(
-                    not use_advanced_fault_detection
-                    or use_auto_fault_detection
-                    or fault_detection_method != "hybrid_superimposed"
-                ),
-                help="Threshold energi superimposed terhadap baseline pre-fault.",
-            )
-
-        with col_adv3:
-            consecutive_samples_input = st.number_input(
-                "Consecutive Samples",
-                value=0,
-                min_value=0,
-                max_value=200,
-                step=1,
-                help="0 = otomatis sekitar 0.1 siklus. Nilai lebih besar menolak spike sesaat.",
-                disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
-            )
-
-        with col_adv4:
-            refine_fault_bar = st.checkbox(
-                "Refine Fault Bar",
-                value=True,
-                help="Backtrack dari kandidat RMS ke perubahan instantaneous awal.",
-                disabled=(not use_advanced_fault_detection or use_auto_fault_detection),
-            )
-
-    if use_auto_fault_detection:
-        use_advanced_fault_detection = True
-        fault_detection_method = auto_fault_detection_settings["fault_detection_method"]
-        adaptive_threshold_sigma = auto_fault_detection_settings["adaptive_threshold_sigma"]
-        superimposed_threshold_sigma = auto_fault_detection_settings["superimposed_threshold_sigma"]
-        consecutive_samples_input = 0
-        refine_fault_bar = auto_fault_detection_settings["refine_fault_bar"]
-
-    detection = detect_fault_inception(
-        assigned_df,
-        frequency=frequency,
-        current_threshold_multiplier=current_threshold_multiplier,
-        voltage_drop_threshold=voltage_drop_threshold,
-        min_prefault_cycles=int(pre_fault_cycles),
-        adaptive_threshold_sigma=(
-            adaptive_threshold_sigma
-            if use_advanced_fault_detection
-            else None
-        ),
-        consecutive_samples=(
-            None
-            if (
-                not use_advanced_fault_detection
-                or int(consecutive_samples_input) == 0
-            )
-            else int(consecutive_samples_input)
-        ),
-        refine_fault_bar=(
-            refine_fault_bar
-            if use_advanced_fault_detection
-            else False
-        ),
-        method=(
-            fault_detection_method
-            if use_advanced_fault_detection
-            else "legacy_rms"
-        ),
-        superimposed_threshold_sigma=superimposed_threshold_sigma,
-        nominal_phase_voltage_rms=local_transformer_data.get("nominal_phase_voltage_rms"),
-        nominal_current_rms=local_transformer_data.get("nominal_current_rms"),
-    )
-
-    st.session_state["fault_detection"] = detection
-
-    if detection["detected"]:
-        st.success("Awal gangguan berhasil terdeteksi otomatis.")
-
-        fault_window = build_fault_window(
-            assigned_df,
-            fault_index=detection["fault_index"],
-            samples_per_cycle=detection["samples_per_cycle"],
-            pre_fault_cycles=int(pre_fault_cycles),
-            post_fault_cycles=int(post_fault_cycles),
-        )
-
-        st.session_state["fault_window"] = fault_window
-
-        col_r1, col_r2, col_r3, col_r4 = st.columns(4)
-
-        col_r1.metric("Fault Time", f'{fault_window["fault_time"]:.6f} s')
-        col_r2.metric("Left Cursor", f'{fault_window["left_time"]:.6f} s')
-        col_r3.metric("Right Cursor", f'{fault_window["right_time"]:.6f} s')
-        col_r4.metric("DFT Cursor", f'{fault_window["dft_time"]:.6f} s')
-
-        st.write("Sampling Rate:", f'{detection["fs"]:.2f} Hz')
-        st.write("Samples per Cycle:", detection["samples_per_cycle"])
-
-        if detection.get("refine_fault_bar"):
-            st.caption(
-                "Fault bar refinement: "
-                f'RMS candidate {detection["rms_fault_time"]:.6f} s -> '
-                f'refined {detection["fault_time"]:.6f} s. '
-                f'Confidence {detection.get("confidence_score", 0):.2f}/10, '
-                f'consecutive samples {detection.get("consecutive_samples", "-")}.'
-            )
-
-        if detection.get("superimposed"):
-            superimposed = detection["superimposed"]
-            st.caption(
-                "Superimposed detector: "
-                f'threshold {superimposed["threshold"]:.6f}, '
-                f'peak energy {superimposed.get("peak_energy", 0.0):.6f}.'
-            )
-
-    else:
-        st.warning(detection["message"])
-
-        st.markdown("### Manual Cursor")
-
-        fs = detection["fs"]
-        samples_per_cycle = detection["samples_per_cycle"]
-
-        min_time = float(assigned_df["time"].min())
-        max_time = float(assigned_df["time"].max())
-
-        manual_fault_time = st.slider(
-            "Pilih waktu awal gangguan manual (s)",
-            min_value=min_time,
-            max_value=max_time,
-            value=min_time,
-            step=(max_time - min_time) / 1000
-        )
-
-        fault_index = int(
-            (assigned_df["time"] - manual_fault_time).abs().idxmin()
-        )
-
-        fault_window = build_fault_window(
-            assigned_df,
-            fault_index=fault_index,
-            samples_per_cycle=samples_per_cycle,
-            pre_fault_cycles=int(pre_fault_cycles),
-            post_fault_cycles=int(post_fault_cycles),
-        )
-
-        st.session_state["fault_window"] = fault_window
-
-    st.markdown("### Validasi Window Analisis")
-
-    if "fault_window" in st.session_state:
-        fault_window = st.session_state["fault_window"]
-
-        st.json(fault_window)
-
-        st.info(
-            "Left Cursor dan Right Cursor digunakan sebagai range analisis. "
-            "DFT Cursor digunakan pada Step 4 untuk mengambil fasor 1 siklus "
-            "setelah awal gangguan."
-        )
-
-        display_df = assigned_df.copy()
-
-        selected_plot = st.multiselect(
-            "Pilih sinyal untuk validasi fault window",
-            ["Va", "Vb", "Vc", "Ia", "Ib", "Ic", "IE"],
-            default=["Ia", "Ib", "Ic"]
-        )
-
-        fig = build_fault_window_plot(
-            display_df,
-            fault_window,
-            selected_plot,
-            "Fault Detection dan Cursor Window",
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
 
 
 with tab5:

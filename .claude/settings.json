@@ -1,4 +1,5 @@
 {
+  "autoCompact": true,
   "permissions": {
     "allow": [
       "Bash(python -m py_compile tabs/line_parameter.py)",

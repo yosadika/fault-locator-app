@@ -34,6 +34,7 @@ def render():
             "Database Excel Cable Data",
         ],
         horizontal=True,
+        key="line_parameter_source",
     )
 
     excel_impedance_data = None
@@ -172,6 +173,7 @@ def render():
             ratio_gib_vt_col = detected_columns.get("ratio_gib_vt")
 
             corrected_columns = {
+                "upt": None if use_cable_database else detected_columns.get("upt"),
                 "ultg": None if use_cable_database else detected_columns.get("ultg"),
                 "gi": None if use_cable_database else detected_columns.get("gi"),
                 "line_number": None if use_cable_database else detected_columns.get("line_number"),
@@ -205,6 +207,101 @@ def render():
                 corrected_columns["ratio_gia_vt"] = None
                 corrected_columns["ratio_gib_ct"] = None
                 corrected_columns["ratio_gib_vt"] = None
+
+            if not use_cable_database:
+                _f_ultg   = st.session_state.get("sidebar_filter_ultg", "")
+                _f_seg    = st.session_state.get("sidebar_filter_segment", "")
+                _f_gi_l   = st.session_state.get("sidebar_filter_gi_local", "")
+                _f_bay_l  = st.session_state.get("sidebar_filter_bay_local", "")
+                _f_line_l = st.session_state.get("sidebar_filter_line_local", "")
+                _f_gi_r   = st.session_state.get("sidebar_filter_gi_remote", "")
+                _f_bay_r  = st.session_state.get("sidebar_filter_bay_remote", "")
+                _f_line_r = st.session_state.get("sidebar_filter_line_remote", "")
+
+                def _ia(v):
+                    return bool(v) and v != "Semua" and not v.startswith("Pilih ")
+
+                def _nv(v):
+                    try:
+                        f = float(v)
+                        if f == int(f):
+                            return str(int(f))
+                    except (ValueError, TypeError):
+                        pass
+                    return str(v)
+
+                def _col_eq(series, val):
+                    return series.astype(str).str.strip().apply(_nv) == _nv(val)
+
+                _filter_active = any(_ia(v) for v in [
+                    _f_ultg, _f_seg, _f_gi_l, _f_bay_l, _f_line_l,
+                    _f_gi_r, _f_bay_r, _f_line_r,
+                ])
+                if _filter_active:
+                    _mask = pd.Series([True] * len(conductor_df), index=conductor_df.index)
+                    _col_ultg = corrected_columns.get("ultg")
+                    _col_seg  = corrected_columns.get("segment")
+                    _col_gi   = corrected_columns.get("gi")
+                    _col_bay  = corrected_columns.get("bay_pht")
+                    _col_line = corrected_columns.get("line_number")
+
+                    if _ia(_f_ultg) and _col_ultg and _col_ultg in conductor_df.columns:
+                        _mask &= _col_eq(conductor_df[_col_ultg], _f_ultg)
+                    if _ia(_f_seg) and _col_seg and _col_seg in conductor_df.columns:
+                        _mask &= _col_eq(conductor_df[_col_seg], _f_seg)
+
+                    if _col_gi and _col_gi in conductor_df.columns:
+                        _has_local  = _ia(_f_gi_l) or _ia(_f_bay_l) or _ia(_f_line_l)
+                        _has_remote = _ia(_f_gi_r) or _ia(_f_bay_r) or _ia(_f_line_r)
+                        if _has_local or _has_remote:
+                            _gi_s   = conductor_df[_col_gi].astype(str).str.strip()
+                            _bay_s  = conductor_df[_col_bay].astype(str).str.strip() \
+                                if (_col_bay and _col_bay in conductor_df.columns) else None
+                            _line_s = conductor_df[_col_line].astype(str).str.strip().apply(_nv) \
+                                if (_col_line and _col_line in conductor_df.columns) else None
+
+                            _local_m = pd.Series([True] * len(conductor_df), index=conductor_df.index)
+                            if _ia(_f_gi_l):
+                                _local_m &= _gi_s == _f_gi_l
+                            if _ia(_f_bay_l) and _bay_s is not None:
+                                _local_m &= _bay_s == _f_bay_l
+                            if _ia(_f_line_l) and _line_s is not None:
+                                _local_m &= _line_s == _nv(_f_line_l)
+
+                            _remote_m = pd.Series([True] * len(conductor_df), index=conductor_df.index)
+                            if _ia(_f_gi_r):
+                                _remote_m &= _gi_s == _f_gi_r
+                            if _ia(_f_bay_r) and _bay_s is not None:
+                                _remote_m &= _bay_s == _f_bay_r
+                            if _ia(_f_line_r) and _line_s is not None:
+                                _remote_m &= _line_s == _nv(_f_line_r)
+
+                            if _has_local and _has_remote:
+                                _mask &= _local_m | _remote_m
+                            elif _has_local:
+                                _mask &= _local_m
+                            else:
+                                _mask &= _remote_m
+
+                    conductor_df = conductor_df[_mask].reset_index(drop=True)
+                    _active_parts = [
+                        f"ULTG={_f_ultg}" if _ia(_f_ultg) else None,
+                        f"Segment={_f_seg}" if _ia(_f_seg) else None,
+                        f"GI Lokal={_f_gi_l}" if _ia(_f_gi_l) else None,
+                        f"Bay Lokal={_f_bay_l}" if _ia(_f_bay_l) else None,
+                        f"Line Lokal={_f_line_l}" if _ia(_f_line_l) else None,
+                        f"GI Remote={_f_gi_r}" if _ia(_f_gi_r) else None,
+                        f"Bay Remote={_f_bay_r}" if _ia(_f_bay_r) else None,
+                        f"Line Remote={_f_line_r}" if _ia(_f_line_r) else None,
+                    ]
+                    st.info(
+                        "Filter sidebar aktif — "
+                        + ", ".join(x for x in _active_parts if x)
+                        + f". {len(conductor_df)} baris tersedia. "
+                        "Ubah di expander Filter GI / Line pada sidebar."
+                    )
+                    if conductor_df.empty:
+                        st.warning("Tidak ada data yang cocok dengan filter sidebar. Ubah filter di sidebar.")
 
             row_labels = build_row_label(conductor_df, corrected_columns)
 

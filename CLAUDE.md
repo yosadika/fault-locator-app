@@ -2,7 +2,8 @@
 
 Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rekaman COMTRADE, menentukan fault type, menghitung lokasi gangguan single-end dan double-end, menggambar R-X locus, serta menampilkan tower schedule dan cuaca di titik gangguan.
 
-**Spesifikasi lengkap:** [`PRD.md`](PRD.md)
+**Spesifikasi lengkap:** [`PRD.md`](PRD.md)  
+**Riwayat keputusan & guardrail:** [`memory/MEMORY.md`](memory/MEMORY.md) — baca sebelum mengubah kode
 
 ## Stack
 
@@ -58,3 +59,36 @@ Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rek
 - CSS/DOM selector Streamlit bawaan rapuh; scope selector ke class komponen.
 - Folium map: gunakan `key`, `center`, `zoom` eksplisit saat ingin fokus ke titik fault.
 - Summary dirender lebih awal; hasil kalkulasi yang dihitung setelahnya baru tampil pada rerun berikutnya.
+
+## Efisiensi Token (berlaku untuk semua sesi)
+
+- **Jangan re-read file yang sudah ada di konteks** — jika konten sudah terlihat dari turn sebelumnya, gunakan langsung untuk `Edit`.
+- **Jangan re-read setelah `Edit` sukses** — `Edit`/`Write` error jika gagal; re-read konfirmasi = token mubazir.
+- **Gunakan `Grep -C 3`** untuk menemukan string target sebelum edit — `-C` maksimal 5–10; lebih dari itu mubazir.
+- **`Read` dengan `offset`+`limit`** jika hanya butuh sebagian file besar (app.py ~4000 baris).
+- **Satu `Read` blok luas, bukan beberapa `Read` kecil yang overlap** — hitung rentang sekali, baca semua sekaligus.
+- **PRD.md: jangan baca penuh kecuali diminta eksplisit** — gunakan `Grep` + `Read offset+limit` untuk section relevan saja.
+- **Compile check: jalankan langsung tanpa `cd`** — working directory sudah benar sejak awal session; `cd /d` adalah sintaks PowerShell/cmd, bukan Bash.
+- **Jangan spawn subagent untuk edit < 50 baris di 1 file** — cold-start subagent (~10K token) lebih mahal dari mengerjakan inline.
+- **Batch edit dalam satu turn** jika ada beberapa perubahan kecil di file yang sama.
+- **Mulai sesi baru** untuk topik/fitur yang tidak berkaitan — jangan akumulasi 60+ turn dalam satu sesi.
+- **Verifikasi asumsi framework sebelum coding** — Edit yang kemudian di-revert adalah pemborosan terbesar; lebih murah investigasi 1 menit daripada 3 attempt salah.
+- **UI behavior Streamlit: investigasi dulu, coding kemudian** — sebelum mengimplementasi show/hide/accordion, verifikasi: apakah widget menulis balik ke session_state? Apakah `expanded=` controlled atau initial-state-only? Jika tidak yakin, solusi client-side (JS) lebih reliable dari Python/session_state.
+- **Tombol berdampingan di Streamlit: selalu `use_container_width=True`** — tanpanya tombol tidak mengisi lebar kolom dan tampak terpisah jauh meski kolom sudah sempit.
+- **Label tombol dan teks UI: title case EYD** — "Refresh Nama File", bukan "Refresh nama file". Berlaku untuk semua label `st.button`, `st.download_button`, heading, dan caption UI.
+
+## Pemilihan Model Dinamis (Routing)
+
+Untuk menghemat biaya, eksekusi berat/ringan dirutekan ke model berbeda lewat **subagent**. Jalankan sesi orchestrator di **Sonnet** (seimbang), lalu delegasikan:
+
+| Tier | Kriteria | Subagent (`.claude/agents/`) | Model |
+|---|---|---|---|
+| LIGHT | 1 file, sepele (typo, rename lokal, teks UI, formatting), tanpa ubah session_state | `porlung-light` | Haiku |
+| STANDARD | 1-2 file dalam satu area fitur, tanpa ubah kontrak session_state lintas halaman | `porlung-standard` | Sonnet |
+| HEAVY | `app.py` + ≥2 modul, ATAU ubah/tambah session_state keys lintas halaman, ATAU refactor/alur workflow | `porlung-heavy` | Opus |
+
+- Gunakan **`/route <deskripsi tugas>`** untuk scoping + delegasi otomatis.
+- Patokan HEAVY: perubahan menyentuh kunci di "Session State Penting" (PRD.md) karena itu kontrak lintas-halaman (Summary/SE/DE/Tower Map/Weather saling bergantung).
+- Di perbatasan dua tier, pilih yang lebih tinggi.
+- Catatan: subagent mulai dingin dan membaca ulang konteks — untuk tugas benar-benar sepele saat sesi sudah di model murah, kerjakan inline daripada spawn.
+- Hook **tidak bisa** mengganti model; pemilihan hanya di awal sesi (`/model`, `opusplan`) atau di batas spawn subagent.

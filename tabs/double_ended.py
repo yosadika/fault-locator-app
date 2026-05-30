@@ -14,6 +14,7 @@ from fault_workflow_helpers import (
     explain_sync_warning,
     explain_two_ended_quality,
     get_absolute_event_time,
+    render_fault_cursor,
 )
 from line_analysis_helpers import (
     build_remote_single_signed_position,
@@ -68,6 +69,38 @@ def render():
     if "line_param" not in st.session_state:
         st.warning("Selesaikan dulu Step 7: Line Parameter.")
         return
+
+    st.markdown("### Fault Cursor")
+    st.caption(
+        "Atur fault cursor local dan remote langsung dari halaman ini tanpa berpindah ke "
+        "Local End atau Remote End. Pengaturan di sini dan di halaman End tersinkron melalui "
+        "session state yang sama."
+    )
+    with st.expander("Local Fault Cursor", expanded=False):
+        render_fault_cursor(
+            end="local",
+            assigned_df_key="assigned_df",
+            metadata_key="local_metadata",
+            transformer_key="local_transformer_data",
+            fault_window_key="fault_window",
+            fault_detection_key="fault_detection",
+            key_prefix="de_local_fc",
+            compact=True,
+        )
+    with st.expander("Remote Fault Cursor", expanded=False):
+        if "remote_assigned_df" not in st.session_state:
+            st.info("Selesaikan Remote End > Signals terlebih dahulu untuk mengatur fault cursor remote.")
+        else:
+            render_fault_cursor(
+                end="remote",
+                assigned_df_key="remote_assigned_df",
+                metadata_key="remote_metadata",
+                transformer_key="remote_transformer_data",
+                fault_window_key="remote_fault_window",
+                fault_detection_key="remote_fault_detection",
+                key_prefix="de_remote_fc",
+                compact=True,
+            )
 
     local_phasors = st.session_state["phasors"]
     line_param_original = st.session_state["line_param"]

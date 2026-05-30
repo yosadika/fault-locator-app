@@ -237,6 +237,7 @@ def detect_impedance_columns(df: pd.DataFrame):
     columns = list(df.columns)
 
     detected = {
+        "upt": find_column(df, ["UPT"]),
         "ultg": find_column(df, ["ULTG"]),
         "gi": find_column(df, ["GI"]),
         "bay_pht": find_column(df, ["BAY PHT", "BAY", "PHT", "BAY_PHT"]),
@@ -281,6 +282,7 @@ def detect_impedance_columns(df: pd.DataFrame):
         "circuit_count": find_column(
             df,
             [
+                "JLH",
                 "JLH SIRKIT",
                 "JUMLAH SIRKIT",
                 "SIRKIT",
@@ -577,6 +579,7 @@ def extract_impedance_from_row(row, columns: dict):
     line_name = None
     length = None
 
+    upt = None
     ultg = None
     gi = None
     bay = None
@@ -585,6 +588,9 @@ def extract_impedance_from_row(row, columns: dict):
     gi_a = None
     gi_b = None
     conductor_type = None
+
+    if columns.get("upt"):
+        upt = str(row[columns["upt"]])
 
     if columns.get("ultg"):
         ultg = str(row[columns["ultg"]])
@@ -636,6 +642,7 @@ def extract_impedance_from_row(row, columns: dict):
     ratio_gib_vt = parse_ratio(row[columns["ratio_gib_vt"]]) if columns.get("ratio_gib_vt") else None
 
     return {
+        "upt": upt,
         "ultg": ultg,
         "gi": gi,
         "line_number": line_number,
