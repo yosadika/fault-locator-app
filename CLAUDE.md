@@ -28,10 +28,12 @@ Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rek
 | `rx_locus.py` | Parse relay settings, overlay zona proteksi, trajectory R-X |
 | `line_analysis_helpers.py` | Infer GI name, reverse DE, comparison dataframe, override panjang line |
 | `waveform_helpers.py` | Plot waveform, phasor diagram, sync local/remote |
-| `fault_workflow_helpers.py` | Explanation text, threshold fault type, TWS location, timestamp parser |
+| `single_ended.py` | Kalkulasi SE: loop impedansi, reactance/magnitude/projection method, Takagi fallback (Rf compensation) |
+| `two_ended.py` | Kalkulasi DE: positive-sequence two-ended, quality scoring, candidate ranking, angle search untuk unsync |
+| `fault_workflow_helpers.py` | Explanation text, threshold fault type, TWS location, timestamp parser; `render_se_formula_expander()` |
 | `summary_helpers.py` | Waveform fokus Summary, scoring SE/DE, grafik posisi SE/DE |
 | `tabs/line_parameter.py` | Render tab Line |
-| `tabs/double_ended.py` | Render tab Double-End |
+| `tabs/double_ended.py` | Render tab Double-End; `render_de_formula_expander()` |
 | `tabs/signal_assignment.py` | Render sub-tab Signals di Local End |
 
 ## Aturan Wajib
@@ -49,7 +51,7 @@ Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rek
    - Tower Map Summary: default fault source = DE jika tersedia
 7. **Setelah perubahan apapun**, jalankan:
    ```
-   python -m py_compile app.py app_runtime.py app_helpers.py case_storage.py weather_services.py weather_ui.py tower_map.py rx_locus.py line_analysis_helpers.py waveform_helpers.py fault_workflow_helpers.py summary_helpers.py tabs/line_parameter.py tabs/double_ended.py tabs/signal_assignment.py
+   python -m py_compile app.py app_runtime.py app_helpers.py case_storage.py weather_services.py weather_ui.py tower_map.py rx_locus.py line_analysis_helpers.py waveform_helpers.py fault_workflow_helpers.py summary_helpers.py single_ended.py two_ended.py tabs/line_parameter.py tabs/double_ended.py tabs/signal_assignment.py
    ```
 8. **Setelah perubahan workflow**, validasi minimal: Summary, Setup DB, Local End, Remote End, Line, HR Check, Single-End, Double-End, R-X Locus.
 9. **Setelah perubahan kalkulasi**, validasi: SE/DE memakai sumber panjang line yang dipilih, Tower Map fault interpolasi memakai `KUMULATIF km`, Summary tidak blank bila kalkulasi belum lengkap.
@@ -72,6 +74,7 @@ Aplikasi Streamlit untuk analisis gangguan transmisi tenaga listrik. Membaca rek
 - **Compile check: jalankan langsung tanpa `cd`** — working directory sudah benar sejak awal session; `cd /d` adalah sintaks PowerShell/cmd, bukan Bash.
 - **Jangan spawn subagent untuk edit < 50 baris di 1 file** — cold-start subagent (~10K token) lebih mahal dari mengerjakan inline.
 - **Batch edit dalam satu turn** jika ada beberapa perubahan kecil di file yang sama.
+- **Fungsi baru > 20 baris: gunakan `Write`/`Edit`, bukan `cat >>` via Bash** — heredoc append rawan escape sequence bug (`\_`, `\ `) yang baru ketahuan saat compile, menghasilkan extra turns.
 - **Mulai sesi baru** untuk topik/fitur yang tidak berkaitan — jangan akumulasi 60+ turn dalam satu sesi.
 - **Verifikasi asumsi framework sebelum coding** — Edit yang kemudian di-revert adalah pemborosan terbesar; lebih murah investigasi 1 menit daripada 3 attempt salah.
 - **UI behavior Streamlit: investigasi dulu, coding kemudian** — sebelum mengimplementasi show/hide/accordion, verifikasi: apakah widget menulis balik ke session_state? Apakah `expanded=` controlled atau initial-state-only? Jika tidak yakin, solusi client-side (JS) lebih reliable dari Python/session_state.

@@ -297,15 +297,21 @@ def calculate_single_ended_fault_location(
 
             if abs(delta_loop_current) > 1e-9:
                 superimposed_zapp = delta_voltage / delta_loop_current
-                superimposed_distance_x_km = calculate_distance_by_reactance(
-                    superimposed_zapp,
-                    z1_per_km,
-                )
-                superimposed_distance_projection_km = calculate_distance_by_projection(
-                    superimposed_zapp,
-                    z1_per_km,
-                )
                 superimposed_loop_current_mag = abs(delta_loop_current)
+
+                # Takagi penuh: d = Im(U · ΔI*) / Im(Z1 · I · ΔI*)
+                # Rf tereliminasi karena Im(Rf · |ΔI|²) = 0
+                dI_conj = delta_loop_current.conjugate()
+                takagi_den = (z1_per_km * loop["loop_current"] * dI_conj).imag
+                if abs(takagi_den) > 1e-9:
+                    superimposed_distance_x_km = (
+                        (loop["loop_voltage"] * dI_conj).imag / takagi_den
+                    )
+                else:
+                    superimposed_distance_x_km = calculate_distance_by_reactance(
+                        superimposed_zapp, z1_per_km
+                    )
+                superimposed_distance_projection_km = superimposed_distance_x_km
 
             prefault_current_mag = abs(prefault_phasors[i_name]["complex"])
             fault_current_mag = abs(phasors[i_name]["complex"])
@@ -377,7 +383,7 @@ def calculate_single_ended_fault_location(
             distance_km=recommended_distance_km,
         )
         used_superimposed_fallback = True
-        effective_recommended_method = "superimposed_reactance"
+        effective_recommended_method = "takagi"
         warnings.append(
             "Jarak konvensional keluar batas, sehingga aplikasi memakai fallback superimposed reactance "
             "berbasis perubahan fasor pre-fault ke fault untuk case resistif/load-flow."
@@ -464,8 +470,8 @@ def build_single_ended_result_dataframe(result: dict):
         {"Parameter": "Used Superimposed Fallback", "Value": result["used_superimposed_fallback"]},
         {"Parameter": "Superimposed Zapp R ohm", "Value": result["superimposed_Zapp_R"]},
         {"Parameter": "Superimposed Zapp X ohm", "Value": result["superimposed_Zapp_X"]},
-        {"Parameter": "Superimposed Distance by Reactance km", "Value": result["superimposed_distance_x_km"]},
-        {"Parameter": "Superimposed Distance by Projection km", "Value": result["superimposed_distance_projection_km"]},
+        {"Parameter": "Takagi Distance km", "Value": result["superimposed_distance_x_km"]},
+        {"Parameter": "Takagi Distance (projection) km", "Value": result["superimposed_distance_projection_km"]},
         {"Parameter": "Superimposed Loop Current Magnitude", "Value": result["superimposed_loop_current_mag"]},
         {"Parameter": "Fault Phase Current Change %", "Value": result["phase_current_change_pct"]},
         {"Parameter": "Fault Phase Current Depressed", "Value": result["phase_current_depressed"]},

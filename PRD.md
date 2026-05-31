@@ -55,11 +55,13 @@ Dokumen ini adalah sumber kebenaran tunggal untuk spesifikasi fitur, perilaku ap
 - **`rx_locus.py`** — Parsing distance relay settings, ekstraksi zone reach, overlay zona proteksi, builder trajectory R-X dari waveform/phasor. Flow widget dan penyimpanan summary R-X masih di `app.py`.
 - **`line_analysis_helpers.py`** — Infer nama GI dari nama line, reverse line name, status operasi DE/backfeed, pemilihan DFT remote terbaik, reverse-result DE, comparison dataframe, override panjang line. Widget pemilihan sumber panjang tetap di `app.py`.
 - **`waveform_helpers.py`** — Plot assigned waveform, fault-window plot, sync local/remote plot, estimasi time shift waveform, diagram phasor, tabel perbandingan prefault/fault. UI tab tetap di `app.py`.
-- **`fault_workflow_helpers.py`** — Explanation text, tabel threshold fault type otomatis, parser timestamp COMTRADE, TWS time-based location, parameter auto fault detection.
+- **`single_ended.py`** — Kalkulasi SE murni: loop impedansi per fault type, reactance/magnitude/projection method, Takagi fallback (kompensasi Rf via incremental phasor).
+- **`two_ended.py`** — Kalkulasi DE murni: positive-sequence two-ended closed-form, quality scoring, candidate ranking, angle search untuk unsynchronized; menyimpan V1L/V1R/I1L/I1R di result dict.
+- **`fault_workflow_helpers.py`** — Explanation text, tabel threshold fault type otomatis, parser timestamp COMTRADE, TWS time-based location, parameter auto fault detection; `render_se_formula_expander()` untuk display rumus SE + nilai aktual + referensi literatur inline.
 - **`summary_helpers.py`** — Pemilihan sinyal fault utama, waveform fokus Summary, estimasi penyebab gangguan, scoring single-ended, grafik posisi SE/DE. Fungsi yang membaca `st.session_state` langsung tetap di `app.py`.
 - **`tabs/`** — Modul render per-tab, masing-masing mengekspos `render(...)` yang dipanggil `app.py`:
   - `tabs/line_parameter.py` — Tab `Line`. Signature: `render()`.
-  - `tabs/double_ended.py` — Tab `Double-End`. Signature: `render()`.
+  - `tabs/double_ended.py` — Tab `Double-End`. Signature: `render()`; `render_de_formula_expander()` untuk display rumus DE + nilai aktual + referensi literatur inline.
   - `tabs/signal_assignment.py` — Sub-tab `Signals` di `Local End`. Signature: `render(df)`.
 
 ### Runtime Flow
@@ -228,7 +230,7 @@ Dokumen ini adalah sumber kebenaran tunggal untuk spesifikasi fitur, perilaku ap
 - Distance method: magnitude, reactance, projection. **Recommended default: reactance.**
 - Fault context: internal line fault atau reverse/backfeed external fault.
 - Mode reverse/backfeed: signed distance dipertahankan; jarak negatif atau > line length tidak langsung salah.
-- Superimposed fallback: untuk ground fault bila prefault tersedia, memakai delta voltage/current, dapat mengganti recommended distance jika konvensional out-of-range dan superimposed reactance masuk range.
+- Takagi fallback: untuk ground fault (SLG) bila prefault tersedia, memakai metode Takagi penuh `d = Im(U·ΔI*)/Im(Z₁·I·ΔI*)` yang mengeliminasi Rf secara eksak; menggantikan recommended distance jika konvensional out-of-range dan hasil Takagi masuk range. Referensi: Saha (2010) Eq. 6.8.
 - Status: `VALID`, `CHECK`, `UNCERTAIN`.
 - Warning: jarak negatif, jarak melebihi line, magnitude vs reactance berbeda signifikan, Rf tinggi, sudut Zapp menyimpang, indikasi load-flow/backfeed.
 - Hasil disimpan: `single_ended_result`, `remote_single_ended_result`, dataframe detail masing-masing.

@@ -1105,3 +1105,122 @@ def render_fault_cursor(
             key_prefix=key_prefix,
             compact=compact,
         )
+
+
+# ---------------------------------------------------------------------------
+# Formula display helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_c(z: complex, unit: str = "", prec: int = 4) -> str:
+    sign = "+" if z.imag >= 0 else "−"
+    mag = abs(z)
+    angle = float(np.degrees(np.angle(z)))
+    u = f" {unit}" if unit else ""
+    return f"{z.real:.{prec}f} {sign} j{abs(z.imag):.{prec}f}{u}  (|{mag:.{prec}f}| ∠ {angle:.2f}°)"
+
+
+_SE_LOOP_LATEX = {
+    "AG": (r"Z_{app} = \frac{V_a}{I_a + K_0 \cdot I_0}", True),
+    "BG": (r"Z_{app} = \frac{V_b}{I_b + K_0 \cdot I_0}", True),
+    "CG": (r"Z_{app} = \frac{V_c}{I_c + K_0 \cdot I_0}", True),
+    "AB": (r"Z_{app} = \frac{V_a - V_b}{I_a - I_b}", False),
+    "BC": (r"Z_{app} = \frac{V_b - V_c}{I_b - I_c}", False),
+    "CA": (r"Z_{app} = \frac{V_c - V_a}{I_c - I_a}", False),
+    "V1/I1": (r"Z_{app} = \frac{V_1}{I_1}", False),
+}
+
+
+def render_se_formula_expander(result: dict, line_param: dict, key_suffix: str = ""):
+    """Expander berisi rumus SE dan nilai aktual yang digunakan dalam perhitungan."""
+    selected_loop = result.get("selected_loop", "-")
+    zapp = result["Zapp"]
+    loop_v = result["loop_voltage"]
+    loop_i = result["loop_current"]
+    z1 = line_param["Z1_per_km"]
+    k0 = line_param["K0"]
+    L = line_param["length_km"]
+    method = result.get("recommended_method", "reactance")
+
+    loop_latex, is_ground = _SE_LOOP_LATEX.get(
+        selected_loop, (r"Z_{app} = \frac{U_{loop}}{I_{loop}}", False)
+    )
+
+    with st.expander("Rumus dan Pembahasan Perhitungan Single-Ended", expanded=False):
+
+        st.markdown("#### 1. Impedansi Loop Gangguan")
+        st.latex(loop_latex)
+        if is_ground:
+            st.caption(
+                "K₀ adalah faktor kompensasi earth return: K₀ = (Z₀ − Z₁) / Z₁, "
+                "dengan I₀ = Iᴇ / 3. "
+                "Ekuivalen dengan k₀ = (Z₀ − Z₁) / (3Z₁) × Iᴇ pada notasi standar."
+            )
+        st.caption("*Referensi: Saha et al. (2010) Eq. 6.3; Phadke & Thorp (2009) Eq. 9.33*")
+
+        st.markdown("#### 2. Nilai yang Digunakan")
+        c1, c2 = st.columns(2)
+        c1.markdown(f"**U_loop** = `{_fmt_c(loop_v, 'kV')}`")
+        c2.markdown(f"**I_loop** = `{_fmt_c(loop_i, 'A')}`")
+        if is_ground:
+            c1, c2 = st.columns(2)
+            c1.markdown(f"**K₀** = `{_fmt_c(k0)}`")
+            c2.markdown("*definisi: K₀ = (Z₀ − Z₁) / Z₁*")
+        c1, c2 = st.columns(2)
+        c1.markdown(f"**Z₁/km** = `{_fmt_c(z1, 'Ω/km')}`")
+        c2.markdown(f"**L** = `{L:.6f} km`")
+
+        st.markdown("#### 3. Impedansi Tampak (Zapp)")
+        st.latex(r"Z_{app} = \frac{U_{loop}}{I_{loop}}")
+        st.markdown(f"= `{_fmt_c(zapp, 'Ω')}`")
+
+        st.markdown("#### 4. Kalkulasi Jarak — Tiga Metode")
+
+        d_x = result["distance_x_km"]
+        st.markdown("**Reactance method** *(default)*:")
+        st.latex(r"d_X = \frac{\mathrm{Im}(Z_{app})}{\mathrm{Im}(Z_1/\mathrm{km})}")
+        st.markdown(
+            f"= {zapp.imag:.4f} / {z1.imag:.4f} = **{d_x:.4f} km** "
+            f"({d_x / L * 100:.2f}%)"
+        )
+        st.caption("*Referensi: Saha et al. (2010) Eq. 6.2; Phadke & Thorp (2009) Eq. 9.34*")
+
+        d_m = result["distance_mag_km"]
+        st.markdown("**Magnitude method:**")
+        st.latex(r"d_{|Z|} = \frac{|Z_{app}|}{|Z_1/\mathrm{km}|}")
+        st.markdown(
+            f"= {abs(zapp):.4f} / {abs(z1):.4f} = **{d_m:.4f} km** "
+            f"({d_m / L * 100:.2f}%)"
+        )
+        st.caption("*Referensi: Saha et al. (2010) Eq. 6.22; IEEE Std C37.114-2014*")
+
+        d_p = result["distance_projection_km"]
+        st.markdown("**Projection method:**")
+        st.latex(r"d_{proj} = \frac{\mathrm{Re}(Z_{app}\cdot\hat{Z}_1^{\,*})}{|Z_1/\mathrm{km}|}")
+        st.markdown(f"= **{d_p:.4f} km** ({d_p / L * 100:.2f}%)")
+        st.caption("*Referensi: Saha et al. (2010) Eq. 6.30–6.31*")
+
+        rec = result["recommended_distance_km"]
+        st.info(
+            f"▶ **Metode yang dipakai:** `{method}` → **{rec:.4f} km** "
+            f"({rec / L * 100:.2f}%)"
+        )
+
+        if result.get("used_superimposed_fallback") and result.get("superimposed_distance_x_km") is not None:
+            st.markdown("#### 5. Fallback: Metode Takagi (Kompensasi Rᶠ)")
+            st.caption(
+                "Digunakan karena hasil conventional keluar batas saluran. "
+                "Metode Takagi mengeliminasi Rᶠ secara eksak tanpa asumsi Rᶠ kecil."
+            )
+            st.latex(
+                r"d_{Takagi} = \frac{\mathrm{Im}(U_{loop}\cdot\Delta I^*)}{\mathrm{Im}(Z_1\cdot I_{loop}\cdot\Delta I^*)}"
+            )
+            st.caption(
+                "Dasar eliminasi: Im(Rᶠ·|ΔI|²) = 0 karena Rᶠ real dan |ΔI|² real.  "
+                "*Referensi: Saha et al. (2010) Eq. 6.8; Phadke & Thorp (2009) Eq. 9.36*"
+            )
+            d_tk = result["superimposed_distance_x_km"]
+            st.markdown(f"**Hasil Takagi:** **{d_tk:.4f} km** ({d_tk / L * 100:.2f}%)")
+            if result.get("superimposed_Zapp_R") is not None:
+                sup_z = complex(result["superimposed_Zapp_R"], result["superimposed_Zapp_X"])
+                st.markdown(f"**Zapp superimposed (ΔV/ΔI):** `{_fmt_c(sup_z, 'Ω')}`")
+

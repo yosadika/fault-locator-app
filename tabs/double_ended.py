@@ -1,3 +1,5 @@
+import math
+import cmath
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -924,6 +926,8 @@ def render():
 
         two_result_df = build_two_ended_result_dataframe(two_result, two_quality)
 
+        render_de_formula_expander(two_result, two_quality, line_param)
+
         with st.expander("Detail Double-Ended Original Direction"):
             st.dataframe(
                 two_result_df.style.format(
@@ -1710,3 +1714,127 @@ def render():
                         st.warning(warning)
                 else:
                     st.success("Hasil time-based berada di dalam panjang saluran dan selisih waktu masih realistis.")
+
+
+# ---------------------------------------------------------------------------
+# DE formula display helper
+# ---------------------------------------------------------------------------
+
+def _fmt_c_de(z: complex, unit: str = "", prec: int = 4) -> str:
+    sign = "+" if z.imag >= 0 else "−"
+    mag = abs(z)
+    angle = math.degrees(cmath.phase(z))
+    u = f" {unit}" if unit else ""
+    return f"{z.real:.{prec}f} {sign} j{abs(z.imag):.{prec}f}{u}  (|{mag:.{prec}f}| ∠ {angle:.2f}°)"
+
+
+def render_de_formula_expander(result: dict, quality: dict, line_param: dict):
+    """Expander berisi rumus DE dan nilai aktual yang digunakan dalam perhitungan."""
+    L = line_param["length_km"]
+    z1 = line_param["Z1_per_km"]
+    z1_total = line_param["Z1_total"]
+
+    V1L = result.get("V1L")
+    V1R = result.get("V1R")
+    I1L = result.get("I1L")
+    I1R = result.get("I1R")
+
+    d_complex = result["distance_complex"]
+    d_km = result["distance_km"]
+
+    with st.expander("Rumus dan Pembahasan Perhitungan Double-Ended", expanded=False):
+
+        st.markdown("#### 1. Model Saluran (Lumped Parameter, Urutan Positif)")
+        st.caption(
+            "Tegangan di titik gangguan F diturunkan dari dua arah secara terpisah "
+            "menggunakan fasor tersinkronisasi, lalu disamakan untuk mendapatkan jarak."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Dari Local End (x = 0):**")
+            st.latex(r"V_F^{local} = V_{1L} - I_{1L}\cdot Z_1\cdot x")
+        with c2:
+            st.markdown("**Dari Remote End (x = L):**")
+            st.latex(r"V_F^{remote} = V_{1R} - I_{1R}\cdot Z_1\cdot(L-x)")
+
+        st.markdown("Dari $V_F^{local} = V_F^{remote}$, diperoleh solusi tertutup:")
+        st.latex(
+            r"x = \frac{V_{1L} - V_{1R} + I_{1R}\cdot Z_1\cdot L}"
+            r"{Z_1\cdot(I_{1L} + I_{1R})}"
+        )
+        st.caption(
+            "Z₁ di sini adalah Z₁/km (impedansi per kilometer). "
+            "Rᶠ tereliminasi karena sistem dua persamaan dari dua ujung — "
+            "jarak diambil dari bagian real hasil kompleks.  "
+            "*Referensi: Saha et al. (2010) Ch. 7 (lumped-parameter); "
+            "IEEE Std C37.114-2014 (versi urutan negatif); "
+            "Eriksson et al. (1985) IEEE Trans. PAS-104*"
+        )
+
+        st.markdown("#### 2. Nilai yang Digunakan")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Local End:**")
+            if V1L is not None:
+                st.markdown(f"V₁L = `{_fmt_c_de(V1L, 'kV')}`")
+            if I1L is not None:
+                st.markdown(f"I₁L = `{_fmt_c_de(I1L, 'A')}`")
+        with c2:
+            st.markdown("**Remote End:**")
+            if V1R is not None:
+                st.markdown(f"V₁R = `{_fmt_c_de(V1R, 'kV')}`")
+            if I1R is not None:
+                st.markdown(f"I₁R = `{_fmt_c_de(I1R, 'A')}`")
+
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f"**Z₁/km** = `{_fmt_c_de(z1, 'Ω/km')}`")
+        c2.markdown(f"**Z₁ total** = `{_fmt_c_de(z1_total, 'Ω')}`")
+        c3.markdown(f"**L** = `{L:.6f} km`")
+
+        st.markdown("#### 3. Langkah Perhitungan")
+        if all(v is not None for v in [V1L, V1R, I1L, I1R]):
+            numerator = V1L - V1R + I1R * z1 * L
+            denominator = z1 * (I1L + I1R)
+            st.markdown(f"**Numerator** = V₁L − V₁R + I₁R·Z₁·L = `{_fmt_c_de(numerator)}`")
+            st.markdown(f"**Denominator** = Z₁·(I₁L + I₁R) = `{_fmt_c_de(denominator)}`")
+
+        st.markdown(f"**x (kompleks)** = {d_complex.real:.4f} + j{d_complex.imag:.4f} km")
+        st.markdown(f"**x (dipakai)** = Re(x) = **{d_km:.4f} km** ({d_km / L * 100:.2f}%)")
+
+        imag_d = d_complex.imag
+        imag_pct = abs(imag_d) / L * 100
+        if abs(imag_d) < 0.02 * L:
+            imag_note = "kecil — sinkronisasi rekaman baik"
+        elif abs(imag_d) < 0.05 * L:
+            imag_note = "perlu diperhatikan — validasi sinkronisasi"
+        else:
+            imag_note = "besar — cek sinkronisasi dan arah arus remote"
+        st.markdown(
+            f"**Im(x)** = {imag_d:.4f} km ({imag_pct:.2f}% panjang line) → {imag_note}"
+        )
+
+        vf_local = result.get("V_fault_from_local")
+        vf_remote = result.get("V_fault_from_remote")
+        if vf_local is not None and vf_remote is not None:
+            mismatch = result.get("voltage_mismatch_magnitude", 0.0)
+            vf_ref = max(abs(vf_local), abs(vf_remote), 1.0)
+            mismatch_pct = mismatch / vf_ref * 100
+
+            st.markdown("#### 4. Verifikasi: Tegangan di Titik Gangguan")
+            st.caption(
+                "Pada solusi ideal, V_F dari kedua ujung harus identik. "
+                "Selisihnya mengindikasikan kualitas sinkronisasi rekaman."
+            )
+            c1, c2 = st.columns(2)
+            c1.markdown(f"**V_F dari Local** = `{_fmt_c_de(vf_local, 'kV')}`")
+            c2.markdown(f"**V_F dari Remote** = `{_fmt_c_de(vf_remote, 'kV')}`")
+            st.markdown(
+                f"**|Mismatch|** = {mismatch:.4f} ({mismatch_pct:.2f}% dari V_F referensi)"
+            )
+            if mismatch_pct < 5:
+                st.success(f"Mismatch kecil ({mismatch_pct:.2f}%) — sinkronisasi rekaman baik.")
+            elif mismatch_pct < 10:
+                st.warning(f"Mismatch moderate ({mismatch_pct:.2f}%) — validasi sinkronisasi rekaman.")
+            else:
+                st.error(f"Mismatch besar ({mismatch_pct:.2f}%) — cek sinkronisasi dan arah arus remote.")
+

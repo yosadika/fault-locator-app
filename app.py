@@ -94,6 +94,7 @@ from fault_workflow_helpers import (
     explain_high_resistance_result,
     explain_sync_warning,
     render_fault_cursor,
+    render_se_formula_expander,
 )
 from case_storage import (
     DEFAULT_CASE_DRIVE_FOLDER_URL,
@@ -3528,6 +3529,8 @@ def render_single_ended_analysis(end_side: str):
         st.info("Mode backfeed/reverse aktif: jarak single-ended ditampilkan sebagai koordinat signed dari terminal relay.")
     for warning in single_result.get("warnings", []):
         st.warning(warning)
+
+    render_se_formula_expander(single_result, line_param)
 
     st.markdown("### Detail Perhitungan")
     st.dataframe(single_df.style.format({"Value": lambda x: f"{x:.6f}" if isinstance(x, (int, float)) else x}), use_container_width=True)

@@ -110,6 +110,10 @@ def calculate_positive_sequence_two_ended(
 
     return {
         "method": "positive_sequence_two_ended",
+        "V1L": V1L,
+        "I1L": I1L,
+        "V1R": V1R,
+        "I1R": I1R,
         "distance_complex": distance_complex,
         "distance_km": distance_km,
         "distance_percent": distance_percent,
